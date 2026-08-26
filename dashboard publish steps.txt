@@ -1,0 +1,149 @@
+Here's the complete, consolidated runbook — everything from file transfer to a permanently running dashboard, using your server IP (`192.168.2.137`) directly, no hostname.
+
+## 1. Transfer files to the server
+From Windows PowerShell (or WinSCP), copy your dashboard folder (excluding `node_modules`, `__pycache__`, `.venv`) to the server, e.g. via `scp` or zip+`scp`, into `/root/dashboard` (or wherever you're keeping it).
+
+## 2. Clean up anything transferred that shouldn't be there
+```bash
+cd /root/dashboard
+rm -rf node_modules __pycache__ .venv package-lock.json
+```
+
+## 3. Install Node.js 20 LTS (Oracle Linux's default/newer Node breaks native module builds)
+```bash
+sudo dnf remove -y nodejs npm
+curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
+sudo dnf install -y nodejs
+node -v   # confirm v20.x.x
+```
+
+## 4. Install build tools + Python 3.11 (needed for node-gyp and Streamlit)
+```bash
+sudo dnf groupinstall "Development Tools" -y
+sudo dnf install -y python3.11
+python3.11 -m pip install --upgrade pip
+```
+
+## 5. Install Node dependencies
+```bash
+cd /root/dashboard
+export npm_config_python=/usr/bin/python3.11
+npm install
+```
+
+## 6. Install Python/Streamlit dependencies
+```bash
+python3.11 -m pip install -r requirements.txt
+which streamlit   # should print /usr/local/bin/streamlit
+```
+
+## 7. Edit `server.js` to serve the dashboard HTML
+```bash
+sed -n '9,13p' server.js   # check it's not already there before adding
+```
+If not already present:
+```bash
+sed -i "10a\\
+app.use(express.static(__dirname));\\
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'oracle_ai_dashboard.html')));" server.js
+```
+
+## 8. Point the dashboard at this server's IP
+```bash
+hostname -I    # confirm the IP — e.g. 192.168.2.137
+grep -n "DEFAULT_PROXY = " oracle_ai_dashboard.html
+```
+Should show:
+```js
+const DEFAULT_PROXY = 'http://192.168.2.137:8080';
+```
+If not set correctly:
+```bash
+sed -i "s|const DEFAULT_PROXY = 'http://localhost:8080';|const DEFAULT_PROXY = 'http://192.168.2.137:8080';|" oracle_ai_dashboard.html
+```
+
+## 9. Open the firewall
+```bash
+sudo firewall-cmd --permanent --add-port=8080/tcp
+sudo firewall-cmd --permanent --add-port=8501-8510/tcp
+sudo firewall-cmd --reload
+sudo firewall-cmd --list-ports
+```
+
+## 10. Confirm `/etc/hosts` is back to normal (no leftover `oracledash` entry)
+```bash
+cat /etc/hosts
+```
+Should only show the default `localhost` lines.
+
+## 11. Test run
+```bash
+node server.js
+```
+Confirm you see:
+```
+✓ Oracle pool created for DB: ...
+✓ Oracle AI proxy running on http://localhost:8080
+```
+with no errors. In a second terminal:
+```bash
+curl -I http://localhost:8080/
+```
+Should return `200 OK`. Then from your laptop's browser:
+```
+http://192.168.2.137:8080/
+```
+Confirm the dashboard loads and connects to Oracle. Once confirmed, `Ctrl+C` the test run.
+
+## 12. Install PM2 and run permanently
+```bash
+sudo npm install -g pm2
+pm2 start server.js --name oracle-dashboard
+pm2 save
+pm2 startup
+```
+**Run the exact command `pm2 startup` prints out** — this registers it to auto-start on reboot.
+
+## 13. Verify
+```bash
+pm2 status
+pm2 logs oracle-dashboard --lines 30
+```
+
+## 14. Final test
+Close your SSH session entirely, then reload `http://192.168.2.137:8080/` in a browser — it should still work.
+
+---
+
+**Ongoing commands you'll use:**
+```bash
+pm2 restart oracle-dashboard   # after any code changes
+pm2 logs oracle-dashboard      # check logs
+pm2 status                     # is it running
+```
+
+**Share this URL with your team:**
+```
+http://192.168.2.137:8080/
+```
+
+Let me know if you want to pick up anywhere in this list, or if something errors along the way.
+
+
+cd /root/dashboard
+node -c server.js                       # syntax check
+pm2 restart oracle-dashboard             # restart cleanly (never `pm2 start` again while one is running)
+ss -tlnp | grep 8080                     # confirm only 1 process on the port, PID matches pm2 status
+curl -I http://localhost:8080/           # confirm real 200 response, not a hang
+pm2 logs oracle-dashboard --lines 50 --nostream   # check for errors
+pm2 save                                 # persist for reboot
+
+
+
+
+
+// ── Serve the dashboard frontend ──────────────────────────────────────────
+app.use(express.static(__dirname));
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'oracle_ai_dashboard.html'));
+});
