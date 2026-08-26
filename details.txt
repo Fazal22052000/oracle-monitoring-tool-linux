@@ -1,0 +1,468 @@
+ORCL = (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = 192.168.2.148)(PORT = 1522)) (CONNECT_DATA = (SERVER = DEDICATED) (SERVICE_NAME = orcl)))
+
+npm install http-proxy-middleware  --to connect python and Javascript code
+
+npm install nodemailer  --for set mail
+
+npm install dotenv
+
+pip install -r requirements.txt  --go to location first where requirement file exist
+
+create fazal user in database and give dba privillage
+
+export ORACLE_USER=fazal
+export ORACLE_PASSWORD=fazal
+export ORACLE_CONNECT_STRING="(DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = 192.168.2.148)(PORT = 1522)) (CONNECT_DATA = (SERVER = DEDICATED) (SERVICE_NAME = orcl)))"
+
+http://localhost:3000/oracle_ai_dashboard    --open in browser
+
+
+http://localhost:8080/api/oracle 
+
+node server.js  ---run in cmd
+
+npx serve .   ---run in cmd
+
+http://localhost:8080  ---proxy url 
+
+TECH = (DESCRIPTION = (ADDRESS = (PROTOCOL = TCP)(HOST = 192.168.20.77)(PORT = 1521)) (CONNECT_DATA = (SERVER = DEDICATED) (SERVICE_NAME = tech)))
+  
+  Root Cause: The PTY tab uses a custom ost-pty-output div (a plain <div> with textContent) as its output renderer — NOT the real xterm.js terminal.
+  =====install where server.js kept=================
+npm install ssh2
+
+=======================
+
+ORCL =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = database.local.com)(PORT = 1521))
+    (CONNECT_DATA =
+      (SERVER = DEDICATED)
+      (SERVICE_NAME = orcl.local.com)
+    )
+  )
+
+ORCL=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=192.168.20.127)(PORT=1521))(CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=orcl.local.com)))
+
+service name orcl
+================================
+  
+192.168.2.116
+
+ORCL12C=(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=192.168.2.116)(PORT=1522))(CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=orcl)))
+
+alter system set local_listener='(ADDRESS=(PROTOCOL=TCP)(HOST=192.168.2.116)(PORT=1522))' scope=memory;
+
+====alert log permission===============
+GRANT SELECT ON V$DIAG_ALERT_EXT TO fazal;
+GRANT CREATE ANY DIRECTORY TO fazal;
+GRANT SELECT ON V$DIAG_TRACE_FILE TO jayesh;
+
+chmod o+r /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+===========================
+for personal gmail
+
+
+Steps to generate a Gmail App Password
+
+Go to: https://myaccount.google.com/apppasswords
+(Sign in with fazalshaikh360@gmail.com)
+In the "App name" box, type anything — e.g. OracleTool
+Click Create
+Google shows you a 16-character password like: abcd efgh ijkl mnop
+Copy it and paste into your .env file without spaces:
+
+   SMTP_PASS=abcdefghijklmnop     --use this in .env file
+   
+   
+  ===========================
+  
+  Subject: Request to allow outbound SMTP for internal tool
+Hi,
+I have an internal Oracle DBA monitoring tool running on my machine (localhost:8080). It needs to send automated health report emails.
+Could you please allow outbound TCP connections to:
+
+Host: smtp.gmail.com
+Port: 587
+Protocol: TCP
+
+This is only needed for sending emails from my local machine. It does not require any inbound firewall changes.
+Thanks
+
+
+That's the simplest and most permanent fix. Once IT allows port 587, your current .env with Gmail App Password will work immediately — no code changes needed.
+Want me to draft this as a proper email you can send directly to your IT admin?You said: or suppose we need to send report from company email/or suppose we need to send report from company email/12:02 PMClaude responded: Great idea!Great idea! If you send from fazal.shaikh@cloverinfotech.com, your IT admin just needs to tell you:
+3 things to ask your IT admin:
+
+
+What is our SMTP server address? (e.g. mail.cloverinfotech.com)
+What port does it use? (25, 465, or 587)
+Is SMTP access allowed from inside the office network?
+
+
+
+If the answer is yes to #3, then your .env becomes:
+envSMTP_HOST=mail.cloverinfotech.com   ← whatever they tell you
+SMTP_PORT=587                        ← whatever they tell you
+SMTP_SECURE=false
+SMTP_USER=fazal.shaikh@cloverinfotech.com
+SMTP_PASS=Clover!2026               ← your email password
+SMTP_FROM=fazal.shaikh@cloverinfotech.com
+
+==========================================prerequisite================================
+
+Now I have everything. Let me produce the complete setup guide:Now I have the complete picture. Here is the full setup guide:
+
+---
+
+## Complete Setup Guide for Oracle AI Dashboard
+
+---
+
+### 1. Prerequisites — Software to Install
+
+**Node.js (v18 or higher)**
+Download from nodejs.org. Verify with:
+```bash
+node --version    # must be v18+
+npm --version
+```
+
+**Oracle Instant Client** — required by the `oracledb` npm package to talk to Oracle. Download "Basic" or "Basic Light" package from Oracle's website matching your Oracle DB version (19c recommended).
+
+On Linux:
+```bash
+# Extract to e.g. /opt/oracle/instantclient_19_22
+export LD_LIBRARY_PATH=/opt/oracle/instantclient_19_22:$LD_LIBRARY_PATH
+```
+On Windows: add the Instant Client folder to your system `PATH`.
+
+**Python 3.8+ and Streamlit** — needed for the Healthcheck panel:
+```bash
+pip install streamlit oracledb pandas
+```
+
+---
+
+### 2. Node.js Packages to Install
+
+Run these inside your project folder where `server.js` lives:
+
+```bash
+npm install express oracledb cors http-proxy-middleware dotenv nodemailer
+```
+
+| Package | Purpose |
+|---|---|
+| `express` | HTTP server framework |
+| `oracledb` | Oracle DB driver |
+| `cors` | Cross-origin support for dashboard HTML |
+| `http-proxy-middleware` | Proxy for Streamlit panels |
+| `dotenv` | Loads `.env` config file |
+| `nodemailer` | Email delivery for scheduled reports |
+
+---
+```
+
+---
+
+### 4. Mistral AI API Key
+
+The AI Agent, AI Health Report, and AI analysis features all call **Mistral AI's API**. Get a free key at `console.mistral.ai`, then enter it in the dashboard under **Settings → AI Agent Config**. No key = no AI responses (the rest of the dashboard still works fully).
+
+---
+
+### 5. Oracle Database User Permissions
+
+This is the most important part. Your DB user needs **read-only SELECT access** to many system views. Run all of the following as `SYS` or `SYSTEM`:
+
+```sql
+-- Replace YOUR_USER with your actual schema name (e.g. fazal)
+
+-- ── Core DBA dictionary views ──────────────────────────────────────────────
+GRANT SELECT ON DBA_USERS              TO YOUR_USER;
+GRANT SELECT ON DBA_OBJECTS            TO YOUR_USER;
+GRANT SELECT ON DBA_SEGMENTS           TO YOUR_USER;
+GRANT SELECT ON DBA_DATA_FILES         TO YOUR_USER;
+GRANT SELECT ON DBA_TEMP_FILES         TO YOUR_USER;
+GRANT SELECT ON DBA_FREE_SPACE         TO YOUR_USER;
+GRANT SELECT ON DBA_TABLESPACES        TO YOUR_USER;
+GRANT SELECT ON DBA_SOURCE             TO YOUR_USER;
+GRANT SELECT ON DBA_TAB_STATISTICS     TO YOUR_USER;
+GRANT SELECT ON DBA_ROLES              TO YOUR_USER;
+GRANT SELECT ON DBA_ROLE_PRIVS         TO YOUR_USER;
+GRANT SELECT ON DBA_SYS_PRIVS          TO YOUR_USER;
+GRANT SELECT ON DBA_AUDIT_TRAIL        TO YOUR_USER;
+GRANT SELECT ON DBA_SCHEDULER_JOBS     TO YOUR_USER;
+GRANT SELECT ON DBA_SCHEDULER_JOB_RUN_DETAILS TO YOUR_USER;
+GRANT SELECT ON sys.v_$datafile TO YOUR_USER;
+
+-- ── AWR / Workload Repository (requires Diagnostics Pack licence) ──────────
+GRANT SELECT ON DBA_HIST_SNAPSHOT          TO YOUR_USER;
+GRANT SELECT ON DBA_HIST_SQLSTAT           TO YOUR_USER;
+GRANT SELECT ON DBA_HIST_SYSSTAT           TO YOUR_USER;
+GRANT SELECT ON DBA_HIST_SYSTEM_EVENT      TO YOUR_USER;
+GRANT SELECT ON DBA_HIST_SYS_TIME_MODEL    TO YOUR_USER;
+GRANT SELECT ON DBA_HIST_DATABASE_INSTANCE TO YOUR_USER;
+
+-- ── V$ dynamic performance views ──────────────────────────────────────────
+GRANT SELECT ON V_$SESSION             TO YOUR_USER;
+GRANT SELECT ON V_$SYSSTAT             TO YOUR_USER;
+GRANT SELECT ON V_$SYSTEM_EVENT        TO YOUR_USER;
+GRANT SELECT ON V_$SQLAREA             TO YOUR_USER;
+GRANT SELECT ON V_$PARAMETER           TO YOUR_USER;
+GRANT SELECT ON V_$DATABASE            TO YOUR_USER;
+GRANT SELECT ON V_$INSTANCE            TO YOUR_USER;
+GRANT SELECT ON V_$LOG                 TO YOUR_USER;
+GRANT SELECT ON V_$LOG_HISTORY         TO YOUR_USER;
+GRANT SELECT ON V_$ARCHIVED_LOG        TO YOUR_USER;
+GRANT SELECT ON V_$ARCHIVE_DEST        TO YOUR_USER;
+GRANT SELECT ON V_$ARCHIVE_DEST_STATUS TO YOUR_USER;
+GRANT SELECT ON V_$RECOVERY_AREA_USAGE TO YOUR_USER;
+GRANT SELECT ON V_$RECOVERY_FILE_DEST  TO YOUR_USER;
+GRANT SELECT ON V_$RECOVERY_PROGRESS   TO YOUR_USER;
+GRANT SELECT ON V_$RMAN_BACKUP_JOB_DETAILS TO YOUR_USER;
+GRANT SELECT ON V_$RMAN_CONFIGURATION  TO YOUR_USER;
+GRANT SELECT ON V_$OSSTAT              TO YOUR_USER;
+GRANT SELECT ON V_$SGASTAT             TO YOUR_USER;
+GRANT SELECT ON V_$SORT_SEGMENT        TO YOUR_USER;
+GRANT SELECT ON V_$TEMP_EXTENT_POOL    TO YOUR_USER;
+GRANT SELECT ON V_$DIAG_INFO           TO YOUR_USER;
+GRANT SELECT ON V_$DIAG_ALERT_EXT      TO YOUR_USER;
+GRANT SELECT ON V_$PDBS                TO YOUR_USER;
+GRANT SELECT ON V_$PWFILE_USERS        TO YOUR_USER;
+GRANT SELECT ON V_$DATAGUARD_STATS     TO YOUR_USER;
+GRANT SELECT ON V_$MANAGED_STANDBY     TO YOUR_USER;
+GRANT SELECT ON V_$XML_AUDIT_TRAIL     TO YOUR_USER;
+
+-- ── GV$ views (needed for RAC multi-instance support) ─────────────────────
+GRANT SELECT ON GV_$SESSION            TO YOUR_USER;
+GRANT SELECT ON GV_$SYSSTAT            TO YOUR_USER;
+GRANT SELECT ON GV_$SYSTEM_EVENT       TO YOUR_USER;
+GRANT SELECT ON GV_$SQLAREA            TO YOUR_USER;
+GRANT SELECT ON GV_$INSTANCE           TO YOUR_USER;
+GRANT SELECT ON GV_$DATABASE           TO YOUR_USER;
+GRANT SELECT ON GV_$LOG                TO YOUR_USER;
+GRANT SELECT ON GV_$SGASTAT            TO YOUR_USER;
+GRANT SELECT ON GV_$ENQUEUE_STATISTICS TO YOUR_USER;
+GRANT SELECT ON GV_$CR_BLOCK_SERVER    TO YOUR_USER;
+GRANT SELECT ON GV_$CURRENT_BLOCK_SERVER TO YOUR_USER;
+
+-- ── Package execution rights ───────────────────────────────────────────────
+GRANT EXECUTE ON DBMS_WORKLOAD_REPOSITORY TO YOUR_USER;  -- AWR/ASH reports
+GRANT EXECUTE ON DBMS_XPLAN               TO YOUR_USER;  -- Explain Plan
+GRANT EXECUTE ON DBMS_UTILITY             TO YOUR_USER;  -- Compile schema
+GRANT EXECUTE ON DBMS_LOB                 TO YOUR_USER;  -- Alert log reading
+
+-- ── PLAN_TABLE — needed for Explain Plan ──────────────────────────────────
+-- This is usually created automatically, but if missing:
+-- @?/rdbms/admin/utlxplan.sql   (run as your user, not SYS)
+
+-- ── Alert log access via BFILE (OS directory object) ──────────────────────
+-- The server reads the alert log using a DIRECTORY object pointing to
+-- the Oracle diag trace path. Grant SELECT on V$DIAG_INFO is already
+-- above (it reveals the path). If using BFILE strategy, also run:
+GRANT READ ON DIRECTORY <your_diag_directory_name> TO YOUR_USER;
+-- Find your directory name with: SELECT * FROM DBA_DIRECTORIES;
+```
+
+**Easiest alternative** — if this is a dev/internal DB and you trust the user, just grant the `DBA` role:
+```sql
+GRANT DBA TO YOUR_USER;  -- gives access to everything above in one line
+```
+
+---
+
+### 6. Start the Server
+
+```bash
+node server.js
+# Server starts on http://localhost:8080
+# Open oracle_ai_dashboard.html in your browser
+```
+
+---
+
+### 7. Quick Checklist
+
+| Item | Required | Notes |
+|---|---|---|
+| Node.js v18+ | ✅ Must | |
+| Oracle Instant Client | ✅ Must | Match your DB version |
+| npm packages (5) | ✅ Must | `npm install` command above |
+| `.env` file | ✅ Must | DB credentials |
+| Python + Streamlit | Optional | Only for Healthcheck panel |
+| Mistral API Key | Optional | Only for AI features |
+| Gmail App Password | Optional | Only for scheduled email reports |
+| Oracle user grants | ✅ Must | All `GRANT SELECT` above |
+| AWR Diagnostics Pack | Licensed | AWR/ASH report features |
+
+
+Yes, absolutely! Python installation is also required. Here's the complete Python setup:
+
+---
+
+## Python Installation & Setup
+
+### 1. Install Python
+
+Download **Python 3.8 or higher** from python.org
+
+Verify after install:
+```bash
+python3 --version    # Linux/Mac
+python --version     # Windows
+pip --version
+```
+
+---
+
+### 2. Python Packages to Install
+
+```bash
+pip install streamlit
+pip install oracledb
+pip install pandas
+pip install python-dotenv
+```
+
+Or install all at once:
+```bash
+pip install streamlit oracledb pandas python-dotenv
+```
+
+| Package | Purpose |
+|---|---|
+| `streamlit` | Runs the Healthcheck panel web UI embedded in the dashboard |
+| `oracledb` | Python Oracle DB driver (thin mode — no Instant Client needed for Python side) |
+| `pandas` | Data manipulation for tables and charts in Streamlit |
+| `python-dotenv` | Reads your `.env` file for DB credentials in Python scripts |
+
+---
+
+### 3. Verify Streamlit is Working
+
+```bash
+streamlit --version
+# or
+python -m streamlit --version
+```
+
+The server.js code looks for `streamlit` or `python3 -m streamlit` or `python -m streamlit` in order — so as long as one works, it will find it automatically.
+
+---
+
+### 4. Where Python is Used in Your Code
+
+Looking at your `server.js`, Python/Streamlit is used for these specific panels:
+
+```javascript
+// From server.js — these are the Streamlit apps it launches:
+healthcheck : { file: 'Checkup.py',   port: 8501 }
+```
+
+So you need your `Checkup.py` file in the same directory as `server.js`. The Node server **automatically starts and stops** the Python Streamlit process — you don't run it manually.
+
+---
+
+### 5. Full Folder Structure Should Look Like This
+
+```
+your-project-folder/
+│
+├── server.js                 ← Node.js backend
+├── oracle_ai_dashboard.html  ← Main dashboard (open in browser)
+├── .env                      ← DB credentials
+├── package.json
+├── node_modules/
+│
+└── Checkup.py                ← Python Streamlit healthcheck app
+```
+
+---
+
+### 6. Complete Installation Order (Step by Step)
+
+Do it in this exact order to avoid issues:
+
+```bash
+# Step 1 — Install Node.js (download from nodejs.org)
+node --version   # confirm v18+
+
+# Step 2 — Install Python (download from python.org)
+python3 --version   # confirm 3.8+
+
+# Step 3 — Install Oracle Instant Client (download from Oracle website)
+# Linux: set LD_LIBRARY_PATH
+# Windows: add to PATH
+
+# Step 4 — Install Node packages
+cd your-project-folder
+npm install express oracledb cors http-proxy-middleware dotenv nodemailer
+
+# Step 5 — Install Python packages
+pip install streamlit oracledb pandas python-dotenv
+
+# Step 6 — Create .env file with your DB credentials
+# Step 7 — Grant Oracle DB permissions (all the GRANTs from previous guide)
+
+# Step 8 — Start the server
+node server.js
+
+# Step 9 — Open dashboard in browser
+# http://localhost:8080  or  open oracle_ai_dashboard.html directly
+```
+
+---
+
+### 7. Windows-Specific Notes
+
+On Windows, `python3` may not work — use `python` instead. Also make sure Python is added to PATH during installation (tick the checkbox in the Python installer). If Streamlit isn't found, run:
+
+```bash
+python -m pip install streamlit
+# then test with:
+python -m streamlit hello
+```
+
+---
+
+### 8. Linux/Mac-Specific Notes
+
+```bash
+# If pip install gives permission errors, use:
+pip install streamlit --user
+# or with sudo:
+sudo pip install streamlit
+
+# If python3 not found on older systems:
+sudo apt install python3 python3-pip    # Ubuntu/Debian
+sudo yum install python3 python3-pip   # RHEL/CentOS
+```
+
+---
+
+### Complete Software Requirements Summary
+
+| Software | Version | Download From |
+|---|---|---|
+| Node.js | v18 or higher | nodejs.org |
+| Python | 3.8 or higher | python.org |
+| Oracle Instant Client | Match your DB version | oracle.com/database/technologies/instant-client |
+| npm packages | latest | via `npm install` |
+| pip packages | latest | via `pip install` |
+| Mistral AI key | — | console.mistral.ai (free) |
+
+
+Complete Alert Log Permission Summary
+sql-- Run as SYS — complete safe setup
+GRANT SELECT ON V_$DIAG_INFO       TO fazal;   -- find diag path
+GRANT SELECT ON V_$DIAG_ALERT_EXT  TO fazal;   -- read alert log via SQL
+GRANT SELECT ON V_$DIAG_TRACE_FILE TO fazal;   -- read trace files via SQL
+
+CREATE OR REPLACE DIRECTORY ORACLE_ALERT_DIR
+  AS '/u01/app/oracle/diag/rdbms/orcl/orcl/trace';
+GRANT READ ON DIRECTORY ORACLE_ALERT_DIR TO fazal;  -- BFILE access
+bash# Run as root — OS side
+chmod o+rx /u01/app/oracle/diag/rdbms/orcl/orcl/trace
+chmod o+r  /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log

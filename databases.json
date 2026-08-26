@@ -1,0 +1,20 @@
+{
+  "jayesh": {
+    "id": "jayesh",
+    "label": "Jayesh DB — jayesh@192.168.20.77:1521/tech",
+    "host": "192.168.20.77",
+    "port": "1521",
+    "service": "tech",
+    "user": "jayesh",
+    "password": "jayesh"
+  },
+  "fazal": {
+    "id": "fazal",
+    "label": "Fazal DB — fazal@192.168.2.148:1522/orcl",
+    "host": "192.168.2.148",
+    "port": "1522",
+    "service": "orcl",
+    "user": "fazal",
+    "password": "FAZAL"
+  }
+}
