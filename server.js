@@ -2,12 +2,44 @@ require('dotenv').config();  // ← loads .env file — MUST be first line
 
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const { spawn, execSync }       = require('child_process');
+const { AsyncLocalStorage }     = require('async_hooks');
 const express = require('express');
 const oracledb = require('oracledb');
+// `xlsx` (SheetJS) — used ONLY to read `.nmon.xlsx` reports that ops teams
+// already have on hand (converted from the raw capture by nmon2xlsx /
+// nmonanalyser). Install with:  npm install xlsx
+const XLSX = require('xlsx');
 const cors    = require('cors');
 const fs      = require('fs');
 const path    = require('path');
 const app     = express();
+
+// ── PER-REQUEST DATABASE CONTEXT ─────────────────────────────────────────────
+// ══ CROSS-DATABASE CONTAMINATION FIX ═══════════════════════════════════════
+// ROOT CAUSE of "B db data shows in A db": _activeDBId used to be a single
+// global variable that every query() call read FRESH at execution time. If a
+// request for DB A was still in flight (awaiting a slow Oracle query) when
+// another request switched the active database to B, the first request's
+// LATER query() calls would silently run against B and return B's rows as if
+// they were the answer to the original A request — the client had no way of
+// knowing its response came from the wrong database. This wasn't a rare edge
+// case: any auto-refresh timer overlapping a database switch could trigger it.
+//
+// FIX: capture the intended database ONCE per HTTP request (as soon as it
+// arrives) and store it in an AsyncLocalStorage context. Every await inside
+// that request's handler — no matter how deeply nested — sees the SAME
+// dbId for its entire lifetime, even if the global `_activeDBId` changes
+// underneath it a moment later because of a concurrent /activate call.
+// This required no changes to the ~150 individual query() call sites.
+const _dbContext = new AsyncLocalStorage();
+
+// Resolves the database id that the CURRENT request (or background task)
+// should use. Falls back to the live global for code paths that run outside
+// of an HTTP request (startup, timers), where there is nothing to race with.
+function currentDbId() {
+  const store = _dbContext.getStore();
+  return (store && store.dbId) || _activeDBId;
+}
 
 // ── SYS / SYSDBA credential helper ───────────────────────────────────────────
 // Oracle requires privilege:oracledb.SYSDBA when connecting as SYS.
@@ -140,8 +172,29 @@ const _poolCache = new Map();
 // Load previously registered databases from disk (survives server restart)
 loadRegistry();
 
-// Convenience: get the currently active DB config
-function DB() { return _dbRegistry.get(_activeDBId) || _defaultDB; }
+// Convenience: get the currently active DB config (request-scoped when inside
+// an HTTP request, otherwise the live global — see currentDbId() above)
+function DB() { return _dbRegistry.get(currentDbId()) || _defaultDB; }
+
+// ── Bind every incoming HTTP request to a fixed database id for its whole
+// lifetime. Placed here (after _dbRegistry/_activeDBId exist) and BEFORE all
+// route handlers below, so every request — including /activate itself — runs
+// inside the AsyncLocalStorage context.
+//
+// A request MAY opt in to a specific database by passing ?dbId=<id> (or
+// header X-DB-Id). This lets the frontend pin a panel refresh to the database
+// it was actually issued for, which is the strongest fix: it works even if
+// several databases are being polled concurrently (e.g. two browser tabs).
+// If no dbId is supplied, or it doesn't exist, we fall back to whatever is
+// globally active at the moment the request arrives (previous behaviour),
+// but — crucially — that value is now frozen for the rest of the request.
+app.use((req, res, next) => {
+  const requested = req.query.dbId || req.headers['x-db-id'];
+  const dbId = (requested && _dbRegistry.has(String(requested)))
+    ? String(requested)
+    : _activeDBId;
+  _dbContext.run({ dbId }, next);
+});
 
 // ── CONNECTION POOL ───────────────────────────────────────────────────────────
 // Each registered database gets its own pool. Pools are created on first use
@@ -249,6 +302,8 @@ app.delete('/api/oracle/databases/:id', async (req, res) => {
   const name = _dbRegistry.get(id)?.name;
   _dbRegistry.delete(id);
   // If active was deleted, fall back to default
+  _racInfoByDb.delete(id);
+  _resolvedLogPathsByDb.delete(id);
   if (_activeDBId === id) { _activeDBId = 'default'; racInfo = null; }
   saveRegistry();  // persist deletion
   res.json({ ok: true, message: 'Database removed: ' + name });
@@ -282,9 +337,13 @@ app.post('/api/oracle/databases/:id/activate', async (req, res) => {
   // This must happen as close together as possible so no request window
   // exists where _activeDBId points to the new DB but cache still has old data.
   _activeDBId = id;
-  racInfo = null;             // force re-detect for new DB
-  _resolvedLogPaths = null;   // force re-resolve log paths for new DB
-  _resolvedLogPathsAt = 0;    // reset timestamp so TTL check also clears
+  // Per-DB caches (see CROSS-DATABASE FIX comments above) are keyed by dbId
+  // and never mix between databases, so they no longer need to be reset here
+  // on every switch — but we still drop this DB's own entries so a stale
+  // pre-switch snapshot for THIS id (e.g. from before its connection details
+  // changed) doesn't linger.
+  _racInfoByDb.delete(id);
+  _resolvedLogPathsByDb.delete(id);
   _cache.clear();             // drop every cached value (all DBs, safest option)
 
   saveRegistry();  // persist active DB selection
@@ -319,8 +378,11 @@ const CACHE_TTL_SLOW = 25000;  // 25s — heavier queries (tablespaces, top-sql)
 const CACHE_TTL_MS   = CACHE_TTL_FAST; // default kept for existing cacheSet calls
 const _cache = new Map();
 
-// Returns a DB-scoped cache key so data from different databases never mixes
-function _cacheKey(key) { return _activeDBId + ':' + key; }
+// Returns a DB-scoped cache key so data from different databases never mixes.
+// Uses the request-scoped dbId (currentDbId()), not the raw global, so a
+// request that started against DB A keeps reading/writing DB A's cache
+// entries even if another request switches the global active DB mid-flight.
+function _cacheKey(key) { return currentDbId() + ':' + key; }
 
 function cacheGet(key) {
   const k = _cacheKey(key);
@@ -336,10 +398,19 @@ function cacheSet(key, data, ttl) {
 function cacheSetSlow(key, data) { cacheSet(key, data, CACHE_TTL_SLOW); }
 
 // ── RAC DETECTION ─────────────────────────────────────────────────────────────
-let racInfo = null;
+// ══ CROSS-DATABASE FIX ══════════════════════════════════════════════════════
+// This used to be a single shared `racInfo` variable. If a request against
+// DB A and a request against DB B both called detectRAC() around the same
+// time, whichever one finished first would cache its result in that single
+// variable and the OTHER database's request would be served the wrong
+// (A's or B's) RAC info. Keyed by dbId now so each database has its own
+// cached result and they can never bleed into each other.
+const _racInfoByDb = new Map();
+let racInfo = null; // kept only so `racInfo = null` reset call-sites still work harmlessly
 
 async function detectRAC() {
-  if (racInfo) return racInfo;
+  const dbId = currentDbId();
+  if (_racInfoByDb.has(dbId)) return _racInfoByDb.get(dbId);
   try {
     const rows = await query(
       `SELECT value FROM v$parameter WHERE name = 'cluster_database'`
@@ -352,11 +423,14 @@ async function detectRAC() {
       );
       instances = irows;
     }
-    racInfo = { isRAC, instances };
+    const result = { isRAC, instances };
+    _racInfoByDb.set(dbId, result);
+    return result;
   } catch(e) {
-    racInfo = { isRAC: false, instances: [] };
+    const result = { isRAC: false, instances: [] };
+    _racInfoByDb.set(dbId, result);
+    return result;
   }
-  return racInfo;
 }
 
 // ── QUERY HELPER ──────────────────────────────────────────────────────────────
@@ -366,7 +440,11 @@ async function detectRAC() {
 async function query(sql, binds, opts) {
   let conn;
   try {
-    const pool = await getPool(_activeDBId);
+    // Use the request-scoped database id (see currentDbId()/_dbContext above)
+    // instead of reading the mutable global directly. This is the fix for
+    // queries silently running against the wrong database when a /activate
+    // switch happens concurrently with an in-flight request.
+    const pool = await getPool(currentDbId());
     conn = await pool.getConnection();
     conn.callTimeout = QUERY_TIMEOUT_MS; // real DB-level cancel on timeout
     const result = await conn.execute(sql, binds || [], {
@@ -1330,7 +1408,7 @@ app.post('/api/oracle/explain-plan', async (req, res) => {
   const stmtId = (statement_id || ('EP_' + Date.now().toString(36).toUpperCase())).substring(0, 30);
   let conn;
   try {
-    const _epPool = await getPool(_activeDBId);
+    const _epPool = await getPool(currentDbId());
     conn = await _epPool.getConnection();
     try { await conn.execute(`DELETE FROM PLAN_TABLE WHERE STATEMENT_ID = :1`, [stmtId], { autoCommit: true }); } catch(e) {}
     await conn.execute(`EXPLAIN PLAN SET STATEMENT_ID = '${stmtId}' FOR ${sql}`, [], { autoCommit: true });
@@ -1560,18 +1638,23 @@ app.post('/api/oracle/set-container', async (req, res) => {
     }
 
     // Commit: update registry, preserve _baseConnectionString for future CDB<->PDB switches
+    // Use currentDbId() (request-scoped) rather than the raw global, so this
+    // stays consistent even if a dbId query param pinned this request to a
+    // non-globally-active database.
+    const targetDbId = currentDbId();
     if (!activeDb._baseConnectionString) {
       activeDb._baseConnectionString = activeDb.connectionString;
     }
     activeDb.connectionString = newConnStr;
-    _dbRegistry.set(_activeDBId, activeDb);
+    _dbRegistry.set(targetDbId, activeDb);
 
     // Close existing pool so next query uses fresh connection to new container
-    if (_poolCache.has(_activeDBId)) {
-      try { await _poolCache.get(_activeDBId).close(0); } catch(_) {}
-      _poolCache.delete(_activeDBId);
+    if (_poolCache.has(targetDbId)) {
+      try { await _poolCache.get(targetDbId).close(0); } catch(_) {}
+      _poolCache.delete(targetDbId);
     }
-    racInfo = null;
+    _racInfoByDb.delete(targetDbId);
+    _resolvedLogPathsByDb.delete(targetDbId);
     _cache.clear();
 
     console.log('[set-container] Switched to:', container === '__cdb__' ? 'CDB$ROOT' : newService);
@@ -1765,14 +1848,22 @@ function filterByTime(allLines, fromDT, toDT, maxLines) {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ── CACHED log path resolution (re-resolved every 5 min, not every request) ──
-let _resolvedLogPaths = null;
+// ══ CROSS-DATABASE FIX ══════════════════════════════════════════════════════
+// Same bug class as racInfo above: this was a single shared variable, so a
+// request against DB A could resolve and cache DB A's log/trace paths, and a
+// concurrent request against DB B would then be served A's paths for up to
+// 5 minutes. Keyed by dbId so each database keeps its own resolved paths.
+const _resolvedLogPathsByDb = new Map(); // dbId → { paths, at }
+let _resolvedLogPaths = null;   // kept only so legacy reset call-sites work harmlessly
 let _resolvedLogPathsAt = 0;
 const LOG_PATH_CACHE_MS = 300000; // 5 minutes
 
 async function resolveLogPaths() {
+  const dbId = currentDbId();
+  const cached = _resolvedLogPathsByDb.get(dbId);
   // Return cached result if still fresh — avoids 2 sequential DB queries on every refresh
-  if (_resolvedLogPaths && (Date.now() - _resolvedLogPathsAt) < LOG_PATH_CACHE_MS) {
-    return _resolvedLogPaths;
+  if (cached && (Date.now() - cached.at) < LOG_PATH_CACHE_MS) {
+    return cached.paths;
   }
 
   // Run both DB queries IN PARALLEL with a short per-query timeout
@@ -1806,13 +1897,13 @@ async function resolveLogPaths() {
 
   const derivedAdrBase = adrBase || (adrHome ? adrHome.split('/diag/')[0] : '');
 
-  _resolvedLogPaths = {
+  const resolved = {
     sid, sidLo, dbName, dbNameLo, host, hostLo,
     diagTrace, diagAlert, adrHome, adrBase: derivedAdrBase, defTrace,
     traceDirFromDefault: defTrace ? path.dirname(defTrace) : ''
   };
-  _resolvedLogPathsAt = Date.now();
-  return _resolvedLogPaths;
+  _resolvedLogPathsByDb.set(dbId, { paths: resolved, at: Date.now() });
+  return resolved;
 }
 
 // ── ALERT LOG — robust multi-strategy with per-your-environment fixes ─────────
@@ -2046,7 +2137,7 @@ app.get('/api/oracle/logs/alert', async (req, res) => {
       let conn2;
       const tmpDirName = ('AL' + Date.now()).slice(-28); // max 30 chars for Oracle dir name
       try {
-        const cfg  = _dbRegistry.get(_activeDBId) || _defaultDB;
+        const cfg  = _dbRegistry.get(currentDbId()) || _defaultDB;
         // Standalone connection — bypasses pool entirely, no queueTimeout risk
         conn2 = await Promise.race([
           oracledb.getConnection({
@@ -2567,7 +2658,7 @@ app.post('/api/oracle/logs/trace-content', async (req, res) => {
       let conn2;
       const tmpDirName = ('TRC' + Date.now()).slice(-28);
       try {
-        const cfg       = _dbRegistry.get(_activeDBId) || _defaultDB;
+        const cfg       = _dbRegistry.get(currentDbId()) || _defaultDB;
         const fileDir   = path.dirname(filePath).replace(/\\/g, '/');
         const fileName  = path.basename(filePath);
         const safeDir   = fileDir.replace(/'/g, "''");
@@ -2946,7 +3037,7 @@ app.post('/api/oracle/ash/report', async (req, res) => {
     // ── Generate ASH HTML report — ASH_REPORT_HTML returns a CLOB ────────────
     // We use a raw connection with executeMany-style PL/SQL block to read the CLOB.
     // FIX: Use pool.getConnection() to avoid bypassing pool limits.
-    const pool = await getPool(_activeDBId);
+    const pool = await getPool(currentDbId());
     conn = await pool.getConnection();
 
     let reportHtml = '';
@@ -3232,7 +3323,7 @@ app.post('/api/oracle/awr/report', async (req, res) => {
       ? 'DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_HTML'
       : 'DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_TEXT';
 
-    const pool = await getPool(_activeDBId);
+    const pool = await getPool(currentDbId());
     conn = await pool.getConnection();
 
     // Fetch with CLOB auto-conversion so getData() is never needed
@@ -3286,6 +3377,372 @@ app.post('/api/oracle/awr/report', async (req, res) => {
     }
     res.status(500).json({ error: msg });
   } finally {
+    if (conn) try { await conn.close(); } catch(_) {}
+  }
+});
+
+// ── ADDM Report Generation ────────────────────────────────────────────────────
+// ADDM (Automatic Database Diagnostic Monitor) analyzes a snapshot period and
+// produces prioritized FINDINGS + RECOMMENDATIONS (unlike AWR, which is raw
+// stats). Unlike AWR_REPORT_HTML (a single function call), ADDM requires a
+// stateful task: DBMS_ADVISOR.CREATE_TASK → SET_TASK_PARAMETER (x N) →
+// EXECUTE_TASK, then DBMS_ADVISOR.GET_TASK_REPORT to pull the CLOB, then
+// (best-effort) DELETE_TASK to avoid leaving clutter in DBA_ADVISOR_TASKS.
+// Same Diagnostics Pack license requirement as AWR.
+app.post('/api/oracle/addm/report', async (req, res) => {
+  let conn;
+  try {
+    const { beginSnap, endSnap, inst_id, format, dbid: clientDbid } = req.body;
+    if (!beginSnap || !endSnap) return res.status(400).json({ error: 'beginSnap and endSnap required' });
+    const bSnap = parseInt(beginSnap);
+    const eSnap = parseInt(endSnap);
+    if (isNaN(bSnap) || isNaN(eSnap)) return res.status(400).json({ error: 'Snapshot IDs must be integers' });
+    if (bSnap >= eSnap) return res.status(400).json({ error: 'beginSnap must be less than endSnap. Select a lower snap ID for Begin and a higher snap ID for End.' });
+
+    const [dbRows, instRows] = await Promise.all([
+      query(`SELECT DBID FROM V$DATABASE`).catch(() => []),
+      query(`SELECT INSTANCE_NUMBER FROM V$INSTANCE`).catch(() => []),
+    ]);
+    const dbid    = clientDbid ? parseInt(clientDbid) : (Number(dbRows[0]?.DBID) || 0);
+    const instNum = inst_id    ? parseInt(inst_id)    : (Number(instRows[0]?.INSTANCE_NUMBER) || 1);
+    if (!dbid) return res.status(500).json({ error: 'Cannot resolve DBID from V$DATABASE' });
+
+    // ── Validate both snap IDs exist (try with instance filter first, then without) ──
+    const snapCheck = await query(
+      `SELECT COUNT(*) AS CNT FROM DBA_HIST_SNAPSHOT
+       WHERE DBID = ${dbid} AND INSTANCE_NUMBER = ${instNum}
+         AND SNAP_ID IN (${bSnap}, ${eSnap})`
+    );
+    let validInstNum = instNum;
+    if (Number(snapCheck[0]?.CNT) < 2) {
+      const snapAny = await query(
+        `SELECT INSTANCE_NUMBER, COUNT(*) AS CNT
+         FROM DBA_HIST_SNAPSHOT
+         WHERE DBID = ${dbid} AND SNAP_ID IN (${bSnap}, ${eSnap})
+         GROUP BY INSTANCE_NUMBER
+         HAVING COUNT(*) = 2
+         FETCH FIRST 1 ROWS ONLY`
+      ).catch(() => []);
+      if (snapAny.length > 0) {
+        validInstNum = Number(snapAny[0].INSTANCE_NUMBER) || instNum;
+      } else {
+        return res.status(400).json({
+          error: `Snapshot IDs ${bSnap} and ${eSnap} not found for DBID=${dbid} Inst=${instNum}. ` +
+                 `Verify both snapshots belong to the same database and instance.`
+        });
+      }
+    }
+
+    const useHtml = (format || 'html') === 'html';
+
+    // ── Use a dedicated pooled connection — task create/execute/report-fetch
+    // must all happen on the SAME session, and DBMS_ADVISOR.EXECUTE_TASK can
+    // legitimately take a couple of minutes on a busy period.
+    const pool = await getPool(currentDbId());
+    conn = await pool.getConnection();
+    // FIX (same class of bug as awr/diff-report): don't let this connection
+    // inherit a short callTimeout from elsewhere in the pool — set an
+    // explicit, generous one for this long-running advisor task.
+    conn.callTimeout = 300000; // 5 min
+
+    // ── Step 1: create + configure + execute the ADDM task ───────────────────
+    const createResult = await conn.execute(
+      `DECLARE
+         tid   NUMBER;
+         tname VARCHAR2(30);
+       BEGIN
+         DBMS_ADVISOR.CREATE_TASK('ADDM', tid, tname);
+         DBMS_ADVISOR.SET_TASK_PARAMETER(tname, 'START_SNAPSHOT', :bid);
+         DBMS_ADVISOR.SET_TASK_PARAMETER(tname, 'END_SNAPSHOT',   :eid);
+         DBMS_ADVISOR.SET_TASK_PARAMETER(tname, 'INSTANCE',       :inst);
+         DBMS_ADVISOR.SET_TASK_PARAMETER(tname, 'DB_ID',          :dbid);
+         DBMS_ADVISOR.EXECUTE_TASK(tname);
+         :o_tname := tname;
+       END;`,
+      {
+        bid    : bSnap,
+        eid    : eSnap,
+        inst   : validInstNum,
+        dbid   : dbid,
+        o_tname: { dir: oracledb.BIND_OUT, type: oracledb.STRING, maxSize: 60 },
+      },
+      { autoCommit: true }
+    );
+    const taskName = createResult.outBinds?.o_tname;
+    if (!taskName) {
+      return res.status(500).json({ error: 'ADDM task was created but no task name was returned — cannot fetch report.' });
+    }
+
+    // ── Step 2: pull the report as a CLOB ─────────────────────────────────────
+    // FIX: DBMS_ADVISOR.GET_TASK_REPORT's TYPE argument only accepts 'TEXT'
+    // (per Oracle's DBMS_ADVISOR docs: "type — The only valid value is TEXT.").
+    // Unlike DBMS_ADVISOR.AWR_REPORT_HTML, there is no native 'HTML' report
+    // type for ADDM tasks — passing 'HTML' here raises
+    // ORA-13618: "not a valid value for procedure argument TYPE"
+    // (via SYS.PRVT_ADVISOR), which is NOT a licensing error even though it
+    // looks similar to one. Always fetch TEXT from Oracle, then wrap it in a
+    // minimal HTML page below if the caller asked for 'html' format.
+    const reportResult = await conn.execute(
+      `SELECT DBMS_ADVISOR.GET_TASK_REPORT(:tname, 'TEXT', 'TYPICAL', 'ALL') AS RPT FROM DUAL`,
+      { tname: taskName },
+      {
+        outFormat   : oracledb.OUT_FORMAT_OBJECT,
+        fetchTypeMap: new Map([[oracledb.CLOB, { type: oracledb.STRING }]]),
+        autoCommit  : true,
+      }
+    );
+    let report = reportResult.rows?.[0]?.RPT;
+    // FIX: don't assume the fetched value is already a plain string — same
+    // class of bug the AWR-report route guards against. Depending on
+    // driver/version behavior, a CLOB returned from a scalar function call
+    // (as opposed to a table column) can come back as a Lob object or
+    // Buffer even with fetchTypeMap set, which made `report.trim()` below
+    // throw "report.trim is not a function".
+    if (report === null || report === undefined) {
+      report = '';
+    } else if (typeof report !== 'string') {
+      if (Buffer.isBuffer(report)) {
+        report = report.toString('utf8');
+      } else if (typeof report.getData === 'function') {
+        try { report = await report.getData(); } catch(_) { report = ''; }
+        try { if (typeof report.close === 'function') await report.close(); } catch(_) {}
+      } else {
+        report = String(report);
+      }
+    }
+
+    // ── Step 3: best-effort cleanup — don't fail the request if this fails ───
+    try {
+      await conn.execute(
+        `BEGIN DBMS_ADVISOR.DELETE_TASK(:tname); EXCEPTION WHEN OTHERS THEN NULL; END;`,
+        { tname: taskName },
+        { autoCommit: true }
+      );
+    } catch(_) {}
+
+    if (!report || report.trim().length === 0) {
+      return res.status(500).json({
+        error: `ADDM report returned empty output for snaps ${bSnap}→${eSnap}. ` +
+               `Ensure the Oracle Diagnostics Pack license is active and the SYSAUX tablespace has AWR/ADDM data.`
+      });
+    }
+
+    // ── Step 3.5: ADDM only produces TEXT reports (see note above) — wrap the
+    // plain-text output in a minimal styled HTML page so the 'html' format
+    // option still renders nicely (e.g. in the dashboard's iframe viewer).
+    if (useHtml) {
+      const escapeHtml = (s) => String(s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      report =
+        `<!DOCTYPE html><html><head><meta charset="utf-8">` +
+        `<title>ADDM Report — Snap ${bSnap} to ${eSnap}</title>` +
+        `<style>
+           body{background:#0d1117;color:#c9d1d9;font-family:Consolas,Menlo,monospace;
+                font-size:12px;line-height:1.5;margin:0;padding:16px}
+           pre{white-space:pre-wrap;word-break:break-word;margin:0}
+         </style></head>` +
+        `<body><pre>${escapeHtml(report)}</pre></body></html>`;
+    }
+
+    res.json({
+      report,
+      format  : useHtml ? 'html' : 'text',
+      dbid,
+      instNum : validInstNum,
+      taskName,
+      bSnap,
+      eSnap,
+    });
+
+  } catch(e) {
+    const msg = e.message || String(e);
+    console.error('[addm/report] ERROR:', e && e.stack ? e.stack : msg);
+    // FIX: this used to match on the broad 'ORA-13' prefix, which also
+    // matches ORA-13618 (bad procedure argument) and mislabeled that as a
+    // licensing problem. Scope this to the actual licensing-related errors:
+    // ORA-13501/13503 (Diagnostics Pack) and CONTROL_MANAGEMENT_PACK_ACCESS.
+    if (msg.includes('ORA-13501') || msg.includes('ORA-13503') || msg.includes('CONTROL_MANAGEMENT_PACK_ACCESS')) {
+      return res.status(500).json({ error: 'Oracle Diagnostics Pack license required for ADDM: ' + msg });
+    }
+    if (msg.includes('NJS-123') || msg.includes('ORA-01013') || msg.includes('user requested cancel')) {
+      return res.status(500).json({ error: 'ADDM task timed out or was cancelled — the analysis took too long. Try a shorter snapshot interval.' });
+    }
+    res.status(500).json({ error: msg });
+  } finally {
+    if (conn) try { await conn.close(); } catch(_) {}
+  }
+});
+
+// ── AWR Diff Report Generation (compares two snapshot periods) ───────────────
+// Mirrors /api/oracle/awr/report above but calls
+// DBMS_WORKLOAD_REPOSITORY.AWR_DIFF_REPORT_HTML/TEXT, which takes TWO
+// (dbid, instance, begin_snap, end_snap) tuples — one per period — and
+// returns Oracle's built-in side-by-side comparison report.
+//
+// IMPORTANT: AWR_DIFF_REPORT is much slower than a single AWR_REPORT (Oracle
+// effectively builds both periods' reports internally, then diffs them) — it
+// can easily run 2-5+ minutes even for small snapshot windows. Two things
+// were needed on top of a plain long-running request:
+//   1. A "heartbeat" — write a single space byte to the response every 15s
+//      while Oracle is still working. JSON.parse ignores this leading
+//      whitespace, but it keeps the TCP connection visibly "active" so a
+//      router/firewall/NAT on a cross-machine LAN setup won't silently kill
+//      an idle connection and produce a client-side "Failed to fetch".
+//   2. Disabling Node's socket timeout for this request, since the default
+//      can otherwise cut the connection while the DB call is still pending.
+app.post('/api/oracle/awr/diff-report', async (req, res) => {
+  let conn;
+  let heartbeat = null;
+
+  // Don't let Node's socket-level timeout kill this request while Oracle is
+  // still generating the report.
+  try { req.socket.setTimeout(0); } catch(_) {}
+  try { res.socket && res.socket.setTimeout(0); } catch(_) {}
+
+  // Once the heartbeat has started, headers (implicit 200) are already on
+  // the wire — we can no longer change the HTTP status code. This helper
+  // sends the JSON body correctly either way; the client only inspects the
+  // parsed body's `.error` field for this route, not the HTTP status.
+  const sendJson = (statusCode, obj) => {
+    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+    if (res.headersSent) {
+      try { res.write(JSON.stringify(obj)); } catch(_) {}
+      try { res.end(); } catch(_) {}
+    } else {
+      res.status(statusCode).json(obj);
+    }
+  };
+
+  try {
+    const { beginSnap1, endSnap1, beginSnap2, endSnap2, inst_id, format, dbid: clientDbid } = req.body;
+    if (!beginSnap1 || !endSnap1 || !beginSnap2 || !endSnap2) {
+      return sendJson(400, { error: 'beginSnap1, endSnap1, beginSnap2 and endSnap2 are all required' });
+    }
+    const b1 = parseInt(beginSnap1), e1 = parseInt(endSnap1);
+    const b2 = parseInt(beginSnap2), e2 = parseInt(endSnap2);
+    if ([b1, e1, b2, e2].some(isNaN)) return sendJson(400, { error: 'Snapshot IDs must be integers' });
+    if (b1 >= e1) return sendJson(400, { error: 'Period 1: beginSnap1 must be less than endSnap1.' });
+    if (b2 >= e2) return sendJson(400, { error: 'Period 2: beginSnap2 must be less than endSnap2.' });
+
+    const [dbRows, instRows] = await Promise.all([
+      query(`SELECT DBID FROM V$DATABASE`).catch(() => []),
+      query(`SELECT INSTANCE_NUMBER FROM V$INSTANCE`).catch(() => []),
+    ]);
+    const dbid    = clientDbid ? parseInt(clientDbid) : (Number(dbRows[0]?.DBID) || 0);
+    const instNum = inst_id    ? parseInt(inst_id)    : (Number(instRows[0]?.INSTANCE_NUMBER) || 1);
+    if (!dbid) return sendJson(500, { error: 'Cannot resolve DBID from V$DATABASE' });
+
+    // ── Validate all 4 snap IDs exist (try with instance filter first, then without) ──
+    const allSnaps = [b1, e1, b2, e2];
+    const snapCheck = await query(
+      `SELECT COUNT(DISTINCT SNAP_ID) AS CNT FROM DBA_HIST_SNAPSHOT
+       WHERE DBID = ${dbid} AND INSTANCE_NUMBER = ${instNum}
+         AND SNAP_ID IN (${allSnaps.join(',')})`
+    );
+    let validInstNum = instNum;
+    if (Number(snapCheck[0]?.CNT) < 4) {
+      const snapAny = await query(
+        `SELECT INSTANCE_NUMBER, COUNT(DISTINCT SNAP_ID) AS CNT
+         FROM DBA_HIST_SNAPSHOT
+         WHERE DBID = ${dbid} AND SNAP_ID IN (${allSnaps.join(',')})
+         GROUP BY INSTANCE_NUMBER
+         HAVING COUNT(DISTINCT SNAP_ID) = 4
+         FETCH FIRST 1 ROWS ONLY`
+      ).catch(() => []);
+      if (snapAny.length > 0) {
+        validInstNum = Number(snapAny[0].INSTANCE_NUMBER) || instNum;
+      } else {
+        return sendJson(400, {
+          error: `Snapshot IDs ${allSnaps.join(', ')} not all found for DBID=${dbid} Inst=${instNum}. ` +
+                 `Verify all 4 snapshots belong to the same database and instance.`
+        });
+      }
+    }
+
+    // ── Use a dedicated pooled connection for the AWR Diff report ─────────────
+    const useHtml = (format || 'html') === 'html';
+    const fn = useHtml
+      ? 'DBMS_WORKLOAD_REPOSITORY.AWR_DIFF_REPORT_HTML'
+      : 'DBMS_WORKLOAD_REPOSITORY.AWR_DIFF_REPORT_TEXT';
+
+    const pool = await getPool(currentDbId());
+    conn = await pool.getConnection();
+
+    // FIX: pooled connections can carry over `callTimeout` from a previous
+    // borrower (the shared query() helper sets callTimeout = QUERY_TIMEOUT_MS
+    // = 90000ms on whatever connection it uses). AWR_DIFF_REPORT legitimately
+    // takes minutes, so we must explicitly override callTimeout here — do not
+    // rely on the default. Set it just under the client's 600000ms fetch
+    // timeout so the server returns a clean, informative error instead of the
+    // browser silently aborting first.
+    conn.callTimeout = 590000; // ~9m50s
+
+    // Start the heartbeat now — everything from here on can legitimately take
+    // minutes. res.setHeader must happen before the first res.write.
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    heartbeat = setInterval(() => { try { res.write(' '); } catch(_) {} }, 15000);
+
+    // AWR_DIFF_REPORT signature: (dbid1, inst1, bid1, eid1, dbid2, inst2, bid2, eid2)
+    // Both periods are the same DB/instance here — only the snapshot windows differ.
+    const _t0 = Date.now();
+    console.log(`[awr/diff-report] starting ${fn} dbid=${dbid} inst=${validInstNum} p1=${b1}-${e1} p2=${b2}-${e2}`);
+    const result = await conn.execute(
+      `SELECT OUTPUT FROM TABLE(${fn}(:1,:2,:3,:4,:5,:6,:7,:8))`,
+      [dbid, validInstNum, b1, e1, dbid, validInstNum, b2, e2],
+      {
+        outFormat   : oracledb.OUT_FORMAT_OBJECT,
+        fetchTypeMap: new Map([[oracledb.CLOB, { type: oracledb.STRING }]]),
+        maxRows     : 200000,
+        autoCommit  : true,
+      }
+    );
+    console.log(`[awr/diff-report] Oracle call finished in ${((Date.now()-_t0)/1000).toFixed(1)}s, rows=${(result.rows||[]).length}`);
+
+    const lines = (result.rows || []).map(row => {
+      const v = row.OUTPUT;
+      if (v === null || v === undefined) return '';
+      if (typeof v === 'string') return v;
+      if (Buffer.isBuffer(v)) return v.toString('utf8');
+      return String(v);
+    });
+    const report = lines.join('\n');
+    console.log(`[awr/diff-report] report size: ${(Buffer.byteLength(report,'utf8')/1024/1024).toFixed(2)} MB`);
+
+    if (!report || report.trim().length === 0) {
+      return sendJson(500, {
+        error: `AWR Diff report returned empty output for periods ${b1}-${e1} vs ${b2}-${e2}. ` +
+               `Ensure the Oracle Diagnostics Pack license is active and the SYSAUX tablespace has AWR data.`
+      });
+    }
+
+    sendJson(200, {
+      report,
+      format  : useHtml ? 'html' : 'text',
+      dbid,
+      instNum : validInstNum,
+      period1 : { bSnap: b1, eSnap: e1 },
+      period2 : { bSnap: b2, eSnap: e2 },
+    });
+
+  } catch(e) {
+    const msg = e.message || String(e);
+    // FIX: this route previously swallowed the real error — it was sent back
+    // to the client but never printed server-side, so when the browser saw
+    // a generic network failure (e.g. connection reset before the JSON body
+    // finished sending) there was nothing in the server log to explain why.
+    console.error('[awr/diff-report] ERROR:', e && e.stack ? e.stack : msg);
+    if (msg.includes('ORA-13516') || msg.includes('AWR') || msg.includes('Diagnostic')) {
+      return sendJson(500, { error: 'Oracle Diagnostics Pack license required: ' + msg });
+    }
+    if (msg.includes('ORA-01013') || msg.includes('user requested cancel')) {
+      return sendJson(500, { error: 'AWR Diff query cancelled — the report took too long. Try shorter snapshot intervals.' });
+    }
+    if (msg.includes('NJS-123')) {
+      return sendJson(500, { error: 'AWR Diff report timed out after ~10 minutes. Try a shorter snapshot window for each period, or run during a quieter time on the DB server.' });
+    }
+    sendJson(500, { error: msg });
+  } finally {
+    if (heartbeat) clearInterval(heartbeat);
     if (conn) try { await conn.close(); } catch(_) {}
   }
 });
@@ -3541,9 +3998,29 @@ app.get('/api/oracle/scheduler', async (req, res) => {
                SUM(CASE WHEN STATE='RUNNING'  THEN 1 ELSE 0 END) AS RUNNING,
                SUM(CASE WHEN STATE='DISABLED' THEN 1 ELSE 0 END) AS DISABLED
              FROM DBA_SCHEDULER_JOBS`).catch(() => []),
-      // Return distinct owners for the filter dropdown
-      query(`SELECT DISTINCT OWNER FROM DBA_SCHEDULER_JOBS ORDER BY OWNER`)
-        .catch(() => []),
+      // ── FIX: owners dropdown was only listing owners from DISTINCT OWNER
+      // FROM DBA_SCHEDULER_JOBS — i.e. only schemas that currently happen to
+      // own at least one scheduler job. Any schema with zero scheduler jobs
+      // (which, on most databases, is most of them) never appeared, which is
+      // why only "2 owners" showed up even though the database has many more
+      // schemas. Fixed by UNION-ing in every real application schema from
+      // DBA_USERS (excluding Oracle-maintained accounts), same exclusion
+      // list already used by the Schema panel, so the dropdown lets you
+      // pre-filter by any schema — not just ones that already have a job.
+      query(`SELECT OWNER FROM (
+               SELECT DISTINCT OWNER FROM DBA_SCHEDULER_JOBS
+               UNION
+               SELECT USERNAME AS OWNER FROM DBA_USERS
+               WHERE USERNAME NOT IN (
+                 'SYS','SYSTEM','DBSNMP','SYSMAN','OUTLN','MDSYS','ORDSYS',
+                 'EXFSYS','DMSYS','WMSYS','CTXSYS','ANONYMOUS','XDB','ORDPLUGINS','ORDDATA',
+                 'SI_INFORMTN_SCHEMA','OLAPSYS','SCOTT','XS$NULL','LBACSYS','OJVMSYS',
+                 'GSMADMIN_INTERNAL','APPQOSSYS','DBSFWUSER','GGSYS','AUDSYS','DVF','DVSYS',
+                 'REMOTE_SCHEDULER_AGENT'
+               )
+               AND ACCOUNT_STATUS NOT IN ('EXPIRED & LOCKED','LOCKED')
+             )
+             ORDER BY OWNER`).catch(() => []),
     ]);
     const s = summary[0] || {};
     res.json({
@@ -3807,51 +4284,73 @@ app.get('/api/oracle/dataguard', async (req, res) => {
     const db = dbInfo[0] || {};
 
     // ── DG Stats (only on DG-configured databases) ───────────────────────
+    // NOTE: 'apply finish time' is a known trouble row on V$DATAGUARD_STATS —
+    // on a standby where redo apply hasn't produced an estimate yet, Oracle's
+    // fixed-view logic for that one metric can throw ORA-01722 even though
+    // nothing here does a real numeric conversion. Querying it separately
+    // means that failure can't wipe out transport lag / apply lag / apply
+    // rate / etc, which used to happen because the whole SELECT was one
+    // try/catch.
     let stats = [];
     try {
       stats = await query(
         `SELECT NAME, VALUE, UNIT, TIME_COMPUTED
          FROM V$DATAGUARD_STATS
+         WHERE NAME != 'apply finish time'
          ORDER BY NAME`
       );
     } catch(_) { stats = []; }
+    try {
+      const finishTime = await query(
+        `SELECT NAME, VALUE, UNIT, TIME_COMPUTED
+         FROM V$DATAGUARD_STATS
+         WHERE NAME = 'apply finish time'`
+      );
+      stats = stats.concat(finishTime);
+    } catch(_) { /* known Oracle quirk — omit this one metric, keep the rest */ }
 
     // ── Archive Destinations with full detail ────────────────────────────
+    // NOTE: V$ARCHIVE_DEST_STATUS does NOT have TARGET, ARCHIVER, NET_TIMEOUT,
+    // or APPLIED_SCN columns — those live on the separate V$ARCHIVE_DEST config
+    // view (see destsConfig below). Selecting them here throws ORA-00904 on
+    // every call, which the old code silently swallowed, so this table always
+    // rendered empty. TYPE (LOCAL/PHYSICAL/LOGICAL/SNAPSHOT/…) is the real
+    // per-destination-role column on this view.
     let dests = [];
     try {
       dests = await query(
-        `SELECT d.DEST_ID                          AS "DEST#",
-                d.STATUS,
-                d.TARGET,
-                d.ARCHIVER,
-                d.DB_UNIQUE_NAME,
-                d.NET_TIMEOUT,
-                d.GAP_STATUS,
-                d.SYNCHRONIZED,
-                d.APPLIED_SCN
-         FROM V$ARCHIVE_DEST_STATUS d
-         WHERE d.STATUS != 'INACTIVE'
-         ORDER BY d.DEST_ID`
+        `SELECT DEST_ID                AS "DEST#",
+                STATUS,
+                TYPE,
+                DATABASE_MODE,
+                PROTECTION_MODE,
+                DB_UNIQUE_NAME,
+                GAP_STATUS,
+                SYNCHRONIZED,
+                SYNCHRONIZATION_STATUS,
+                ARCHIVED_SEQ#           AS "ARCHIVED_SEQ",
+                APPLIED_SEQ#            AS "APPLIED_SEQ",
+                ERROR
+         FROM V$ARCHIVE_DEST_STATUS
+         WHERE STATUS != 'INACTIVE'
+         ORDER BY DEST_ID`
       );
-    } catch(_) {
-      try {
-        dests = await query(
-          `SELECT DEST_ID AS "DEST#", STATUS, TARGET, ARCHIVER, DB_UNIQUE_NAME, GAP_STATUS
-           FROM V$ARCHIVE_DEST_STATUS
-           WHERE STATUS != 'INACTIVE'
-           ORDER BY DEST_ID`
-        );
-      } catch(__) { dests = []; }
-    }
+    } catch(_) { dests = []; }
 
-    // ── Standby databases visible ────────────────────────────────────────
+    // ── Standby-related background processes (RFS/MRP/ARCH/etc) visible on
+    //    this instance ────────────────────────────────────────────────────
+    // NOTE: V$MANAGED_STANDBY reports Data Guard PROCESS activity — it has no
+    // DB_UNIQUE_NAME, ROLE, PROTECTION_MODE, DESTINATION, APPLIED_SCN, or
+    // APPLIED_TIME columns (those don't exist on this view at all). The old
+    // query selected all six and threw ORA-00904 on every single call,
+    // silently returning [] via the outer catch.
     let standbys = [];
     try {
       standbys = await query(
-        `SELECT DB_UNIQUE_NAME, ROLE, PROTECTION_MODE, DESTINATION,
-                APPLIED_SCN, APPLIED_TIME
+        `SELECT PROCESS, PID, STATUS, CLIENT_PROCESS, CLIENT_PID,
+                THREAD#, SEQUENCE#, BLOCK#, BLOCKS, DELAY_MINS
          FROM V$MANAGED_STANDBY`
-      ).catch(() => []);
+      );
     } catch(_) { standbys = []; }
 
     // ── Redo apply stats (standby only) ─────────────────────────────────
@@ -3864,11 +4363,117 @@ app.get('/api/oracle/dataguard', async (req, res) => {
       ).catch(() => []);
     } catch(_) { applyStats = []; }
 
-    const isDGConfigured = stats.length > 0
+    // ── Current log sequence being generated (primary-side health check) ─
+    let currentLog = [];
+    try {
+      currentLog = await query(
+        `SELECT THREAD#, SEQUENCE#, ARCHIVED, STATUS
+         FROM V$LOG
+         WHERE STATUS = 'CURRENT'
+         ORDER BY THREAD#`
+      );
+    } catch(_) { currentLog = []; }
+
+    // ── Standby transport destination(s) — error check ───────────────────
+    // Don't assume the standby lives at DEST_ID=2 — that's a common convention
+    // but not a rule (some shops use 3, 4, or have several standby destinations
+    // in a multi-standby config). Instead, find every destination whose TARGET
+    // is actually 'STANDBY' and surface STATUS/ERROR for each of them.
+    // NOTE: TARGET lives on V$ARCHIVE_DEST (the config view) — it does NOT
+    // exist on V$ARCHIVE_DEST_STATUS. V$ARCHIVE_DEST already carries STATUS,
+    // ERROR, and DB_UNIQUE_NAME itself, so no join/second view is needed.
+    let standbyDests = [];
+    try {
+      standbyDests = await query(
+        `SELECT DEST_ID, STATUS, ERROR, DB_UNIQUE_NAME
+         FROM V$ARCHIVE_DEST
+         WHERE TARGET = 'STANDBY'
+         ORDER BY DEST_ID`
+      );
+    } catch(_) { standbyDests = []; }
+
+    // ── Archive destination CONFIG (separate from the STATUS view above) ─
+    // V$ARCHIVE_DEST carries the static config columns (SCHEDULE, DESTINATION,
+    // TRANSMIT_MODE) that don't live on V$ARCHIVE_DEST_STATUS.
+    let destsConfig = [];
+    try {
+      destsConfig = await query(
+        `SELECT DEST_ID, DEST_NAME, STATUS, TARGET, ARCHIVER, SCHEDULE,
+                DESTINATION, ERROR, TRANSMIT_MODE
+         FROM V$ARCHIVE_DEST
+         WHERE STATUS != 'INACTIVE'
+         ORDER BY DEST_ID`
+      );
+    } catch(_) { destsConfig = []; }
+
+    // ── Authoritative DG-configured signal: V$DATAGUARD_CONFIG ───────────
+    // This is the SAME view/logic the dashboard's DB-info banner already uses
+    // ("Data Guard Configured: YES/NO" via COUNT(*)>1 FROM v$dataguard_config)
+    // — it lists every DB_UNIQUE_NAME named in the Data Guard / Broker
+    // configuration, including the local database itself. More than one row
+    // means at least one OTHER site is configured, which is the correct,
+    // Oracle-documented way to answer "is DG configured" and doesn't depend
+    // on the standby-only V$DATAGUARD_STATS view, on archive destinations
+    // happening to show up as rows, or on fal_server/log_archive_config being
+    // set (the heuristics below). Without this, the DG panel could disagree
+    // with the dashboard banner about whether DG is even configured.
+    let dgConfigMembers = [];
+    try {
+      dgConfigMembers = await query(
+        `SELECT DB_UNIQUE_NAME, PARENT_DBUN, DEST_ROLE FROM V$DATAGUARD_CONFIG ORDER BY DB_UNIQUE_NAME`
+      );
+    } catch(_) { dgConfigMembers = []; }
+    const dgConfigViewIndicatesDG = dgConfigMembers.length > 1;
+
+    // ── DG-related init parameters — a cheap, reliable "is DG configured at
+    //    all" signal that doesn't depend on the standby-only V$DATAGUARD_STATS
+    //    view or on how many archive destinations happen to show up as rows ──
+    let dgParams = [];
+    try {
+      dgParams = await query(
+        `SELECT NAME, VALUE FROM V$PARAMETER WHERE NAME IN ('fal_server','fal_client','log_archive_config')`
+      );
+    } catch(_) { dgParams = []; }
+    const falServer        = dgParams.find(r => r.NAME === 'fal_server')?.VALUE || '';
+    const logArchiveConfig = dgParams.find(r => r.NAME === 'log_archive_config')?.VALUE || '';
+
+    // Broker-managed configs frequently leave fal_server/log_archive_config unset
+    // (the broker drives transport itself), so also check log_archive_dest_N
+    // directly for a SERVICE= entry — this doesn't depend on V$ARCHIVE_DEST(_STATUS)
+    // returning rows the way hasStandbyDest below does.
+    let logArchiveDestParams = [];
+    try {
+      logArchiveDestParams = await query(
+        `SELECT VALUE FROM V$PARAMETER WHERE NAME LIKE 'log\\_archive\\_dest\\_%' ESCAPE '\\'`
+      );
+    } catch(_) { logArchiveDestParams = []; }
+    const hasServiceDest = logArchiveDestParams.some(r => (r.VALUE || '').toUpperCase().includes('SERVICE='));
+
+    // ── Is Data Guard actually configured? ───────────────────────────────
+    // IMPORTANT: V$DATAGUARD_STATS is documented by Oracle to return NO ROWS
+    // when queried on a PRIMARY database — that's normal, not a sign DG is
+    // missing — so `stats.length > 0` can only ever confirm DG on a STANDBY.
+    // Likewise, requiring more than one archive destination row breaks on the
+    // very common setup where only the standby-facing destination shows up as
+    // its own row (local/implicit archiving doesn't always appear in
+    // V$ARCHIVE_DEST_STATUS). So on a PRIMARY we instead look for a
+    // standby-targeted destination, a switchover status that only appears in
+    // a real DG config, or fal_server/log_archive_config being set.
+    const hasStandbyDest = dests.some(d => ['PHYSICAL','LOGICAL','SNAPSHOT'].includes((d.TYPE || '').toUpperCase()))
+                         || destsConfig.some(d => (d.TARGET || '').toUpperCase() === 'STANDBY')
+                         || standbyDests.length > 0;
+    const switchoverIndicatesDG = !!db.SWITCHOVER_STATUS
+      && !['NOT ALLOWED', '—', ''].includes(db.SWITCHOVER_STATUS);
+    const paramsIndicateDG = !!falServer.trim() || logArchiveConfig.toUpperCase().includes('DG_CONFIG') || hasServiceDest;
+
+    const isDGConfigured = dgConfigViewIndicatesDG
+      || stats.length > 0
       || db.DATABASE_ROLE === 'PHYSICAL STANDBY'
       || db.DATABASE_ROLE === 'LOGICAL STANDBY'
       || db.DATABASE_ROLE === 'SNAPSHOT STANDBY'
-      || (dests.length > 1); // multiple archive destinations suggests DG
+      || hasStandbyDest
+      || switchoverIndicatesDG
+      || paramsIndicateDG;
 
     // Extract lag values from stats
     const applyLag  = stats.find(r => r.NAME === 'apply lag')?.VALUE  || null;
@@ -3891,10 +4496,299 @@ app.get('/api/oracle/dataguard', async (req, res) => {
       applyRate,
       stats,
       dests,
+      destsConfig,
       standbys,
       applyStats,
+      currentLog,
+      standbyDests,
+      dgConfigMembers,
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DATA GUARD — STANDBY HEALTH CHECK VIA SSH + SQL*PLUS
+//
+//  POST /api/oracle/dataguard/standby-ssh
+//
+//  WHY THIS EXISTS: a physical/logical standby is very often left in MOUNT
+//  state with no listener/service registered — that's normal, Data Guard
+//  redo apply doesn't require the standby to be "open" — so the app's
+//  regular oracledb connection pool (which needs a TNS listener + service)
+//  usually CANNOT reach the standby directly. DBAs instead SSH to the
+//  standby host and run `sqlplus / as sysdba` locally (a "bequeath"
+//  connection — no listener needed at all). This endpoint automates exactly
+//  that: SSH in, source the Oracle environment (oraenv / env_* files, same
+//  approach as the OS Terminal's ssh-exec), open ONE sqlplus session, run
+//  every standby-side Data Guard query in a single batch (CSV markup output
+//  so it's trivial to parse), and hand back structured rows per query so
+//  the Data Guard panel can render them next to the primary-side data.
+//
+//  Body: {
+//    host, port, user, password, privateKey  — SSH connection (same shape as /api/os/ssh-exec)
+//    oracleSid                               — sets ORACLE_SID / sources env_<SID> before connecting
+//    connectString                           — optional full sqlplus CONNECT target, e.g.
+//                                               "sys/password@host:1521/orclpdb1 as sysdba".
+//                                               If omitted, falls back to a local bequeath
+//                                               connection "/ as sysdba" (requires oracleSid
+//                                               and an OS account in the oracle/dba group).
+//    timeout                                 — optional ms, default 60000, hard cap 300000
+//  }
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Split sqlplus CSV-markup output into named blocks using the PROMPT markers
+// injected around every query by _dgBuildStandbySql() below.
+function _dgSplitBlocks(stdout) {
+  const blocks = {};
+  const re = /~~~DGQ_([A-Z0-9_]+)_START~~~\r?\n([\s\S]*?)~~~DGQ_\1_END~~~/g;
+  let m;
+  while ((m = re.exec(stdout)) !== null) blocks[m[1]] = m[2];
+  return blocks;
+}
+
+// Minimal CSV line parser — handles double-quoted fields with "" escaping,
+// exactly what `SET MARKUP CSV ON QUOTE ON` produces.
+function _dgParseCsvLine(line) {
+  const out = [];
+  let cur = '', inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQ) {
+      if (ch === '"') { if (line[i+1] === '"') { cur += '"'; i++; } else inQ = false; }
+      else cur += ch;
+    } else {
+      if (ch === '"') inQ = true;
+      else if (ch === ',') { out.push(cur); cur = ''; }
+      else cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+// Turn one CSV block into { columns, rows, error } — `error` is set when the
+// block's text looks like a SQL*Plus/ORA error instead of CSV data.
+function _dgParseCsvBlock(text) {
+  const lines = (text || '').split(/\r?\n/).map(l => l.replace(/\r$/, '')).filter(l => l.trim() !== '');
+  if (!lines.length) return { columns: [], rows: [], error: null };
+
+  const errLine = lines.find(l => /^\s*(ORA-\d{5}|SP2-\d{4})/.test(l));
+  if (errLine) return { columns: [], rows: [], error: lines.join(' ').trim() };
+
+  const columns = _dgParseCsvLine(lines[0]).map(c => c.trim());
+  const rows    = lines.slice(1).map(l => _dgParseCsvLine(l));
+  return { columns, rows, error: null };
+}
+
+function _dgBuildStandbySql(connectStr) {
+  const Q = (id, sql) => `PROMPT ~~~DGQ_${id}_START~~~\n${sql}\nPROMPT ~~~DGQ_${id}_END~~~\n`;
+  return [
+    `WHENEVER SQLERROR CONTINUE`,
+    `SET HEADING ON`,
+    `SET PAGESIZE 50000`,
+    `SET LINESIZE 32767`,
+    `SET TRIMSPOOL ON`,
+    `SET TRIMOUT ON`,
+    `SET FEEDBACK OFF`,
+    `SET VERIFY OFF`,
+    `SET ECHO OFF`,
+    `SET TERMOUT ON`,
+    `SET WRAP OFF`,
+    `SET MARKUP CSV ON QUOTE ON`,
+    `CONNECT ${connectStr}`,
+    Q('CONNTEST', `SELECT USER AS "CONNECTED_AS" FROM DUAL;`),
+    Q('ROLE',      `SELECT DATABASE_ROLE, OPEN_MODE, PROTECTION_MODE, SWITCHOVER_STATUS FROM V$DATABASE;`),
+    // NOTE: these three V$DATAGUARD_STATS metrics are pulled separately so one bad
+    // row (WHENEVER SQLERROR CONTINUE) can't wipe out the others.
+    //
+    // ROOT CAUSE of the ORA-01722 "invalid number" that used to hit ALL THREE of
+    // these queries identically: TIME_COMPUTED and DATUM_TIME on V$DATAGUARD_STATS
+    // are VARCHAR2 columns (already pre-formatted date strings), NOT DATE columns.
+    // Wrapping a VARCHAR2 in TO_CHAR(col,'format-model') has no valid overload —
+    // SQL*Plus/Oracle falls back to the numeric TO_CHAR(NUMBER, format) signature,
+    // tries to implicitly convert the date-like string to a NUMBER, and throws
+    // ORA-01722 on every single row, for every one of the three metrics. Selecting
+    // the columns as-is (no TO_CHAR) avoids the bad overload entirely.
+    Q('LAG_TRANSPORT',    `SELECT NAME, VALUE, UNIT, TIME_COMPUTED, DATUM_TIME FROM V$DATAGUARD_STATS WHERE NAME = 'transport lag';`),
+    Q('LAG_APPLY',        `SELECT NAME, VALUE, UNIT, TIME_COMPUTED, DATUM_TIME FROM V$DATAGUARD_STATS WHERE NAME = 'apply lag';`),
+    Q('LAG_APPLYFINISH',  `SELECT NAME, VALUE, UNIT, TIME_COMPUTED, DATUM_TIME FROM V$DATAGUARD_STATS WHERE NAME = 'apply finish time';`),
+    Q('ARCHGAP',   `SELECT THREAD#, LOW_SEQUENCE#, HIGH_SEQUENCE# FROM V$ARCHIVE_GAP;`),
+    Q('MRP',       `SELECT PROCESS, STATUS, THREAD#, SEQUENCE#, BLOCK#, BLOCKS FROM V$MANAGED_STANDBY WHERE PROCESS LIKE 'MRP%';`),
+    Q('ALLPROC',   `SELECT PROCESS, PID, STATUS, CLIENT_PROCESS, CLIENT_PID, SEQUENCE#, THREAD#, BLOCK#, ACTIVE_AGENTS, KNOWN_AGENTS FROM V$MANAGED_STANDBY;`),
+    Q('LASTLOG',   `SELECT ARCH.THREAD# AS "THREAD", ARCH.SEQUENCE# AS "LAST_SEQ_RECEIVED", APPL.SEQUENCE# AS "LAST_SEQ_APPLIED", (ARCH.SEQUENCE# - APPL.SEQUENCE#) AS "DIFFERENCE"
+FROM (SELECT THREAD#, SEQUENCE# FROM V$ARCHIVED_LOG
+      WHERE (THREAD#,SEQUENCE#) IN (SELECT THREAD#,MAX(SEQUENCE#)
+      FROM V$ARCHIVED_LOG WHERE RESETLOGS_CHANGE# =
+      (SELECT RESETLOGS_CHANGE# FROM V$DATABASE) GROUP BY THREAD#)) ARCH,
+     (SELECT THREAD#, SEQUENCE# FROM V$LOG_HISTORY
+      WHERE (THREAD#,SEQUENCE#) IN (SELECT THREAD#,MAX(SEQUENCE#)
+      FROM V$LOG_HISTORY GROUP BY THREAD#)) APPL
+WHERE ARCH.THREAD# = APPL.THREAD#;`),
+    Q('RECOVERY',  `SELECT * FROM V$RECOVERY_PROGRESS;`),
+    Q('SRL',       `SELECT GROUP#, THREAD#, SEQUENCE#, ARCHIVED, STATUS FROM V$STANDBY_LOG;`),
+    Q('FAL',       `SELECT NAME, VALUE FROM V$PARAMETER WHERE NAME IN ('fal_server','fal_client','log_archive_config','log_archive_dest_state_2','standby_file_management');`),
+    Q('DATAFILE',  `SELECT FILE#, STATUS, ENABLED, CREATION_CHANGE#, ROUND(BYTES/1024/1024, 2) AS SIZE_MB FROM V$DATAFILE;`),
+    Q('HEALTH',    `SELECT (SELECT VALUE FROM V$DATAGUARD_STATS WHERE NAME='transport lag') AS TRANSPORT_LAG,
+       (SELECT VALUE FROM V$DATAGUARD_STATS WHERE NAME='apply lag') AS APPLY_LAG,
+       (SELECT STATUS FROM V$MANAGED_STANDBY WHERE PROCESS LIKE 'MRP%' AND ROWNUM=1) AS MRP_STATUS,
+       (SELECT DATABASE_ROLE FROM V$DATABASE) AS ROLE,
+       (SELECT OPEN_MODE FROM V$DATABASE) AS OPEN_MODE
+FROM DUAL;`),
+    `EXIT`,
+  ].join('\n');
+}
+
+app.post('/api/oracle/dataguard/standby-ssh', (req, res) => {
+  const { host, port, user: sshUser, password, privateKey, oracleSid, connectString } = req.body || {};
+
+  if (!host || typeof host !== 'string' || !host.trim())     return res.status(400).json({ error: 'host is required' });
+  if (!sshUser || typeof sshUser !== 'string')                return res.status(400).json({ error: 'user is required' });
+  if (!password && !privateKey)                               return res.status(400).json({ error: 'password or privateKey is required' });
+  if (!connectString && !oracleSid)                            return res.status(400).json({ error: 'either oracleSid (for a local "/ as sysdba" bequeath connection) or a full connectString is required' });
+
+  const SSH2 = _getSsh2();
+  if (!SSH2) return res.status(500).json({ error: 'ssh2 package not installed. Run: npm install ssh2  then restart server.js' });
+
+  const sshPort = parseInt(port, 10) || 22;
+  const timeout = Math.min(parseInt(req.body.timeout, 10) || 60_000, 300_000);
+  const t0      = Date.now();
+
+  const connectStr = (connectString && connectString.trim()) || '/ as sysdba';
+
+  // Source the Oracle environment on the remote host: ORACLE_SID → env_<SID> /
+  // oraenv → login profiles, same layered approach as /api/os/ssh-exec so
+  // sqlplus resolves correctly regardless of how that server's DBA set things up.
+  const sidLit = oracleSid ? String(oracleSid).replace(/[^A-Za-z0-9_$]/g, '') : '';
+  const oracleEnvSetup = [
+    sidLit ? `export ORACLE_SID='${sidLit}'` : '',
+    '[ -f "$HOME/.bash_profile" ] && . "$HOME/.bash_profile" 2>/dev/null',
+    '[ -f "$HOME/.bashrc" ]       && . "$HOME/.bashrc"       2>/dev/null',
+    sidLit ? `[ -f "$HOME/env_${sidLit}" ] && . "$HOME/env_${sidLit}" 2>/dev/null` : '',
+    'for __f in "$HOME"/env_*; do [ -f "$__f" ] && . "$__f" 2>/dev/null; done',
+    '[ -z "$ORACLE_HOME" ] && [ -n "$ORACLE_SID" ] && command -v oraenv >/dev/null 2>&1 && export ORAENV_ASK=NO && . oraenv >/dev/null 2>&1',
+    '[ -z "$ORACLE_HOME" ] && [ -d /u01/app/oracle/product ] && export ORACLE_HOME=$(ls -d /u01/app/oracle/product/*/*/bin/.. 2>/dev/null | head -1)',
+    '[ -n "$ORACLE_HOME" ] && export PATH="$ORACLE_HOME/bin:$PATH"',
+  ].filter(Boolean).join(' ; ');
+
+  const sqlScript = _dgBuildStandbySql(connectStr);
+  // Quoted heredoc delimiter ('DGSQLEOF') is CRITICAL: it stops the remote
+  // shell from trying to expand every "$" in V$DATABASE / V$DATAGUARD_STATS
+  // etc. as a shell variable before sqlplus ever sees the script.
+  const fullCmd = `${oracleEnvSetup} ; sqlplus -s /nolog <<'DGSQLEOF'\n${sqlScript}\nDGSQLEOF`;
+
+  console.log(`[dataguard/standby-ssh] ${sshUser}@${host}:${sshPort}  sid=${sidLit || '(none)'}  connectAs=${connectString ? 'custom' : 'bequeath'}`);
+
+  const poolKey = _sshPoolKey(sshUser.trim(), host.trim(), sshPort);
+  let _poolConn = null;
+  let responded = false;
+  const reply = (status, body) => {
+    if (responded) return;
+    responded = true;
+    if (_poolConn) { _sshPoolRelease(poolKey); _poolConn = null; }
+    res.status(status).json(body);
+  };
+
+  const timer = setTimeout(() => reply(504, { error: `Standby SSH/sqlplus check timed out after ${timeout/1000}s` }), timeout);
+
+  _sshPoolGet(sshUser.trim(), host.trim(), sshPort, password, privateKey)
+    .then(conn => {
+      _poolConn = conn;
+      conn.exec(fullCmd, (err, stream) => {
+        if (err) { clearTimeout(timer); return reply(500, { error: 'SSH exec error: ' + err.message }); }
+
+        let stdoutBuf = '', stderrBuf = '';
+        stream.on('data', d => { stdoutBuf += d.toString('utf8'); });
+        stream.stderr.on('data', d => { stderrBuf += d.toString('utf8'); });
+        stream.on('close', (code) => {
+          clearTimeout(timer);
+          const elapsed = Date.now() - t0;
+          const blocks = _dgSplitBlocks(stdoutBuf);
+
+          // ── Connection sanity check ──────────────────────────────────────
+          const connTest = _dgParseCsvBlock(blocks.CONNTEST);
+          if (connTest.error || !blocks.CONNTEST) {
+            const preamble = stdoutBuf.split('~~~DGQ_')[0].trim();
+            return reply(502, {
+              error: 'Could not establish the SQL*Plus session on the standby (' +
+                     (connTest.error || preamble || 'connection failed — check host/SID/credentials').slice(0, 500) + ')',
+              stderr: stderrBuf.slice(0, 2000),
+              host, exitCode: code,
+            });
+          }
+
+          const parsed = {};
+          for (const key of ['ROLE','ARCHGAP','MRP','ALLPROC','LASTLOG','RECOVERY','SRL','FAL','DATAFILE','HEALTH']) {
+            parsed[key] = _dgParseCsvBlock(blocks[key]);
+          }
+
+          // ── Merge the three per-metric lag queries into one 'LAG' result ────
+          // Each of transport lag / apply lag / apply finish time was queried
+          // independently (see _dgBuildStandbySql). If one of them errors — most
+          // commonly 'apply finish time' with ORA-01722 while the standby is
+          // MOUNTED and apply hasn't started — we still show whichever metrics
+          // came back cleanly instead of blanking the whole panel.
+          const lagParts = {
+            'transport lag':     _dgParseCsvBlock(blocks.LAG_TRANSPORT),
+            'apply lag':         _dgParseCsvBlock(blocks.LAG_APPLY),
+            'apply finish time': _dgParseCsvBlock(blocks.LAG_APPLYFINISH),
+          };
+          const lagRows = [];
+          const lagFailures = [];
+          let lagColumns = [];
+          for (const [metric, blk] of Object.entries(lagParts)) {
+            if (blk.error) { lagFailures.push(`${metric}: ${blk.error}`); continue; }
+            if (blk.columns.length) lagColumns = blk.columns;
+            lagRows.push(...blk.rows);
+          }
+          parsed.LAG = {
+            columns: lagColumns,
+            rows: lagRows,
+            // Only surface as a hard error if EVERY metric failed; otherwise keep
+            // the rows that succeeded and note the partial failures separately.
+            error: (lagRows.length === 0 && lagFailures.length) ? lagFailures.join(' | ') : null,
+            partialErrors: lagFailures.length ? lagFailures : undefined,
+          };
+
+          const roleRow = parsed.ROLE.rows[0] || [];
+          const roleCols = parsed.ROLE.columns;
+          const roleIdx = (name) => roleCols.indexOf(name);
+          const lagMap = {};
+          parsed.LAG.rows.forEach(r => {
+            const nameIdx = parsed.LAG.columns.indexOf('NAME');
+            const valIdx  = parsed.LAG.columns.indexOf('VALUE');
+            if (nameIdx >= 0 && valIdx >= 0) lagMap[r[nameIdx]] = r[valIdx];
+          });
+
+          reply(200, {
+            connectedAs:      connTest.rows[0]?.[0] || null,
+            host, sid: sidLit || null,
+            elapsed,
+            role:             roleIdx('DATABASE_ROLE')     >= 0 ? roleRow[roleIdx('DATABASE_ROLE')]     : null,
+            openMode:         roleIdx('OPEN_MODE')         >= 0 ? roleRow[roleIdx('OPEN_MODE')]         : null,
+            protectionMode:   roleIdx('PROTECTION_MODE')   >= 0 ? roleRow[roleIdx('PROTECTION_MODE')]   : null,
+            switchoverStatus: roleIdx('SWITCHOVER_STATUS') >= 0 ? roleRow[roleIdx('SWITCHOVER_STATUS')] : null,
+            transportLag:     lagMap['transport lag']      || null,
+            applyLag:         lagMap['apply lag']           || null,
+            applyFinishTime:  lagMap['apply finish time']   || null,
+            lag:              parsed.LAG,
+            archiveGap:       parsed.ARCHGAP,
+            mrpStatus:        parsed.MRP,
+            allProcesses:     parsed.ALLPROC,
+            lastLog:          parsed.LASTLOG,
+            recoveryProgress: parsed.RECOVERY,
+            standbyRedoLogs:  parsed.SRL,
+            falSettings:      parsed.FAL,
+            datafileStatus:   parsed.DATAFILE,
+            healthCheck:      parsed.HEALTH,
+            exitCode: code,
+          });
+        });
+      });
+    })
+    .catch(err => {
+      clearTimeout(timer);
+      reply(502, { error: 'SSH connection failed: ' + err.message });
+    });
 });
 
 app.get('/api/oracle/rac', async (req, res) => {
@@ -5274,7 +6168,7 @@ app.get('/api/oracle/ddl', async (req, res) => {
 
     let conn;
     try {
-      const pool = await getPool(_activeDBId);
+      const pool = await getPool(currentDbId());
       conn = await pool.getConnection();
       conn.callTimeout = 60000;  // 60s — large packages/types can take time
 
@@ -5661,7 +6555,7 @@ app.post('/api/oracle/terminal', async (req, res) => {
     const t0 = Date.now();
     let conn;
     try {
-      const pool = await getPool(_activeDBId);
+      const pool = await getPool(currentDbId());
       conn = await pool.getConnection();
       conn.callTimeout = 120000; // 2-min timeout for terminal
 
@@ -6256,6 +7150,9 @@ function parseSarText(raw) {
         (colsLower.includes('%user') || colsLower.includes('%usr')))            return 'cpu';
     if (colsLower.includes('kbmemfree'))                                        return 'memory';
     if (colsLower.includes('ldavg-1'))                                          return 'load';
+    // Network errors (`sar -n EDEV`) must be checked BEFORE the throughput section
+    // below — both start with IFACE, but this one carries rxerr/s not rxpck/s.
+    if (colsLower.includes('iface') && colsLower.some(c => c.startsWith('rxerr'))) return 'netedev';
     if (colsLower.includes('iface') && colsLower.some(c => c.startsWith('rxpck'))) return 'network';
     // Per-device disk stats (`sar -d`): DEV tps rkB/s wkB/s ... await svctm %util.
     // Distinct from the aggregate disk section below — this one has a per-device
@@ -6270,6 +7167,32 @@ function parseSarText(raw) {
     // barely swapping, or actively swapping while space is still plentiful.
     if (colsLower.includes('kbswpfree') && colsLower.includes('%swpused'))       return 'swapspace';
     if (colsLower.includes('pgpgin/s'))                                         return 'paging';
+    // Process creation & context-switch rate (`sar -w`) — cheap, high-signal
+    // early warning for thrashing/thundering-herd workloads before CPU/load
+    // even look abnormal.
+    if (colsLower.includes('proc/s') && colsLower.includes('cswch/s'))           return 'procswitch';
+    // Socket usage (`sar -n SOCK`) — totsck/tcpsck/udpsck etc. A slow climb here
+    // with no matching traffic growth usually means a file-descriptor/connection
+    // leak in an application, not real load.
+    if (colsLower.includes('totsck') && colsLower.includes('tcpsck'))            return 'sock';
+    // Kernel table usage (`sar -v`) — dentry cache, open file handles, inode
+    // handlers, pseudo-terminals. Exhausting any one of these can bring down a
+    // host even while CPU/memory/disk all look completely healthy.
+    if (colsLower.includes('dentunusd') && colsLower.includes('file-nr'))        return 'ktables';
+    // Huge pages (`sar -H`) — only present on hosts using HugePages (common for
+    // Oracle SGA sizing).
+    if (colsLower.includes('kbhugfree') && colsLower.includes('kbhugused'))      return 'huge';
+    // NFS client activity (`sar -n NFS`) — call/s + retrans/s is the signature;
+    // a rising retrans/s ratio means the NFS server or network path is unreliable.
+    if (colsLower.includes('call/s') && colsLower.includes('retrans/s'))         return 'nfsclient';
+    // NFS server activity (`sar -n NFSD`) — distinguished from the client view
+    // above by scall/s (server-side "calls received") instead of call/s.
+    if (colsLower.includes('scall/s') && colsLower.includes('badcall/s'))        return 'nfsserver';
+    // Softnet / network-stack stats (`sar -n SOFT`) — dropd/s and squeezd/s
+    // reveal packet drops at the kernel softirq layer that never show up as
+    // interface errors, a common hidden cause of intermittent network stalls
+    // under high packet-per-second load.
+    if (colsLower.includes('total/s') && colsLower.some(c => c.startsWith('dropd')))  return 'softnet';
     return null;
   }
 
@@ -6289,7 +7212,10 @@ function parseSarText(raw) {
     return numericTokens < tokens.length / 2;
   }
 
-  const sections  = { cpu: [], memory: [], load: [], network: [], disk: [], diskdev: [], swap: [], swapspace: [], paging: [] };
+  const sections  = {
+    cpu: [], memory: [], load: [], network: [], disk: [], diskdev: [], swap: [], swapspace: [], paging: [],
+    netedev: [], procswitch: [], sock: [], ktables: [], huge: [], nfsclient: [], nfsserver: [], softnet: [],
+  };
   const colMap    = {};   // section → canonical column names, in the order they appear after the time token
   let   curSection = null;
 
@@ -6373,7 +7299,7 @@ function parseSarText(raw) {
     for (let i = 0; i < cols.length; i++) {
       const key = cols[i];
       const val = tokens[i];
-      if (i === 0 && (curSection === 'cpu' || curSection === 'network' || curSection === 'diskdev')) {
+      if (i === 0 && (curSection === 'cpu' || curSection === 'network' || curSection === 'diskdev' || curSection === 'netedev' || curSection === 'softnet')) {
         row[key] = val; // 'all' / CPU number, interface name, or device name — keep as string
       } else {
         const num = parseFloat(val.replace(',', '.')); // tolerate comma decimals from non-English locales
@@ -6389,15 +7315,23 @@ function parseSarText(raw) {
   const cpuAll = sections.cpu.filter(r => r.cpu === 'all');
 
   const parsed = {
-    cpu:       cpuAll.length ? cpuAll : sections.cpu,
-    memory:    sections.memory,
-    load:      sections.load,
-    network:   sections.network,
-    disk:      sections.disk,
-    diskdev:   sections.diskdev,
-    swap:      sections.swap,
-    swapspace: sections.swapspace,
-    paging:    sections.paging,
+    cpu:        cpuAll.length ? cpuAll : sections.cpu,
+    memory:     sections.memory,
+    load:       sections.load,
+    network:    sections.network,
+    disk:       sections.disk,
+    diskdev:    sections.diskdev,
+    swap:       sections.swap,
+    swapspace:  sections.swapspace,
+    paging:     sections.paging,
+    netedev:    sections.netedev,
+    procswitch: sections.procswitch,
+    sock:       sections.sock,
+    ktables:    sections.ktables,
+    huge:       sections.huge,
+    nfsclient:  sections.nfsclient,
+    nfsserver:  sections.nfsserver,
+    softnet:    sections.softnet,
   };
 
   return { parsed, diag, meta };
@@ -6411,16 +7345,37 @@ function _sarTotalPoints(parsed) {
 // sections succeeding — surfaced directly in the UI so a blank chart is
 // never a silent mystery.
 const SAR_SECTION_HINTS = {
-  cpu:     'No CPU rows found. Make sure the report includes `sar -u` (or plain `sar`) output with the standard "CPU %user %nice %system %iowait %steal %idle" header.',
-  memory:  'No memory rows found. Include `sar -r` output (header starts with "kbmemfree").',
-  load:    'No load-average rows found. Include `sar -q` output (header includes "ldavg-1").',
-  disk:    'No disk I/O rows found. Include `sar -b` output (header includes "bread/s"/"bwrtn/s").',
-  network: 'No network rows found. Include `sar -n DEV` output (header starts with "IFACE").',
+  cpu:        'No CPU rows found. Make sure the report includes `sar -u` (or plain `sar`) output with the standard "CPU %user %nice %system %iowait %steal %idle" header.',
+  memory:     'No memory rows found. Include `sar -r` output (header starts with "kbmemfree").',
+  load:       'No load-average rows found. Include `sar -q` output (header includes "ldavg-1").',
+  disk:       'No disk I/O rows found. Include `sar -b` output (header includes "bread/s"/"bwrtn/s").',
+  network:    'No network rows found. Include `sar -n DEV` output (header starts with "IFACE").',
+  diskdev:    'No per-device disk rows found. Include `sar -d` output (header starts with "DEV").',
+  swap:       'No swap-activity rows found. Include `sar -W` output (header: "pswpin/s pswpout/s").',
+  swapspace:  'No swap-space rows found. Include `sar -S` output (header starts with "kbswpfree").',
+  paging:     'No paging rows found. Include `sar -B` output (header starts with "pgpgin/s").',
+  netedev:    'No network-error rows found. Include `sar -n EDEV` output (header starts with "IFACE" and includes "rxerr/s").',
+  procswitch: 'No process/context-switch rows found. Include `sar -w` output (header: "proc/s cswch/s").',
+  sock:       'No socket-usage rows found. Include `sar -n SOCK` output (header starts with "totsck").',
+  ktables:    'No kernel-table rows found. Include `sar -v` output (header starts with "dentunusd").',
+  huge:       'No hugepages rows found. Include `sar -H` output (header starts with "kbhugfree") — only relevant if this host uses HugePages.',
+  nfsclient:  'No NFS-client rows found. Include `sar -n NFS` output (header starts with "call/s") — only relevant if this host mounts NFS.',
+  nfsserver:  'No NFS-server rows found. Include `sar -n NFSD` output (header starts with "scall/s") — only relevant if this host exports NFS.',
+  softnet:    'No softnet rows found. Include `sar -n SOFT` output (header includes "total/s"/"dropd/s").',
 };
+
+// Sections every production report is expected to have — missing one of these
+// is always surfaced as a warning, even if the header itself was never found.
+const SAR_CORE_SECTIONS = ['cpu', 'memory', 'load', 'disk', 'network'];
+// Optional sections — normal to be entirely absent (not every capture runs
+// every sar flag, and NFS/hugepages only apply to hosts using those features).
+// Only warn on these if the header WAS found but rows still failed to parse,
+// since that indicates a real parsing problem rather than "flag not captured".
+const SAR_OPTIONAL_SECTIONS = ['diskdev', 'swap', 'swapspace', 'paging', 'netedev', 'procswitch', 'sock', 'ktables', 'huge', 'nfsclient', 'nfsserver', 'softnet'];
 
 function _sarBuildWarnings(parsed, diag) {
   const warnings = [];
-  ['cpu', 'memory', 'load', 'disk', 'network'].forEach(sec => {
+  SAR_CORE_SECTIONS.forEach(sec => {
     if ((parsed[sec] || []).length === 0) {
       const hadHeader = !!diag.headersFound[sec];
       warnings.push({
@@ -6429,6 +7384,15 @@ function _sarBuildWarnings(parsed, diag) {
         message: hadHeader
           ? `The "${sec}" header was found but no data rows matched it (${diag.rowsSkippedMismatch[sec] || 0} rows skipped — likely a column-count mismatch).`
           : SAR_SECTION_HINTS[sec],
+      });
+    }
+  });
+  SAR_OPTIONAL_SECTIONS.forEach(sec => {
+    if ((parsed[sec] || []).length === 0 && diag.headersFound[sec] && (diag.rowsSkippedMismatch[sec] || 0) > 0) {
+      warnings.push({
+        section: sec,
+        hadHeader: true,
+        message: `The "${sec}" header was found but no data rows matched it (${diag.rowsSkippedMismatch[sec]} rows skipped — likely a column-count mismatch).`,
       });
     }
   });
@@ -6453,7 +7417,7 @@ app.post('/api/sar/parse', express.text({ type: '*/*', limit: '25mb' }), (req, r
       });
     }
     const warnings = _sarBuildWarnings(parsed, diag);
-    console.log(`[sar/parse] parsed ${text.length} bytes → cpu=${parsed.cpu.length} mem=${parsed.memory.length} load=${parsed.load.length} disk=${parsed.disk.length} diskdev=${parsed.diskdev.length} net=${parsed.network.length} swap=${parsed.swap.length} swapspace=${parsed.swapspace.length} paging=${parsed.paging.length}${meta.hostname ? `  host=${meta.hostname} cores=${meta.cpuCount||'?'}` : ''}${warnings.length ? `  ⚠ ${warnings.length} section(s) empty` : ''}`);
+    console.log(`[sar/parse] parsed ${text.length} bytes → cpu=${parsed.cpu.length} mem=${parsed.memory.length} load=${parsed.load.length} disk=${parsed.disk.length} diskdev=${parsed.diskdev.length} net=${parsed.network.length} netedev=${parsed.netedev.length} swap=${parsed.swap.length} swapspace=${parsed.swapspace.length} paging=${parsed.paging.length} procswitch=${parsed.procswitch.length} sock=${parsed.sock.length} ktables=${parsed.ktables.length} huge=${parsed.huge.length} nfsclient=${parsed.nfsclient.length} nfsserver=${parsed.nfsserver.length} softnet=${parsed.softnet.length}${meta.hostname ? `  host=${meta.hostname} cores=${meta.cpuCount||'?'}` : ''}${warnings.length ? `  ⚠ ${warnings.length} section(s) empty` : ''}`);
     res.json({ ok: true, parsed, warnings, diagnostics: diag, meta });
   } catch (e) {
     res.status(500).json({ error: 'Failed to parse SAR report: ' + e.message });
@@ -6482,30 +7446,70 @@ app.post('/api/sar/live', (req, res) => {
   const timeout = 25_000;
   const t0 = Date.now();
 
-  // One-shot snapshot across all metric groups, separated by unique markers so
-  // we can split the combined stdout back into per-section chunks before parsing.
+  // ── Run all sar samples IN PARALLEL, not sequentially ──────────────────────
+  // Each `sar X 1 1` blocks for its 1-second sample window plus process
+  // spawn overhead. The old code chained all 15 of them with `;` (fully
+  // sequential), so one /api/sar/live round trip always took ~15-20+
+  // seconds no matter what — meaning the "Interval" dropdown (5s/10s/etc.)
+  // could never actually be honored: the in-flight guard just kept skipping
+  // ticks until the still-running 20s request finished, so live data only
+  // ever refreshed every ~20s regardless of the selected interval.
+  // Fix: launch every `sar` invocation as a background job writing to its
+  // own temp file, `wait` for them all (they run concurrently, so total time
+  // ≈ the slowest single one, ~1-2s), then cat the results out in order.
   // LC_ALL=C / LANG=C forces English column headers and period decimal points
   // regardless of the remote host's configured locale — without this, some
   // locales format numbers as "5,23" instead of "5.23" and silently break parsing.
   const ENV = 'LC_ALL=C LANG=C';
-  const cmd = [
-    // Host metadata — captured explicitly (not relied upon from sar's own banner
-    // line) so load-average can be judged against the real CPU core count rather
-    // than a generic guess, and so the report clearly shows which host it's from.
-    'echo __SAR_META_START__', `${ENV} sh -c 'uname -r; hostname; nproc' 2>&1`,        'echo __SAR_META_END__',
-    'echo __SAR_CPU_START__',  `(${ENV} sar -u 1 1 2>&1 || echo "SAR_NOT_INSTALLED")`, 'echo __SAR_CPU_END__',
-    'echo __SAR_MEM_START__',  `${ENV} sar -r 1 1 2>&1`,                                'echo __SAR_MEM_END__',
-    'echo __SAR_LOAD_START__', `${ENV} sar -q 1 1 2>&1`,                                'echo __SAR_LOAD_END__',
-    'echo __SAR_DISK_START__', `${ENV} sar -b 1 1 2>&1`,                                'echo __SAR_DISK_END__',
-    'echo __SAR_NET_START__',  `${ENV} sar -n DEV 1 1 2>&1`,                            'echo __SAR_NET_END__',
+  // Unique temp-file prefix per request ($$  = remote shell PID) so
+  // concurrent /api/sar/live calls (e.g. two browser tabs) never collide.
+  const T = '/tmp/.sarlive_$$';
+  const SECTIONS = [
+    // [marker, background command that writes its output to "$T_<marker>"]
+    ['META',    `${ENV} sh -c 'uname -r; hostname; nproc' > ${T}_META 2>&1 &`],
+    ['CPU',     `(${ENV} sar -u 1 1 > ${T}_CPU 2>&1 || echo "SAR_NOT_INSTALLED" > ${T}_CPU) &`],
+    ['MEM',     `${ENV} sar -r 1 1 > ${T}_MEM 2>&1 &`],
+    ['LOAD',    `${ENV} sar -q 1 1 > ${T}_LOAD 2>&1 &`],
+    ['DISK',    `${ENV} sar -b 1 1 > ${T}_DISK 2>&1 &`],
+    ['NET',     `${ENV} sar -n DEV 1 1 > ${T}_NET 2>&1 &`],
     // Swap activity (pswpin/s, pswpout/s) — the single most reliable signal of
     // genuine memory pressure (as opposed to Linux simply using spare RAM as
     // page cache, which %memused alone can't distinguish).
-    'echo __SAR_SWAP_START__', `${ENV} sar -W 1 1 2>&1`,                                'echo __SAR_SWAP_END__',
+    ['SWAP',    `${ENV} sar -W 1 1 > ${T}_SWAP 2>&1 &`],
     // Paging activity (pgpgin/s, pgpgout/s, fault/s, majflt/s) — surfaced for
     // completeness alongside swap.
-    'echo __SAR_PAGE_START__', `${ENV} sar -B 1 1 2>&1`,                                'echo __SAR_PAGE_END__',
-  ].join(' ; ');
+    ['PAGE',    `${ENV} sar -B 1 1 > ${T}_PAGE 2>&1 &`],
+    // Per-device disk stats — the aggregate DISK section above can look fine
+    // while one specific device is actually saturated.
+    ['DISKDEV', `${ENV} sar -d 1 1 > ${T}_DISKDEV 2>&1 &`],
+    // Network errors — dropped/error/collision packets never show up in the
+    // plain throughput numbers above.
+    ['EDEV',    `${ENV} sar -n EDEV 1 1 > ${T}_EDEV 2>&1 &`],
+    // Process creation & context-switch rate — an early signal of thrashing
+    // before CPU/load even look abnormal.
+    ['PROC',    `${ENV} sar -w 1 1 > ${T}_PROC 2>&1 &`],
+    // Socket usage — a slow climb with no matching traffic growth usually
+    // means a connection/file-descriptor leak in an application.
+    ['SOCK',    `${ENV} sar -n SOCK 1 1 > ${T}_SOCK 2>&1 &`],
+    // Kernel table usage (dentry cache, open files, inodes, ptys) — any one
+    // of these filling up can bring the host down with CPU/memory both idle.
+    ['KTBL',    `${ENV} sar -v 1 1 > ${T}_KTBL 2>&1 &`],
+    // HugePages — only meaningful on hosts sizing an Oracle SGA with them;
+    // harmless (empty/'not installed') if the host doesn't use HugePages.
+    ['HUGE',    `${ENV} sar -H 1 1 > ${T}_HUGE 2>&1 &`],
+    // NFS client/server activity — only meaningful if this host mounts/exports
+    // NFS; harmless if not.
+    ['NFS',     `${ENV} sar -n NFS 1 1 > ${T}_NFS 2>&1 &`],
+    ['NFSD',    `${ENV} sar -n NFSD 1 1 > ${T}_NFSD 2>&1 &`],
+    // Softnet stats — kernel softirq-layer packet drops that never show up as
+    // interface errors, a common hidden cause of intermittent network stalls.
+    ['SOFT',    `${ENV} sar -n SOFT 1 1 > ${T}_SOFT 2>&1 &`],
+  ];
+  const launchAll = SECTIONS.map(([, bgCmd]) => bgCmd).join(' ');
+  const collectAll = SECTIONS
+    .map(([marker]) => `echo __SAR_${marker}_START__; cat ${T}_${marker} 2>/dev/null; echo __SAR_${marker}_END__;`)
+    .join(' ');
+  const cmd = `${launchAll} wait; ${collectAll} rm -f ${T}_*`;
 
   console.log(`[sar/live] sampling ${sshUser}@${host}:${sshPort}`);
 
@@ -6527,11 +7531,31 @@ app.post('/api/sar/live', (req, res) => {
     return m ? m[1] : '';
   }
 
-  _sshPoolGet(sshUser.trim(), host.trim(), sshPort, password, privateKey)
-    .then(conn => {
-      _poolConn = conn;
-      conn.exec(cmd, (err, stream) => {
-        if (err) { clearTimeout(timer); return reply(500, { error: 'SSH exec error: ' + err.message }); }
+  // Wrap exec in the same evict-and-retry-once pattern as /api/os/ssh-exec:
+  // a pooled connection can look "ready" locally while the remote side has
+  // silently dropped it (idle timeout, NAT drop, MaxSessions limit). Without
+  // this retry, a stale pooled connection surfaces here as an immediate
+  // "SSH exec error: Channel open failure" instead of transparently
+  // reconnecting — one of the causes behind the SAR Live panel intermittently
+  // failing even though Batch mode (which already retries) still works.
+  function _execWithRetry(conn, isRetry) {
+    _poolConn = conn;
+    conn.exec(cmd, (err, stream) => {
+      if (err) {
+        const isStale = /channel open failure|open failed/i.test(err.message);
+        if (isStale && !isRetry) {
+          console.warn('[sar/live] channel open failure on pooled conn — retrying fresh');
+          try { conn.end(); } catch(_e) {}
+          _sshPool.delete(poolKey);
+          _poolConn = null;
+          _sshPoolGet(sshUser.trim(), host.trim(), sshPort, password, privateKey)
+            .then(fresh => _execWithRetry(fresh, true))
+            .catch(e2 => { clearTimeout(timer); reply(502, { error: 'SSH connection failed: ' + e2.message }); });
+          return;
+        }
+        clearTimeout(timer);
+        return reply(500, { error: 'SSH exec error: ' + err.message });
+      }
         let out = '';
         stream.on('data', d => { out += d.toString('utf8'); });
         stream.stderr.on('data', d => { out += d.toString('utf8'); });
@@ -6546,7 +7570,7 @@ app.post('/api/sar/live', (req, res) => {
             });
           }
 
-          const combined = ['CPU', 'MEM', 'LOAD', 'DISK', 'NET', 'SWAP', 'PAGE']
+          const combined = ['CPU', 'MEM', 'LOAD', 'DISK', 'NET', 'SWAP', 'PAGE', 'DISKDEV', 'EDEV', 'PROC', 'SOCK', 'KTBL', 'HUGE', 'NFS', 'NFSD', 'SOFT']
             .map(name => extractSection(out, name))
             .join('\n');
 
@@ -6566,7 +7590,10 @@ app.post('/api/sar/live', (req, res) => {
           reply(200, { ok: true, parsed, warnings, elapsed: Date.now() - t0, host, sampledAt: new Date().toISOString(), meta });
         });
       });
-    })
+  } // end _execWithRetry
+
+  _sshPoolGet(sshUser.trim(), host.trim(), sshPort, password, privateKey)
+    .then(conn => _execWithRetry(conn, false))
     .catch(err => {
       clearTimeout(timer);
       console.warn(`[sar/live] connection error: ${err.message}`);
@@ -6575,6 +7602,1219 @@ app.post('/api/sar/live', (req, res) => {
 });
 
 console.log('✓ SAR report analysis endpoints attached (/api/sar/parse, /api/sar/live)');
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  NMON REPORT ANALYSIS — AIX/Linux `nmon` performance capture
+//
+//  POST /api/nmon/parse   Body: raw text (Content-Type: text/plain) — the
+//                          contents of a RAW `.nmon` capture file (the plain
+//                          CSV-style text that `nmon`/`topas_nmon` itself
+//                          writes, e.g. `hostname_YYMMDD_HHMM.nmon`).
+//
+//  POST /api/nmon/parse-xlsx   Body: raw bytes of a `.nmon.xlsx` workbook —
+//                          the Excel conversion of the same capture produced
+//                          by `nmon2xlsx`/`nmonanalyser`/`topas_nmon`'s own
+//                          exporter. Production hosts here are only ever
+//                          handed this .xlsx file (not the original raw
+//                          .nmon text), so this endpoint is the one the
+//                          dashboard's upload box actually uses for .xlsx
+//                          files. See `parseNmonXlsx()` further down for the
+//                          implementation — it returns the exact same JSON
+//                          shape as this text parser.
+//
+//  Every numeric value in the response is taken verbatim from the report —
+//  nothing is estimated, smoothed, or inferred. Sections nmon didn't capture
+//  (e.g. no `-V` flag → no volume-group stats) are simply left empty and
+//  called out explicitly in `warnings`, never silently substituted.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Split a raw nmon CSV line into fields. nmon's own writer never quotes
+// fields, so a plain split is correct and matches how every existing nmon
+// parsing tool (nmon2xlsx, nmonanalyser, njmon) reads this format too.
+function _nmonSplit(line) {
+  return line.split(',');
+}
+
+function parseNmonText(raw) {
+  const rawLines = String(raw || '').split(/\r?\n/).filter(l => l.trim().length > 0);
+
+  // ── Pass 1: bucket every line by its leading section tag ──────────────────
+  const sections = new Map();  // tag -> { header: string[]|null, rows: {tcode, values:string[]}[] }
+  const aaaLines = [];
+  const zzzzRows = [];         // { tcode, timeStr, dateStr }
+
+  for (const line of rawLines) {
+    const parts = _nmonSplit(line);
+    const tag = parts[0];
+    if (!tag) continue;
+
+    if (tag === 'AAA') { aaaLines.push(parts.slice(1)); continue; }
+    if (tag === 'ZZZZ') {
+      // ZZZZ,T0001,08:00:40,10-AUG-2026
+      const [tcode, timeStr, dateStr] = parts.slice(1);
+      if (tcode) zzzzRows.push({ tcode, timeStr: timeStr || '', dateStr: dateStr || '' });
+      continue;
+    }
+    // BBB*/UARG lines are static lookup/legend tables (disk-to-VG name maps,
+    // full command-line args, etc.) — not time-series data. Skip them; they
+    // don't affect any chart or figure below and including them would just
+    // add noise to the section list.
+    if (/^BBB/.test(tag) || tag === 'UARG' || tag === 'ERROR') continue;
+
+    // ══ FIX: TOP section rows are NOT laid out like every other section ═══
+    // Every other tag writes `TAG,Tcode,value1,value2,...` — Tcode is always
+    // the field right after the tag. TOP is nmon's one exception: it writes
+    // `TOP,PID,Tcode,value1,value2,...` — the PID comes BEFORE the Tcode.
+    // The generic isDataRow check below (`/^T\d+$/.test(rest[0])`) tests the
+    // PID against the Tcode pattern, fails, and the row was silently
+    // dropped — even on captures taken with `-T` and thousands of real TOP
+    // rows present, `topProcesses` came back completely empty with a
+    // misleading "capture likely run without -T" warning. Handle TOP's
+    // PID-then-Tcode layout explicitly instead of assuming Tcode-first.
+    if (tag === 'TOP') {
+      const rest = parts.slice(1);           // [PID, Tcode, %CPU, %Usr, ...] or [+PID, Time, %CPU, ...] for the header line
+      const tcode = rest[1];
+      if (!sections.has(tag)) sections.set(tag, { header: null, rows: [] });
+      const sec = sections.get(tag);
+      if (/^T\d+$/.test(tcode || '')) {
+        // Keep the FULL field list (including PID) so column positions still
+        // line up 1:1 with the header row below.
+        sec.rows.push({ tcode, values: rest });
+      } else if (!sec.header && rest.length > 1) {
+        // nmon writes a single-field caption line ("TOP,%CPU Utilisation")
+        // immediately before the real column-name header row — a bare
+        // `rest.length === 1` line like that is never the header, so skip
+        // it and wait for the actual multi-column header line.
+        sec.header = rest;
+      }
+      continue;
+    }
+
+    const rest = parts.slice(1);
+    const isDataRow = /^T\d+$/.test(rest[0] || '');
+    if (!sections.has(tag)) sections.set(tag, { header: null, rows: [] });
+    const sec = sections.get(tag);
+    if (isDataRow) {
+      sec.rows.push({ tcode: rest[0], values: rest.slice(1) });
+    } else if (!sec.header) {
+      // First non-data-row line for this tag is its column header.
+      sec.header = rest;
+    }
+  }
+
+  // ── Metadata (AAA) ──────────────────────────────────────────────────────
+  const meta = {};
+  for (const parts of aaaLines) {
+    const key = parts[0];
+    if (!key) continue;
+    meta[key] = parts.slice(1).filter(v => v !== undefined && v !== '').join(',');
+  }
+
+  // ── Timestamp map: Tcode → real Date + display label ───────────────────
+  // nmon's own date/time strings are locale-dependent in format (DD-MON-YYYY
+  // is standard) — parsed explicitly rather than trusted to `new Date(str)`,
+  // which mis-parses DD-MON-YYYY in some Node/ICU builds.
+  const MONTHS = { JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11 };
+  function parseNmonDateTime(dateStr, timeStr) {
+    const dm = /^(\d{1,2})[-\/](\w{3})[-\/](\d{2,4})$/.exec((dateStr || '').trim());
+    const tm = /^(\d{1,2}):(\d{2}):(\d{2})$/.exec((timeStr || '').trim());
+    if (!dm || !tm) return null;
+    const mon = MONTHS[dm[2].toUpperCase()];
+    if (mon === undefined) return null;
+    let year = parseInt(dm[3], 10);
+    if (year < 100) year += 2000;
+    return new Date(year, mon, parseInt(dm[1],10), parseInt(tm[1],10), parseInt(tm[2],10), parseInt(tm[3],10));
+  }
+
+  const timeMap = new Map(); // tcode -> { date: Date|null, label: 'HH:MM:SS' }
+  for (const z of zzzzRows) {
+    const date = parseNmonDateTime(z.dateStr, z.timeStr);
+    timeMap.set(z.tcode, { date, label: z.timeStr });
+  }
+  // Sort order for all series: chronological by ZZZZ Tcode sequence (the
+  // order nmon itself wrote them in), NOT alphabetical Tcode string sort —
+  // T0001..T9999 sorts correctly as strings up to 4 digits but a report with
+  // >9999 snapshots would break that assumption, so we sort by the ZZZZ
+  // capture order explicitly.
+  const tcodeOrder = new Map(zzzzRows.map((z, i) => [z.tcode, i]));
+  function sortByTime(rows) {
+    return rows.slice().sort((a, b) => (tcodeOrder.get(a.tcode) ?? 1e9) - (tcodeOrder.get(b.tcode) ?? 1e9));
+  }
+  function timeLabel(tcode) {
+    const t = timeMap.get(tcode);
+    return t ? t.label : tcode;
+  }
+  function timeISO(tcode) {
+    const t = timeMap.get(tcode);
+    return (t && t.date) ? t.date.toISOString() : null;
+  }
+
+  const num = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
+
+  // ── Generic helper: turn a parsed section into an array of row objects
+  //    keyed by its header column names (trimmed), in chronological order ──
+  function namedRows(tag) {
+    const sec = sections.get(tag);
+    if (!sec || !sec.header) return { header: [], rows: [] };
+    const header = sec.header.map(h => (h || '').trim());
+    const rows = sortByTime(sec.rows).map(r => {
+      const obj = { tcode: r.tcode, time: timeLabel(r.tcode), iso: timeISO(r.tcode) };
+      header.forEach((h, i) => { if (h) obj[h] = num(r.values[i]); });
+      return obj;
+    });
+    return { header, rows };
+  }
+
+  // ── CPU_ALL — overall logical-CPU utilization ──────────────────────────
+  const cpuAll = namedRows('CPU_ALL');
+  const cpu = cpuAll.rows.map(r => ({
+    time: r.time, iso: r.iso,
+    user: r['User%'], sys: r['Sys%'], wait: r['Wait%'], idle: r['Idle%'],
+    busy: r['Busy'], physicalCPUs: r['PhysicalCPUs'], cpuPct: r['CPU%']
+  }));
+
+  // ── LPAR — AIX virtualization / entitlement (absent on bare-metal Linux
+  //    captures — that's expected and fine, not an error) ─────────────────
+  const lparRows = namedRows('LPAR');
+  const lpar = lparRows.rows.map(r => ({
+    time: r.time, iso: r.iso,
+    physicalCPU: r['PhysicalCPU'], virtualCPUs: r['virtualCPUs'], logicalCPUs: r['logicalCPUs'],
+    poolCPUs: r['poolCPUs'], entitled: r['entitled'], weight: r['weight'],
+    poolIdle: r['PoolIdle'], usedAllCPUPct: r['usedAllCPU%'], usedPoolCPUPct: r['usedPoolCPU%'],
+    sharedCPU: r['SharedCPU'], capped: r['Capped'],
+    ecUser: r['EC_User%'], ecSys: r['EC_Sys%'], ecWait: r['EC_Wait%'], ecIdle: r['EC_Idle%'],
+    // VP_* = utilization measured against Virtual Processors (the LPAR's
+    // dispatched VP count), NOT against the much larger logical-CPU count
+    // that CPU_ALL's User/Sys/Wait use. This is what the reference
+    // nmon-analyser workbook's headline "CPU% vs VPs" chart plots — it's a
+    // materially different (and for capacity planning, more meaningful)
+    // view than the logical-CPU chart, so it's kept as its own field set
+    // rather than folded into `cpu`.
+    vpUser: r['VP_User%'], vpSys: r['VP_Sys%'], vpWait: r['VP_Wait%'], vpIdle: r['VP_Idle%'],
+    folded: r['Folded'], unfoldedVPs: r['Unfolded VPs'], otherLPARs: r['OtherLPARs']
+  }));
+
+  // ── Memory ──────────────────────────────────────────────────────────────
+  const memRows = namedRows('MEM');
+  const memory = memRows.rows.map(r => ({
+    time: r.time, iso: r.iso,
+    realFreePct: r['Real Free %'], virtFreePct: r['Virtual free %'],
+    realFreeMB: r['Real free(MB)'], virtFreeMB: r['Virtual free(MB)'],
+    realTotalMB: r['Real total(MB)'], virtTotalMB: r['Virtual total(MB)']
+  }));
+
+  // ── Paging (pgspace) ─────────────────────────────────────────────────────
+  const pageRows = namedRows('PAGE');
+  const paging = pageRows.rows.map(r => ({
+    time: r.time, iso: r.iso, faults: r['faults'], pgin: r['pgin'], pgout: r['pgout'],
+    pgsin: r['pgsin'], pgsout: r['pgsout'], srfr: r['sr/fr']
+  }));
+
+  // ── Process / run-queue ──────────────────────────────────────────────────
+  const procRows = namedRows('PROC');
+  const proc = procRows.rows.map(r => ({
+    time: r.time, iso: r.iso, runQueue: r['RunQueue'], swapIn: r['Swap-in'],
+    pswitch: r['pswitch'], syscall: r['syscall'], fork: r['fork'], exec: r['exec']
+  }));
+
+  // ── Generic helper: sum every column of a "wide" per-item section (one
+  //    column per disk/HBA/etc.) into a single per-timestamp total. Used for
+  //    Fibre Channel below, and as the DISK_SUMM fallback further down. ────
+  function sumWideSection(tag) {
+    const sec = sections.get(tag);
+    if (!sec || !sec.header) return { header: [], rows: [], totals: [] };
+    const header = sec.header.map(h => (h || '').trim()).filter(Boolean);
+    const rows = sortByTime(sec.rows);
+    const totals = rows.map(r => {
+      const vals = r.values.map(num).filter(v => v !== null);
+      return { time: timeLabel(r.tcode), iso: timeISO(r.tcode), total: vals.reduce((a,v)=>a+v,0) };
+    });
+    return { header, rows, totals };
+  }
+
+  // ── Disk throughput summary ──────────────────────────────────────────────
+  const diskSummRows = namedRows('DISK_SUMM');
+  let diskSumm = diskSummRows.rows.map(r => ({
+    time: r.time, iso: r.iso,
+    readKBs: r['Disk Read KB/s'], writeKBs: r['Disk Write KB/s'], iops: r['IO/sec']
+  }));
+  // ══ FIX: some captures omit DISK_SUMM (the nmon-computed aggregate row)
+  // but still write DISKREAD/DISKWRITE — the same per-disk wide sections
+  // DISKBUSY comes from, just in KB/s instead of %busy. When that's the
+  // case, derive the same total-KB/s-across-all-disks figure ourselves by
+  // summing every disk column per timestamp (identical approach to the FC
+  // summation below) instead of leaving the whole Disk I/O chart blank when
+  // the raw data to compute it was there in the file all along. `iops` has
+  // no equivalent per-disk column to derive from, so it's left null rather
+  // than guessed. ══
+  let diskSummSource = diskSumm.length ? 'DISK_SUMM' : null;
+  if (!diskSumm.length) {
+    const diskReadSum  = sumWideSection('DISKREAD');
+    const diskWriteSum = sumWideSection('DISKWRITE');
+    if (diskReadSum.header.length || diskWriteSum.header.length) {
+      const n = Math.max(diskReadSum.totals.length, diskWriteSum.totals.length);
+      diskSumm = Array.from({ length: n }, (_, i) => {
+        const rt = diskReadSum.totals[i], wt = diskWriteSum.totals[i];
+        return {
+          time: (rt || wt).time, iso: (rt || wt).iso,
+          readKBs: (rt && rt.total) || 0, writeKBs: (wt && wt.total) || 0, iops: null
+        };
+      });
+      diskSummSource = 'derived-DISKREAD/DISKWRITE';
+    }
+  }
+
+  // ── Fibre Channel throughput (SAN-attached storage — sum across all HBAs)
+  const fcRead  = sumWideSection('FCREAD');
+  const fcWrite = sumWideSection('FCWRITE');
+  const hasFC = fcRead.header.length > 0;
+  const fc = hasFC ? fcRead.totals.map((r, i) => ({
+    time: r.time, iso: r.iso, readKBs: r.total, writeKBs: (fcWrite.totals[i] && fcWrite.totals[i].total) || 0
+  })) : [];
+
+  // ── Network — prefer nmon's own Total-Read / Total-Write columns when
+  //    present (nmon computes these itself, excluding loopback); nmon writes
+  //    the write total as a NEGATIVE number purely so a combined RX/TX chart
+  //    plots above/below one axis in its own reporting tools — we take the
+  //    absolute value since this is a magnitude, not a signed quantity ──────
+  const netSec = namedRows('NET');
+  let netTotals = [];
+  const netHeaderTrim = (sections.get('NET') && sections.get('NET').header || []).map(h => (h||'').trim());
+  const hasNetTotalCols = netHeaderTrim.includes('Total-Read') && netHeaderTrim.some(h => h.startsWith('Total-Write'));
+  if (hasNetTotalCols) {
+    const writeKey = netHeaderTrim.find(h => h.startsWith('Total-Write'));
+    netTotals = netSec.rows.map(r => ({
+      time: r.time, iso: r.iso, readKBs: r['Total-Read'] || 0, writeKBs: Math.abs(r[writeKey] || 0)
+    }));
+  } else if (netHeaderTrim.length) {
+    // Fallback: sum every *-read / *-write column ourselves (still exact —
+    // just computed here instead of trusting a Total-* column nmon didn't
+    // write, e.g. when the report was captured with an older nmon build)
+    const readCols  = netHeaderTrim.filter(h => /-read$/i.test(h));
+    const writeCols = netHeaderTrim.filter(h => /-write$/i.test(h));
+    netTotals = netSec.rows.map(r => ({
+      time: r.time, iso: r.iso,
+      readKBs:  readCols.reduce((a,h)=>a+(Math.abs(r[h])||0),0),
+      writeKBs: writeCols.reduce((a,h)=>a+(Math.abs(r[h])||0),0)
+    }));
+  }
+  // Per-interface averages (excludes loopback `lo*` from the "top" ranking —
+  // loopback traffic never leaves the host and isn't a network bottleneck)
+  const netInterfaces = [];
+  // ══ FIX: a NET section that only has nmon's own Total-Read/Total-Write
+  // columns (no per-adapter breakdown) is a normal, valid capture — not a
+  // missing section. Previously the per-interface table and the "no NET
+  // section" message couldn't tell this case apart from NET being entirely
+  // absent, so a report with real (if all-zero) network totals still showed
+  // the misleading "No NET section in this report." Track it explicitly. ══
+  const netIfCols = netHeaderTrim.filter(h => h && !/^(Total-Read|Total-Write.*)$/i.test(h));
+  const hasNetPerInterfaceData = netIfCols.length > 0;
+  if (netHeaderTrim.length) {
+    const ifNames = [...new Set(netHeaderTrim
+      .map(h => h.replace(/-(read|write|total)$/i, ''))
+      .filter(h => h && !/^(Total-Read|Total-Write.*)$/i.test(h)))];
+    ifNames.forEach(name => {
+      const rCol = netHeaderTrim.find(h => h === `${name}-read`);
+      const wCol = netHeaderTrim.find(h => h === `${name}-write`);
+      if (!rCol && !wCol) return;
+      const reads  = netSec.rows.map(r => r[rCol]).filter(v => v != null);
+      const writes = netSec.rows.map(r => r[wCol]).filter(v => v != null);
+      const avg = arr => arr.length ? arr.reduce((a,v)=>a+v,0)/arr.length : 0;
+      const max = arr => arr.length ? Math.max(...arr) : 0;
+      netInterfaces.push({
+        name, isLoopback: /^lo\d*$/i.test(name),
+        avgReadKBs: avg(reads), maxReadKBs: max(reads),
+        avgWriteKBs: avg(writes), maxWriteKBs: max(writes)
+      });
+    });
+    netInterfaces.sort((a,b) => (b.avgReadKBs+b.avgWriteKBs) - (a.avgReadKBs+a.avgWriteKBs));
+  }
+
+  // ── Disk busy — per-hdisk %busy → top-N busiest disks by average ────────
+  function topBusyFromWideSection(tag, label) {
+    const sec = sections.get(tag);
+    if (!sec || !sec.header) return [];
+    const header = sec.header.map(h => (h || '').trim()).filter(Boolean);
+    const rows = sortByTime(sec.rows);
+    return header.map((name, colIdx) => {
+      const vals = rows.map(r => num(r.values[colIdx])).filter(v => v !== null);
+      const avg = vals.length ? vals.reduce((a,v)=>a+v,0)/vals.length : 0;
+      const max = vals.length ? Math.max(...vals) : 0;
+      return { name, avgBusyPct: avg, maxBusyPct: max, samples: vals.length };
+    }).sort((a,b) => b.avgBusyPct - a.avgBusyPct);
+  }
+  const diskBusyAll = topBusyFromWideSection('DISKBUSY');
+  const vgBusyAll   = topBusyFromWideSection('VGBUSY');
+
+  // ── Generic helper: rank a "wide" per-item section (one column per disk/
+  //    filesystem/adapter/etc.) by AVERAGE value across the whole capture,
+  //    keeping avg+max+samples — same shape as topBusyFromWideSection but
+  //    for sections whose values are magnitudes (KB/s, MB, count) rather
+  //    than a 0–100 %busy figure. Used for JFSFILE, JFSINODE, IOADAPT,
+  //    PAGING (space) below. ─────────────────────────────────────────────
+  function rankWideSection(tag) {
+    const sec = sections.get(tag);
+    if (!sec || !sec.header) return [];
+    const header = sec.header.map(h => (h || '').trim()).filter(Boolean);
+    const rows = sortByTime(sec.rows);
+    return header.map((name, colIdx) => {
+      const vals = rows.map(r => num(r.values[colIdx])).filter(v => v !== null);
+      const avg = vals.length ? vals.reduce((a,v)=>a+v,0)/vals.length : 0;
+      const max = vals.length ? Math.max(...vals) : 0;
+      const min = vals.length ? Math.min(...vals) : 0;
+      return { name, avg, max, min, samples: vals.length };
+    });
+  }
+  // Time-series for the top-N columns of a wide section (by whichever
+  // ranking array is passed in) — used to trend the busiest/fullest
+  // filesystems/adapters instead of just showing a single ranked table.
+  function wideSectionTrend(tag, topNames) {
+    const sec = sections.get(tag);
+    if (!sec || !sec.header || !topNames.length) return { names: [], rows: [] };
+    const header = sec.header.map(h => (h || '').trim());
+    const colIdx = topNames.map(n => header.indexOf(n));
+    const rows = sortByTime(sec.rows).map(r => ({
+      time: timeLabel(r.tcode), iso: timeISO(r.tcode),
+      values: colIdx.map(ci => ci >= 0 ? num(r.values[ci]) : null)
+    }));
+    return { names: topNames, rows };
+  }
+
+  // ── Memory: additional breakdowns (MEMUSE / MEMNEW) ─────────────────────
+  const memUseRows = namedRows('MEMUSE');
+  const memUse = memUseRows.rows.map(r => ({
+    time: r.time, iso: r.iso,
+    numperm: r['%numperm'], minperm: r['%minperm'], maxperm: r['%maxperm'],
+    minfree: r['minfree'], maxfree: r['maxfree'],
+    numclient: r['%numclient'], maxclient: r['%maxclient'],
+    lruablePages: r[' lruable pages'] ?? r['lruable pages'], comp: r['%comp']
+  }));
+  const memNewRows = namedRows('MEMNEW');
+  const memNew = memNewRows.rows.map(r => ({
+    time: r.time, iso: r.iso,
+    processPct: r['Process%'], fscachePct: r['FScache%'], systemPct: r['System%'],
+    freePct: r['Free%'], pinnedPct: r['Pinned%'], userPct: r['User%']
+  }));
+
+  // ── Filesystem usage (JFSFILE / JFSINODE) — critical for production ────
+  const fsUsedAll = rankWideSection('JFSFILE').sort((a,b) => b.max - a.max);
+  const fsUsedTop5Names = fsUsedAll.slice(0, 5).map(f => f.name);
+  const fsUsedTrend = wideSectionTrend('JFSFILE', fsUsedTop5Names);
+  const fsInodeAll = rankWideSection('JFSINODE').sort((a,b) => b.max - a.max);
+
+  // ── Network packets/sec (NETPACKET) ─────────────────────────────────────
+  const netPktSec = sections.get('NETPACKET');
+  let netPackets = [];
+  if (netPktSec && netPktSec.header) {
+    const header = netPktSec.header.map(h => (h||'').trim());
+    const readCols  = header.filter(h => /-reads\/s$/i.test(h));
+    const writeCols = header.filter(h => /-writes\/s$/i.test(h));
+    const rows = sortByTime(netPktSec.rows);
+    netPackets = rows.map(r => {
+      const obj = {}; header.forEach((h,i) => { if (h) obj[h] = num(r.values[i]); });
+      return {
+        time: timeLabel(r.tcode), iso: timeISO(r.tcode),
+        readPktsPerSec:  readCols.reduce((a,h)=>a+(obj[h]||0),0),
+        writePktsPerSec: writeCols.reduce((a,h)=>a+(obj[h]||0),0)
+      };
+    });
+  }
+
+  // ── Paging space free (PAGING) — different from PAGE (fault/pgin/pgout)
+  //    above; this is MB-free per paging device, the number that matters
+  //    when a production box is at risk of swap exhaustion. ──────────────
+  const pagingSpaceAll = rankWideSection('PAGING');
+  const pagingSpaceDevices = pagingSpaceAll.map(d => ({ name: d.name, avgFreeMB: d.avg, minFreeMB: d.min, samples: d.samples }))
+    .sort((a,b) => a.minFreeMB - b.minFreeMB); // most-depleted device first
+  let pagingSpaceTotal = [];
+  { const sec = sections.get('PAGING');
+    if (sec && sec.header) {
+      const header = sec.header.map(h => (h||'').trim()).filter(Boolean);
+      pagingSpaceTotal = sortByTime(sec.rows).map(r => ({
+        time: timeLabel(r.tcode), iso: timeISO(r.tcode),
+        totalFreeMB: r.values.map(num).filter(v=>v!==null).reduce((a,v)=>a+v,0)
+      }));
+    }
+  }
+
+  // ── Shared CPU pool (POOLS) & Large Page use (LARGEPAGE) — single latest
+  //    snapshot info cards, these are slow-changing configuration-style
+  //    metrics rather than something you'd trend over time. ───────────────
+  function latestSnapshot(tag) {
+    const r = namedRows(tag);
+    return r.rows.length ? r.rows[r.rows.length - 1] : null;
+  }
+  const poolsLatest = latestSnapshot('POOLS');
+  const pools = poolsLatest ? {
+    time: poolsLatest.time,
+    shcpusInSys: poolsLatest['shcpus_in_sys'], maxPoolCapacity: poolsLatest['max_pool_capacity'],
+    entitledPoolCapacity: poolsLatest['entitled_pool_capacity'], poolBusyTime: poolsLatest['pool_busy_time'],
+    entitled: poolsLatest['entitled']
+  } : null;
+  const largePageLatest = latestSnapshot('LARGEPAGE');
+  const largePage = largePageLatest ? {
+    time: largePageLatest.time,
+    freePages: largePageLatest['Freepages'], usedPages: largePageLatest['Usedpages'],
+    pages: largePageLatest['Pages'], highWater: largePageLatest['HighWater'], sizeMB: largePageLatest['SizeMB']
+  } : null;
+
+  // ── Disk adapter / HBA throughput (IOADAPT) — ranked like Busiest Disks
+  //    but by average combined KB/s instead of %busy (this section has no
+  //    busy% column, just per-adapter read/write KB/s and xfer/tps). ──────
+  let ioAdaptTop = [];
+  { const sec = sections.get('IOADAPT');
+    if (sec && sec.header) {
+      const header = sec.header.map(h => (h||'').trim()).filter(Boolean);
+      const rows = sortByTime(sec.rows);
+      const readCols  = header.filter(h => /_read$/i.test(h));
+      const writeCols = header.filter(h => /_write$/i.test(h));
+      const adapterNames = [...new Set([...readCols, ...writeCols].map(h => h.replace(/_(read|write|xfer-tps)$/i,'')))];
+      ioAdaptTop = adapterNames.map(name => {
+        const rIdx = header.indexOf(`${name}_read`), wIdx = header.indexOf(`${name}_write`);
+        const reads  = rIdx>=0 ? rows.map(r=>num(r.values[rIdx])).filter(v=>v!==null) : [];
+        const writes = wIdx>=0 ? rows.map(r=>num(r.values[wIdx])).filter(v=>v!==null) : [];
+        const avg = arr => arr.length ? arr.reduce((a,v)=>a+v,0)/arr.length : 0;
+        const max = arr => arr.length ? Math.max(...arr) : 0;
+        return { name, avgReadKBs: avg(reads), avgWriteKBs: avg(writes), maxReadKBs: max(reads), maxWriteKBs: max(writes) };
+      }).sort((a,b) => (b.avgReadKBs+b.avgWriteKBs) - (a.avgReadKBs+a.avgWriteKBs));
+    }
+  }
+
+  // ── File-level I/O (FILE) & Async I/O (PROCAIO) ─────────────────────────
+  const fileIORows = namedRows('FILE');
+  const fileIO = fileIORows.rows.map(r => ({
+    time: r.time, iso: r.iso, iget: r['iget'], namei: r['namei'],
+    readch: r['readch'], writech: r['writech']
+  }));
+  const procAioRows = namedRows('PROCAIO');
+  const procAio = procAioRows.rows.map(r => ({
+    time: r.time, iso: r.iso, aioprocs: r['aioprocs'], aiorunning: r['aiorunning'],
+    aiocpu: r['aiocpu'], syscpu: r['syscpu']
+  }));
+
+  // ── Per-Volume-Group full detail — merges VGBUSY/VGREAD/VGWRITE/VGXFER/
+  //    VGSIZE (5 separate wide sections keyed by the same VG names) into
+  //    one ranked table instead of 5 disconnected ones. ───────────────────
+  function avgOf(tag, name) {
+    const sec = sections.get(tag);
+    if (!sec || !sec.header) return null;
+    const header = sec.header.map(h => (h||'').trim());
+    const idx = header.indexOf(name);
+    if (idx < 0) return null;
+    const vals = sortByTime(sec.rows).map(r => num(r.values[idx])).filter(v => v !== null);
+    return vals.length ? vals.reduce((a,v)=>a+v,0)/vals.length : null;
+  }
+  const vgNames = [...new Set(vgBusyAll.map(v => v.name))];
+  const vgDetail = vgNames.map(name => {
+    const busyRow = vgBusyAll.find(v => v.name === name);
+    return {
+      name,
+      avgBusyPct: busyRow ? busyRow.avgBusyPct : null, maxBusyPct: busyRow ? busyRow.maxBusyPct : null,
+      avgReadKBs: avgOf('VGREAD', name), avgWriteKBs: avgOf('VGWRITE', name),
+      avgXfer: avgOf('VGXFER', name), sizeGB: avgOf('VGSIZE', name)
+    };
+  }).sort((a,b) => (b.avgBusyPct||0) - (a.avgBusyPct||0));
+
+  // ── Per-CPU-core breakdown (CPU01, CPU02, … as separate sections) ──────
+  const perCpuTags = [...sections.keys()].filter(t => /^CPU\d+$/.test(t)).sort();
+  const perCpu = perCpuTags.map(tag => {
+    const r = namedRows(tag);
+    const users = r.rows.map(x=>x['User%']).filter(v=>v!=null);
+    const syss  = r.rows.map(x=>x['Sys%']).filter(v=>v!=null);
+    const waits = r.rows.map(x=>x['Wait%']).filter(v=>v!=null);
+    const avg = a => a.length ? a.reduce((s,v)=>s+v,0)/a.length : 0;
+    const busySeries = r.rows.map(x => (x['User%']||0)+(x['Sys%']||0)+(x['Wait%']||0));
+    return {
+      id: tag, avgUser: avg(users), avgSys: avg(syss), avgWait: avg(waits),
+      avgBusy: avg(busySeries), maxBusy: busySeries.length ? Math.max(...busySeries) : 0
+    };
+  }).sort((a,b) => b.avgBusy - a.avgBusy);
+
+  const topSec = sections.get('TOP');
+  let topProcesses = [];
+  let topPeak = null;
+  if (topSec && topSec.header) {
+    // ══ FIX: nmon labels the TOP section's PID column "+PID" (with a
+    // leading +) on some builds, not "PID" — strip it so idx['PID'] below
+    // actually matches instead of coming back undefined. ══
+    const header = topSec.header.map(h => (h || '').trim().replace(/^\+/, ''));
+    const idx = {}; header.forEach((h,i) => idx[h] = i);
+    const byCommand = new Map(); // command -> { sumCPU, maxCPU, maxCPUAt, samples, pids:Set, user }
+    for (const r of topSec.rows) {
+      const cmd = (r.values[idx['Command']] || '').trim() || '(unknown)';
+      const pct = num(r.values[idx['%CPU']]);
+      if (pct === null) continue;
+      const user = (r.values[idx['User']] || '').trim();
+      const pid  = (r.values[idx['PID']] || '').trim();
+      if (!byCommand.has(cmd)) byCommand.set(cmd, { command: cmd, user, sumCPU: 0, maxCPU: 0, maxCPUAt: null, maxCPUPid: null, samples: 0, pids: new Set() });
+      const b = byCommand.get(cmd);
+      b.sumCPU += pct; b.samples += 1; b.pids.add(pid);
+      if (pct > b.maxCPU) { b.maxCPU = pct; b.maxCPUAt = timeLabel(r.tcode); b.maxCPUPid = pid; }
+      if (!topPeak || pct > topPeak.pct) topPeak = { pct, command: cmd, pid, user, time: timeLabel(r.tcode) };
+    }
+    topProcesses = [...byCommand.values()].map(b => ({
+      command: b.command, user: b.user, avgCPU: b.sumCPU / b.samples, maxCPU: b.maxCPU,
+      maxCPUAt: b.maxCPUAt, samples: b.samples, distinctPIDs: b.pids.size
+    })).sort((a,b) => b.avgCPU - a.avgCPU);
+  }
+
+  // ── Assemble diagnostics / warnings (same "never silently blank" philosophy
+  //     as the SAR parser) ───────────────────────────────────────────────────
+  const sectionsFound = [...sections.keys()];
+  const warnings = [];
+  if (!cpu.length)      warnings.push({ section: 'cpu',    message: 'No CPU_ALL section found — this may not be a valid nmon capture file.' });
+  if (!memory.length)   warnings.push({ section: 'memory', message: 'No MEM section found.' });
+  if (!diskSumm.length) {
+    warnings.push({ section: 'disk', message: 'No DISK_SUMM section found, and no DISKREAD/DISKWRITE sections to derive totals from either (capture may have been run without disk stats, or disks_per_line limit hid the summary).' });
+  } else if (diskSummSource === 'derived-DISKREAD/DISKWRITE') {
+    warnings.push({ section: 'disk', message: 'No DISK_SUMM section found — Disk I/O totals below are derived by summing the DISKREAD/DISKWRITE per-disk sections instead (IOPS is not available this way, so it\'s left blank).' });
+  }
+  if (!netTotals.length) {
+    warnings.push({ section: 'network', message: 'No NET section found.' });
+  } else if (!hasNetPerInterfaceData) {
+    warnings.push({ section: 'network', message: 'NET section only has nmon\'s aggregate Total-Read/Total-Write columns — no per-adapter breakdown was captured, so the Network Interfaces table will be empty even though the totals chart has data.' });
+  }
+  if (!lpar.length)     warnings.push({ section: 'lpar',   message: 'No LPAR section — normal for a non-virtualized/bare-metal or non-AIX capture; entitlement analysis will be skipped.' });
+  if (!proc.length)     warnings.push({ section: 'proc',   message: 'No PROC section found — run queue, context-switch, and fork/exec metrics will be skipped.' });
+  if (!topProcesses.length) warnings.push({ section: 'top', message: 'No TOP (per-process) section — the capture was likely run without the -T flag, so top-process ranking will be skipped.' });
+  if (!diskBusyAll.length)  warnings.push({ section: 'diskbusy', message: 'No DISKBUSY section — per-disk busy% ranking will be skipped.' });
+  if (!memUse.length)   warnings.push({ section: 'memuse',  message: 'No MEMUSE section — kernel memory-pool tuning metrics will be skipped.' });
+  if (!memNew.length)   warnings.push({ section: 'memnew',  message: 'No MEMNEW section — memory-category breakdown chart will be skipped.' });
+  if (!fsUsedAll.length) warnings.push({ section: 'filesystem', message: 'No JFSFILE section — filesystem %used table will be skipped.' });
+  if (!netPackets.length) warnings.push({ section: 'netpacket', message: 'No NETPACKET section — packets/sec chart will be skipped.' });
+  if (!pagingSpaceDevices.length) warnings.push({ section: 'pagingspace', message: 'No PAGING section — paging-space-free table will be skipped.' });
+  if (!ioAdaptTop.length) warnings.push({ section: 'ioadapt', message: 'No IOADAPT section — disk adapter/HBA ranking will be skipped.' });
+  if (!perCpu.length)   warnings.push({ section: 'percpu',   message: 'No per-core CPU sections (CPU01, CPU02, …) — per-core breakdown will be skipped.' });
+
+  // LPARNumberName / MachineType come through as "3,CHFRSDB02" / "IBM,9080-HEX"
+  // (nmon writes them as two separate comma fields) — split back out into
+  // clean labeled values instead of showing the user a raw embedded comma.
+  const lparParts = (meta.LPARNumberName || '').split(',').map(s => s.trim());
+  const machineParts = (meta.MachineType || '').split(',').map(s => s.trim());
+
+  return {
+    meta: {
+      host: meta.host || meta.NodeName || null,
+      lparName: lparParts[1] || lparParts[0] || null,
+      lparNumber: (lparParts.length > 1 ? lparParts[0] : null),
+      machineVendor: machineParts[0] || null,
+      machineModel: machineParts[1] || null,
+      serialNumber: meta.SerialNumber || null,
+      aixVersion: meta.AIX || null,
+      technologyLevel: meta.TL || null,
+      hardware: meta.hardware || null,
+      kernel: meta.kernel || null,
+      captureTool: meta.version || null,
+      intervalSec: num(meta.interval),
+      snapshots: num(meta.snapshots) || zzzzRows.length,
+      capturedBy: meta.user || null,
+      command: meta.command || null,
+      startTime: zzzzRows.length ? timeLabel(zzzzRows[0].tcode) : null,
+      endTime: zzzzRows.length ? timeLabel(zzzzRows[zzzzRows.length-1].tcode) : null,
+      startISO: zzzzRows.length ? timeISO(zzzzRows[0].tcode) : null,
+      endISO: zzzzRows.length ? timeISO(zzzzRows[zzzzRows.length-1].tcode) : null,
+    },
+    cpu, lpar, memory, paging, proc, diskSumm, diskSummSource, fc, hasFC,
+    netTotals, netInterfaces, hasNetPerInterfaceData,
+    diskBusyTop: diskBusyAll.slice(0, 15), diskBusyCount: diskBusyAll.length,
+    vgBusy: vgBusyAll,
+    topProcesses: topProcesses.slice(0, 20), topPeak,
+    memUse, memNew,
+    fsUsedTop: fsUsedAll.slice(0, 20), fsUsedCount: fsUsedAll.length, fsUsedTrend,
+    fsInodeTop: fsInodeAll.slice(0, 20), fsInodeCount: fsInodeAll.length,
+    netPackets,
+    pagingSpaceDevices, pagingSpaceTotal,
+    pools, largePage,
+    ioAdaptTop: ioAdaptTop.slice(0, 15),
+    fileIO, procAio,
+    vgDetail,
+    perCpu,
+    sectionsFound, warnings,
+    diag: { totalLines: rawLines.length, aaaLines: aaaLines.length, zzzzCount: zzzzRows.length, sectionsFound }
+  };
+}
+
+function _nmonTotalPoints(parsed) {
+  return (parsed.cpu.length + parsed.memory.length + parsed.diskSumm.length + parsed.netTotals.length +
+          parsed.lpar.length + parsed.paging.length + parsed.proc.length);
+}
+
+// ── POST /api/nmon/parse ─────────────────────────────────────────────────────
+// 60 MB limit — the TOP (per-process) section can be very large on hosts
+// running thousands of processes across many hours of capture (this sample
+// report alone, at 460 snapshots, has ~68,000 TOP rows).
+app.post('/api/nmon/parse', express.text({ type: '*/*', limit: '60mb' }), (req, res) => {
+  try {
+    const text = req.body || '';
+    if (!text.trim()) return res.status(400).json({ error: 'Empty nmon report content' });
+
+    // Quick sanity check before doing the full parse, so a wrong file (e.g.
+    // someone uploads the .nmon.xlsx by mistake) gets a clear, specific error
+    // instead of a confusing "no data found".
+    if (!/^AAA,/m.test(text) && !/^ZZZZ,/m.test(text)) {
+      // A .xlsx file posted here as text/plain shows up as binary garbage,
+      // not valid nmon CSV — detect the "PK" zip signature xlsx files start
+      // with and point the user at the right endpoint instead of a generic
+      // "not a valid nmon file" error.
+      const looksLikeXlsx = text.slice(0, 2) === 'PK';
+      return res.status(400).json({
+        error: looksLikeXlsx
+          ? 'This looks like a .nmon.xlsx file, not raw text. The dashboard now supports .xlsx uploads directly ' +
+            '— select the file again from the upload box and it will be routed correctly.'
+          : 'This doesn\'t look like a raw nmon capture file or a .nmon.xlsx workbook. Make sure you\'re ' +
+            'uploading either the plain-text .nmon file (e.g. "hostname_YYMMDD_HHMM.nmon") or its .nmon.xlsx ' +
+            'Excel conversion — both are supported.'
+      });
+    }
+
+    const parsed = parseNmonText(text);
+    if (_nmonTotalPoints(parsed) === 0) {
+      return res.status(400).json({
+        error: 'No recognizable nmon time-series sections found in this file. Make sure it\'s a complete, ' +
+               'un-truncated raw .nmon capture.',
+        diagnostics: parsed.diag
+      });
+    }
+    console.log(`[nmon/parse] parsed ${text.length} bytes → host=${parsed.meta.host||'?'} snapshots=${parsed.meta.snapshots} ` +
+      `cpu=${parsed.cpu.length} mem=${parsed.memory.length} disk=${parsed.diskSumm.length} net=${parsed.netTotals.length} ` +
+      `lpar=${parsed.lpar.length} top=${parsed.topProcesses.length}${parsed.warnings.length ? `  ⚠ ${parsed.warnings.length} section(s) missing` : ''}`);
+    res.json(parsed);
+  } catch (e) {
+    console.error('[nmon/parse] error:', e);
+    res.status(500).json({ error: 'Failed to parse nmon report: ' + e.message });
+  }
+});
+
+console.log('✓ NMON report analysis endpoint attached (/api/nmon/parse)');
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  NMON REPORT ANALYSIS — .nmon.xlsx (Excel conversion) SUPPORT
+//
+//  ══ FIX: "sections show no data" for production reports ══════════════════
+//  ROOT CAUSE: /api/nmon/parse only ever accepted the RAW plain-text `.nmon`
+//  capture file. Production hosts here are only distributed the `.nmon.xlsx`
+//  workbook (built by nmon2xlsx/topas_nmon's own Excel export) — the raw
+//  `.nmon` text file is not what gets handed to the dashboard. Uploading the
+//  .xlsx to the old endpoint was rejected outright with "doesn't look like a
+//  raw nmon capture file", so EVERY section came back empty — not just some.
+//
+//  FIX: read the workbook directly with SheetJS. Each nmon section (CPU_ALL,
+//  MEM, PAGE, PROC, DISK_SUMM, NET, LPAR, DISKBUSY, VGBUSY, FCREAD/FCWRITE,
+//  TOP, plus the AAA metadata and ZZZZ timestamp sheets) is written by the
+//  Excel exporter as its own sheet, using the exact same column names as the
+//  raw text format — so every value below is read verbatim from the
+//  spreadsheet cell, nothing is estimated or re-derived, same as the raw
+//  parser above. The two endpoints return the IDENTICAL JSON shape, so the
+//  existing frontend rendering code (nmonRenderAll) needs no changes at all.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const _xlsxNum = v => (typeof v === 'number' && Number.isFinite(v)) ? v : null;
+function _xlsxTimeLabel(d) { return (d instanceof Date) ? d.toTimeString().slice(0, 8) : null; }
+function _xlsxIso(d) { return (d instanceof Date) ? d.toISOString() : null; }
+
+// Reads one sheet into { header:[...], rows:[{date, time, iso, values:[...]}] }.
+// Column A of every nmon-exported sheet is the timestamp; column B onward are
+// the same fields the raw `.nmon` writer uses, in the same order.
+function _xlsxSheetRows(wb, name) {
+  if (!wb.SheetNames.includes(name)) return { header: [], rows: [] };
+  const raw = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: true, defval: null, blankrows: false });
+  if (!raw.length) return { header: [], rows: [] };
+  const header = (raw[0] || []).slice(1).map(h => (h == null ? '' : String(h).trim()));
+  const rows = raw.slice(1)
+    .map(r => ({ date: (r[0] instanceof Date) ? r[0] : null, values: r.slice(1) }))
+    .filter(r => r.date); // drops any trailing blank rows some exporters leave
+  return { header, rows };
+}
+
+// Same shape as `namedRows()` in the raw-text parser above, but keyed off a
+// real per-row Date instead of a shared Tcode — the xlsx exporter doesn't
+// carry Tcodes at all, and sections like TOP have their own timestamps that
+// don't line up with the main ZZZZ interval grid, so per-row dates are the
+// more reliable join key here.
+function _xlsxNamedRows(wb, tag) {
+  const { header, rows } = _xlsxSheetRows(wb, tag);
+  return {
+    header,
+    rows: rows.map(r => {
+      const obj = { time: _xlsxTimeLabel(r.date), iso: _xlsxIso(r.date) };
+      header.forEach((h, i) => { if (h) obj[h] = _xlsxNum(r.values[i]); });
+      return obj;
+    })
+  };
+}
+
+function parseNmonXlsx(buffer) {
+  const wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
+
+  // ── Metadata (AAA sheet) ──────────────────────────────────────────────
+  const meta = {};
+  if (wb.SheetNames.includes('AAA')) {
+    const raw = XLSX.utils.sheet_to_json(wb.Sheets.AAA, { header: 1, raw: true, defval: '' });
+    raw.forEach(r => {
+      const key = r[0];
+      if (!key) return;
+      meta[key] = r.slice(1).filter(v => v !== undefined && v !== '' && v !== null).join(',');
+    });
+  }
+
+  // ── Capture window (ZZZZ sheet) ─────────────────────────────────────────
+  let zzzzDates = [];
+  if (wb.SheetNames.includes('ZZZZ')) {
+    const raw = XLSX.utils.sheet_to_json(wb.Sheets.ZZZZ, { header: 1, raw: true, defval: null });
+    zzzzDates = raw.map(r => (r[3] instanceof Date) ? r[3] : ((r[2] instanceof Date) ? r[2] : null)).filter(Boolean);
+  }
+
+  // ── CPU_ALL ──────────────────────────────────────────────────────────────
+  const cpuAll = _xlsxNamedRows(wb, 'CPU_ALL');
+  const cpu = cpuAll.rows.map(r => ({
+    time: r.time, iso: r.iso,
+    user: r['User%'], sys: r['Sys%'], wait: r['Wait%'], idle: r['Idle%'],
+    busy: r['Busy'], physicalCPUs: r['PhysicalCPUs'], cpuPct: r['CPU%']
+  }));
+
+  // ── LPAR ─────────────────────────────────────────────────────────────────
+  const lparRows = _xlsxNamedRows(wb, 'LPAR');
+  const lpar = lparRows.rows.map(r => ({
+    time: r.time, iso: r.iso,
+    physicalCPU: r['PhysicalCPU'], virtualCPUs: r['virtualCPUs'], logicalCPUs: r['logicalCPUs'],
+    poolCPUs: r['poolCPUs'], entitled: r['entitled'], weight: r['weight'],
+    poolIdle: r['PoolIdle'], usedAllCPUPct: r['usedAllCPU%'], usedPoolCPUPct: r['usedPoolCPU%'],
+    sharedCPU: r['SharedCPU'], capped: r['Capped'],
+    ecUser: r['EC_User%'], ecSys: r['EC_Sys%'], ecWait: r['EC_Wait%'], ecIdle: r['EC_Idle%'],
+    vpUser: r['VP_User%'], vpSys: r['VP_Sys%'], vpWait: r['VP_Wait%'], vpIdle: r['VP_Idle%'],
+    folded: r['Folded'], unfoldedVPs: r['Unfolded VPs'], otherLPARs: r['OtherLPARs']
+  }));
+
+  // ── Memory ───────────────────────────────────────────────────────────────
+  const memRows = _xlsxNamedRows(wb, 'MEM');
+  const memory = memRows.rows.map(r => ({
+    time: r.time, iso: r.iso,
+    realFreePct: r['Real Free %'], virtFreePct: r['Virtual free %'],
+    realFreeMB: r['Real free(MB)'], virtFreeMB: r['Virtual free(MB)'],
+    realTotalMB: r['Real total(MB)'], virtTotalMB: r['Virtual total(MB)']
+  }));
+
+  // ── Paging ───────────────────────────────────────────────────────────────
+  const pageRows = _xlsxNamedRows(wb, 'PAGE');
+  const paging = pageRows.rows.map(r => ({
+    time: r.time, iso: r.iso, faults: r['faults'], pgin: r['pgin'], pgout: r['pgout'],
+    pgsin: r['pgsin'], pgsout: r['pgsout'], srfr: r['sr/fr']
+  }));
+
+  // ── Process / run-queue ────────────────────────────────────────────────
+  const procRows = _xlsxNamedRows(wb, 'PROC');
+  const proc = procRows.rows.map(r => ({
+    time: r.time, iso: r.iso, runQueue: r['RunQueue'], swapIn: r['Swap-in'],
+    pswitch: r['pswitch'], syscall: r['syscall'], fork: r['fork'], exec: r['exec']
+  }));
+
+  // ── Fibre Channel throughput (sum across all HBAs) ──────────────────────
+  function sumWideXlsx(tag) {
+    const { header, rows } = _xlsxSheetRows(wb, tag);
+    const totals = rows.map(r => ({
+      time: _xlsxTimeLabel(r.date), iso: _xlsxIso(r.date),
+      total: r.values.map(_xlsxNum).filter(v => v !== null).reduce((a, v) => a + v, 0)
+    }));
+    return { header, rows, totals };
+  }
+
+  // ── Disk throughput summary ─────────────────────────────────────────────
+  const diskSummRows = _xlsxNamedRows(wb, 'DISK_SUMM');
+  let diskSumm = diskSummRows.rows.map(r => ({
+    time: r.time, iso: r.iso,
+    readKBs: r['Disk Read KB/s'], writeKBs: r['Disk Write KB/s'], iops: r['IO/sec']
+  }));
+  // ══ FIX: same DISK_SUMM fallback as the raw-text parser — derive totals
+  // from the DISKREAD/DISKWRITE sheets when DISK_SUMM itself wasn't in the
+  // workbook, instead of leaving Disk I/O empty when the data to compute it
+  // was there all along. ══
+  let diskSummSource = diskSumm.length ? 'DISK_SUMM' : null;
+  if (!diskSumm.length) {
+    const diskReadSum  = sumWideXlsx('DISKREAD');
+    const diskWriteSum = sumWideXlsx('DISKWRITE');
+    if (diskReadSum.header.length || diskWriteSum.header.length) {
+      const n = Math.max(diskReadSum.totals.length, diskWriteSum.totals.length);
+      diskSumm = Array.from({ length: n }, (_, i) => {
+        const rt = diskReadSum.totals[i], wt = diskWriteSum.totals[i];
+        return {
+          time: (rt || wt).time, iso: (rt || wt).iso,
+          readKBs: (rt && rt.total) || 0, writeKBs: (wt && wt.total) || 0, iops: null
+        };
+      });
+      diskSummSource = 'derived-DISKREAD/DISKWRITE';
+    }
+  }
+
+  const fcReadX  = sumWideXlsx('FCREAD');
+  const fcWriteX = sumWideXlsx('FCWRITE');
+  const hasFC = fcReadX.header.length > 0;
+  const fc = hasFC ? fcReadX.totals.map((r, i) => ({
+    time: r.time, iso: r.iso, readKBs: r.total, writeKBs: (fcWriteX.totals[i] && fcWriteX.totals[i].total) || 0
+  })) : [];
+
+  // ── Network (prefer nmon's own Total-Read / Total-Write(-ve) columns) ───
+  const netSecX = _xlsxSheetRows(wb, 'NET');
+  const netHeaderTrim = netSecX.header;
+  const netSec = _xlsxNamedRows(wb, 'NET');
+  let netTotals = [];
+  const hasNetTotalCols = netHeaderTrim.includes('Total-Read') && netHeaderTrim.some(h => h.startsWith('Total-Write'));
+  if (hasNetTotalCols) {
+    const writeKey = netHeaderTrim.find(h => h.startsWith('Total-Write'));
+    netTotals = netSec.rows.map(r => ({
+      time: r.time, iso: r.iso, readKBs: r['Total-Read'] || 0, writeKBs: Math.abs(r[writeKey] || 0)
+    }));
+  } else if (netHeaderTrim.length) {
+    const readCols  = netHeaderTrim.filter(h => /-read$/i.test(h));
+    const writeCols = netHeaderTrim.filter(h => /-write$/i.test(h));
+    netTotals = netSec.rows.map(r => ({
+      time: r.time, iso: r.iso,
+      readKBs:  readCols.reduce((a, h) => a + (Math.abs(r[h]) || 0), 0),
+      writeKBs: writeCols.reduce((a, h) => a + (Math.abs(r[h]) || 0), 0)
+    }));
+  }
+  const netInterfaces = [];
+  // Same distinction as the raw-text parser: NET-with-only-totals is valid,
+  // not missing — see the comment there for the full rationale.
+  const netIfCols = netHeaderTrim.filter(h => h && !/^(Total-Read|Total-Write.*)$/i.test(h));
+  const hasNetPerInterfaceData = netIfCols.length > 0;
+  if (netHeaderTrim.length) {
+    const ifNames = [...new Set(netHeaderTrim
+      .map(h => h.replace(/-(read|write|total)$/i, ''))
+      .filter(h => h && !/^total$/i.test(h)))];
+    ifNames.forEach(name => {
+      const rCol = netHeaderTrim.find(h => h === `${name}-read`);
+      const wCol = netHeaderTrim.find(h => h === `${name}-write`);
+      if (!rCol && !wCol) return;
+      const reads  = netSec.rows.map(r => r[rCol]).filter(v => v != null);
+      const writes = netSec.rows.map(r => r[wCol]).filter(v => v != null);
+      const avg = arr => arr.length ? arr.reduce((a, v) => a + v, 0) / arr.length : 0;
+      const max = arr => arr.length ? Math.max(...arr) : 0;
+      netInterfaces.push({
+        name, isLoopback: /^lo\d*$/i.test(name),
+        avgReadKBs: avg(reads), maxReadKBs: max(reads),
+        avgWriteKBs: avg(writes), maxWriteKBs: max(writes)
+      });
+    });
+    netInterfaces.sort((a, b) => (b.avgReadKBs + b.avgWriteKBs) - (a.avgReadKBs + a.avgWriteKBs));
+  }
+
+  // ── Disk / VG busy — top-N by average %busy ──────────────────────────────
+  function topBusyXlsx(tag) {
+    const { header, rows } = _xlsxSheetRows(wb, tag);
+    return header
+      .map((name, colIdx) => ({ name, colIdx }))
+      .filter(c => c.name && !/^totals?$/i.test(c.name))
+      .map(({ name, colIdx }) => {
+        const vals = rows.map(r => _xlsxNum(r.values[colIdx])).filter(v => v !== null);
+        const avg = vals.length ? vals.reduce((a, v) => a + v, 0) / vals.length : 0;
+        const max = vals.length ? Math.max(...vals) : 0;
+        return { name, avgBusyPct: avg, maxBusyPct: max, samples: vals.length };
+      })
+      .sort((a, b) => b.avgBusyPct - a.avgBusyPct);
+  }
+  const diskBusyAll = topBusyXlsx('DISKBUSY');
+  const vgBusyAll   = topBusyXlsx('VGBUSY');
+
+  // ── Generic helper: rank a "wide" per-item sheet (one column per disk/
+  //    filesystem/adapter/etc.) by AVERAGE value — same shape as
+  //    topBusyXlsx but for magnitudes (KB/s, MB, count) rather than a
+  //    0–100 %busy figure. Used for JFSFILE, JFSINODE, PAGING below. ──────
+  function rankWideXlsx(tag) {
+    const { header, rows } = _xlsxSheetRows(wb, tag);
+    return header
+      .map((name, colIdx) => ({ name, colIdx }))
+      .filter(c => c.name && !/^totals?$/i.test(c.name))
+      .map(({ name, colIdx }) => {
+        const vals = rows.map(r => _xlsxNum(r.values[colIdx])).filter(v => v !== null);
+        const avg = vals.length ? vals.reduce((a, v) => a + v, 0) / vals.length : 0;
+        const max = vals.length ? Math.max(...vals) : 0;
+        const min = vals.length ? Math.min(...vals) : 0;
+        return { name, avg, max, min, samples: vals.length };
+      });
+  }
+  // Time-series for the top-N columns of a wide sheet, by name.
+  function wideXlsxTrend(tag, topNames) {
+    const { header, rows } = _xlsxSheetRows(wb, tag);
+    if (!header.length || !topNames.length) return { names: [], rows: [] };
+    const colIdx = topNames.map(n => header.indexOf(n));
+    return {
+      names: topNames,
+      rows: rows.map(r => ({
+        time: _xlsxTimeLabel(r.date), iso: _xlsxIso(r.date),
+        values: colIdx.map(ci => ci >= 0 ? _xlsxNum(r.values[ci]) : null)
+      }))
+    };
+  }
+
+  // ── Memory: additional breakdowns (MEMUSE / MEMNEW) ─────────────────────
+  const memUseX = _xlsxNamedRows(wb, 'MEMUSE');
+  const memUse = memUseX.rows.map(r => ({
+    time: r.time, iso: r.iso,
+    numperm: r['%numperm'], minperm: r['%minperm'], maxperm: r['%maxperm'],
+    minfree: r['minfree'], maxfree: r['maxfree'],
+    numclient: r['%numclient'], maxclient: r['%maxclient'],
+    lruablePages: r[' lruable pages'] ?? r['lruable pages'], comp: r['%comp']
+  }));
+  const memNewX = _xlsxNamedRows(wb, 'MEMNEW');
+  const memNew = memNewX.rows.map(r => ({
+    time: r.time, iso: r.iso,
+    processPct: r['Process%'], fscachePct: r['FScache%'], systemPct: r['System%'],
+    freePct: r['Free%'], pinnedPct: r['Pinned%'], userPct: r['User%']
+  }));
+
+  // ── Filesystem usage (JFSFILE / JFSINODE) — critical for production ────
+  const fsUsedAll = rankWideXlsx('JFSFILE').sort((a,b) => b.max - a.max);
+  const fsUsedTop5Names = fsUsedAll.slice(0, 5).map(f => f.name);
+  const fsUsedTrend = wideXlsxTrend('JFSFILE', fsUsedTop5Names);
+  const fsInodeAll = rankWideXlsx('JFSINODE').sort((a,b) => b.max - a.max);
+
+  // ── Network packets/sec (NETPACKET) ─────────────────────────────────────
+  const netPktX = _xlsxSheetRows(wb, 'NETPACKET');
+  let netPackets = [];
+  if (netPktX.header.length) {
+    const header = netPktX.header;
+    const readCols  = header.filter(h => /-reads\/s$/i.test(h));
+    const writeCols = header.filter(h => /-writes\/s$/i.test(h));
+    netPackets = netPktX.rows.map(r => {
+      const obj = {}; header.forEach((h,i) => { if (h) obj[h] = _xlsxNum(r.values[i]); });
+      return {
+        time: _xlsxTimeLabel(r.date), iso: _xlsxIso(r.date),
+        readPktsPerSec:  readCols.reduce((a,h)=>a+(obj[h]||0),0),
+        writePktsPerSec: writeCols.reduce((a,h)=>a+(obj[h]||0),0)
+      };
+    });
+  }
+
+  // ── Paging space free (PAGING) — MB-free per paging device; the number
+  //    that matters when a production box risks swap exhaustion. ─────────
+  const pagingSpaceAll = rankWideXlsx('PAGING');
+  const pagingSpaceDevices = pagingSpaceAll.map(d => ({ name: d.name, avgFreeMB: d.avg, minFreeMB: d.min, samples: d.samples }))
+    .sort((a,b) => a.minFreeMB - b.minFreeMB);
+  const pagingTotalX = _xlsxSheetRows(wb, 'PAGING');
+  const pagingSpaceTotal = pagingTotalX.header.length ? pagingTotalX.rows.map(r => ({
+    time: _xlsxTimeLabel(r.date), iso: _xlsxIso(r.date),
+    totalFreeMB: r.values.map(_xlsxNum).filter(v=>v!==null).reduce((a,v)=>a+v,0)
+  })) : [];
+
+  // ── Shared CPU pool (POOLS) & Large Page use (LARGEPAGE) — single latest
+  //    snapshot info cards (slow-changing configuration, not a trend). ────
+  function latestSnapshotXlsx(tag) {
+    const r = _xlsxNamedRows(wb, tag);
+    return r.rows.length ? r.rows[r.rows.length - 1] : null;
+  }
+  const poolsLatest = latestSnapshotXlsx('POOLS');
+  const pools = poolsLatest ? {
+    time: poolsLatest.time,
+    shcpusInSys: poolsLatest['shcpus_in_sys'], maxPoolCapacity: poolsLatest['max_pool_capacity'],
+    entitledPoolCapacity: poolsLatest['entitled_pool_capacity'], poolBusyTime: poolsLatest['pool_busy_time'],
+    entitled: poolsLatest['entitled']
+  } : null;
+  const largePageLatest = latestSnapshotXlsx('LARGEPAGE');
+  const largePage = largePageLatest ? {
+    time: largePageLatest.time,
+    freePages: largePageLatest['Freepages'], usedPages: largePageLatest['Usedpages'],
+    pages: largePageLatest['Pages'], highWater: largePageLatest['HighWater'], sizeMB: largePageLatest['SizeMB']
+  } : null;
+
+  // ── Disk adapter / HBA throughput (IOADAPT) — ranked by average combined
+  //    KB/s (this sheet has no busy% column, just per-adapter KB/s+tps). ──
+  let ioAdaptTop = [];
+  { const { header, rows } = _xlsxSheetRows(wb, 'IOADAPT');
+    if (header.length) {
+      const readCols  = header.filter(h => /_read$/i.test(h));
+      const writeCols = header.filter(h => /_write$/i.test(h));
+      const adapterNames = [...new Set([...readCols, ...writeCols].map(h => h.replace(/_(read|write|xfer-tps)$/i,'')))];
+      ioAdaptTop = adapterNames.map(name => {
+        const rIdx = header.indexOf(`${name}_read`), wIdx = header.indexOf(`${name}_write`);
+        const reads  = rIdx>=0 ? rows.map(r=>_xlsxNum(r.values[rIdx])).filter(v=>v!==null) : [];
+        const writes = wIdx>=0 ? rows.map(r=>_xlsxNum(r.values[wIdx])).filter(v=>v!==null) : [];
+        const avg = arr => arr.length ? arr.reduce((a,v)=>a+v,0)/arr.length : 0;
+        const max = arr => arr.length ? Math.max(...arr) : 0;
+        return { name, avgReadKBs: avg(reads), avgWriteKBs: avg(writes), maxReadKBs: max(reads), maxWriteKBs: max(writes) };
+      }).sort((a,b) => (b.avgReadKBs+b.avgWriteKBs) - (a.avgReadKBs+a.avgWriteKBs));
+    }
+  }
+
+  // ── File-level I/O (FILE) & Async I/O (PROCAIO) ─────────────────────────
+  const fileIOX = _xlsxNamedRows(wb, 'FILE');
+  const fileIO = fileIOX.rows.map(r => ({
+    time: r.time, iso: r.iso, iget: r['iget'], namei: r['namei'],
+    readch: r['readch'], writech: r['writech']
+  }));
+  const procAioX = _xlsxNamedRows(wb, 'PROCAIO');
+  const procAio = procAioX.rows.map(r => ({
+    time: r.time, iso: r.iso, aioprocs: r['aioprocs'], aiorunning: r['aiorunning'],
+    aiocpu: r['aiocpu'], syscpu: r['syscpu']
+  }));
+
+  // ── Per-Volume-Group full detail — merges VGBUSY/VGREAD/VGWRITE/VGXFER/
+  //    VGSIZE into one ranked table instead of 5 disconnected ones. ───────
+  function avgOfXlsx(tag, name) {
+    const { header, rows } = _xlsxSheetRows(wb, tag);
+    const idx = header.indexOf(name);
+    if (idx < 0) return null;
+    const vals = rows.map(r => _xlsxNum(r.values[idx])).filter(v => v !== null);
+    return vals.length ? vals.reduce((a,v)=>a+v,0)/vals.length : null;
+  }
+  const vgNames = [...new Set(vgBusyAll.map(v => v.name))];
+  const vgDetail = vgNames.map(name => {
+    const busyRow = vgBusyAll.find(v => v.name === name);
+    return {
+      name,
+      avgBusyPct: busyRow ? busyRow.avgBusyPct : null, maxBusyPct: busyRow ? busyRow.maxBusyPct : null,
+      avgReadKBs: avgOfXlsx('VGREAD', name), avgWriteKBs: avgOfXlsx('VGWRITE', name),
+      avgXfer: avgOfXlsx('VGXFER', name), sizeGB: avgOfXlsx('VGSIZE', name)
+    };
+  }).sort((a,b) => (b.avgBusyPct||0) - (a.avgBusyPct||0));
+
+  // ── Per-CPU-core breakdown (CPU01, CPU02, … as separate sheets) ────────
+  const perCpuTags = wb.SheetNames.filter(t => /^CPU\d+$/.test(t)).sort();
+  const perCpu = perCpuTags.map(tag => {
+    const r = _xlsxNamedRows(wb, tag);
+    const users = r.rows.map(x=>x['User%']).filter(v=>v!=null);
+    const syss  = r.rows.map(x=>x['Sys%']).filter(v=>v!=null);
+    const waits = r.rows.map(x=>x['Wait%']).filter(v=>v!=null);
+    const avg = a => a.length ? a.reduce((s,v)=>s+v,0)/a.length : 0;
+    const busySeries = r.rows.map(x => (x['User%']||0)+(x['Sys%']||0)+(x['Wait%']||0));
+    return {
+      id: tag, avgUser: avg(users), avgSys: avg(syss), avgWait: avg(waits),
+      avgBusy: avg(busySeries), maxBusy: busySeries.length ? Math.max(...busySeries) : 0
+    };
+  }).sort((a,b) => b.avgBusy - a.avgBusy);
+
+  // ── TOP — per-process detail ─────────────────────────────────────────────
+  const topRaw = _xlsxSheetRows(wb, 'TOP');
+  let topProcesses = [];
+  let topPeak = null;
+  if (topRaw.header.length) {
+    const idx = {}; topRaw.header.forEach((h, i) => idx[h] = i);
+    const byCommand = new Map();
+    for (const r of topRaw.rows) {
+      const cmd = String(r.values[idx['Command']] ?? '').trim() || '(unknown)';
+      const pct = _xlsxNum(r.values[idx['%CPU']]);
+      if (pct === null) continue;
+      const user = String(r.values[idx['User']] ?? '').trim();
+      const pid  = String(r.values[idx['PID']] ?? '').trim();
+      const tLbl = _xlsxTimeLabel(r.date);
+      if (!byCommand.has(cmd)) byCommand.set(cmd, { command: cmd, user, sumCPU: 0, maxCPU: 0, maxCPUAt: null, maxCPUPid: null, samples: 0, pids: new Set() });
+      const b = byCommand.get(cmd);
+      b.sumCPU += pct; b.samples += 1; b.pids.add(pid);
+      if (pct > b.maxCPU) { b.maxCPU = pct; b.maxCPUAt = tLbl; b.maxCPUPid = pid; }
+      if (!topPeak || pct > topPeak.pct) topPeak = { pct, command: cmd, pid, user, time: tLbl };
+    }
+    topProcesses = [...byCommand.values()].map(b => ({
+      command: b.command, user: b.user, avgCPU: b.sumCPU / b.samples, maxCPU: b.maxCPU,
+      maxCPUAt: b.maxCPUAt, samples: b.samples, distinctPIDs: b.pids.size
+    })).sort((a, b) => b.avgCPU - a.avgCPU);
+  }
+
+  // ── Warnings (identical philosophy to the raw-text parser) ──────────────
+  const EXCLUDE_TAGS = new Set(['AAA', 'ZZZZ', 'ERROR', 'UARG', 'SYS_SUMM']);
+  const sectionsFound = wb.SheetNames.filter(n => !EXCLUDE_TAGS.has(n) && !/^BBB/.test(n));
+  const warnings = [];
+  if (!cpu.length)      warnings.push({ section: 'cpu',    message: 'No CPU_ALL sheet found in this workbook.' });
+  if (!memory.length)   warnings.push({ section: 'memory', message: 'No MEM sheet found.' });
+  if (!diskSumm.length) {
+    warnings.push({ section: 'disk', message: 'No DISK_SUMM sheet found, and no DISKREAD/DISKWRITE sheets to derive totals from either.' });
+  } else if (diskSummSource === 'derived-DISKREAD/DISKWRITE') {
+    warnings.push({ section: 'disk', message: 'No DISK_SUMM sheet found — Disk I/O totals below are derived by summing the DISKREAD/DISKWRITE sheets instead (IOPS is not available this way, so it\'s left blank).' });
+  }
+  if (!netTotals.length) {
+    warnings.push({ section: 'network', message: 'No NET sheet found.' });
+  } else if (!hasNetPerInterfaceData) {
+    warnings.push({ section: 'network', message: 'NET sheet only has nmon\'s aggregate Total-Read/Total-Write columns — no per-adapter breakdown was captured, so the Network Interfaces table will be empty even though the totals chart has data.' });
+  }
+  if (!lpar.length)     warnings.push({ section: 'lpar',   message: 'No LPAR sheet — normal for a non-virtualized/bare-metal or non-AIX capture; entitlement analysis will be skipped.' });
+  if (!proc.length)     warnings.push({ section: 'proc',   message: 'No PROC sheet found — run queue, context-switch, and fork/exec metrics will be skipped.' });
+  if (!topProcesses.length) warnings.push({ section: 'top', message: 'No TOP sheet — the capture was likely run without the -T flag, so top-process ranking will be skipped.' });
+  if (!diskBusyAll.length)  warnings.push({ section: 'diskbusy', message: 'No DISKBUSY sheet — per-disk busy% ranking will be skipped.' });
+  if (!memUse.length)   warnings.push({ section: 'memuse',  message: 'No MEMUSE sheet — kernel memory-pool tuning metrics will be skipped.' });
+  if (!memNew.length)   warnings.push({ section: 'memnew',  message: 'No MEMNEW sheet — memory-category breakdown chart will be skipped.' });
+  if (!fsUsedAll.length) warnings.push({ section: 'filesystem', message: 'No JFSFILE sheet — filesystem %used table will be skipped.' });
+  if (!netPackets.length) warnings.push({ section: 'netpacket', message: 'No NETPACKET sheet — packets/sec chart will be skipped.' });
+  if (!pagingSpaceDevices.length) warnings.push({ section: 'pagingspace', message: 'No PAGING sheet — paging-space-free table will be skipped.' });
+  if (!ioAdaptTop.length) warnings.push({ section: 'ioadapt', message: 'No IOADAPT sheet — disk adapter/HBA ranking will be skipped.' });
+  if (!perCpu.length)   warnings.push({ section: 'percpu',   message: 'No per-core CPU sheets (CPU01, CPU02, …) — per-core breakdown will be skipped.' });
+
+  const lparParts = (meta.LPARNumberName || '').split(',').map(s => s.trim());
+  const machineParts = (meta.MachineType || '').split(',').map(s => s.trim());
+
+  return {
+    meta: {
+      host: meta.host || meta.NodeName || null,
+      lparName: lparParts[1] || lparParts[0] || null,
+      lparNumber: (lparParts.length > 1 ? lparParts[0] : null),
+      machineVendor: machineParts[0] || null,
+      machineModel: machineParts[1] || null,
+      serialNumber: meta.SerialNumber || null,
+      aixVersion: meta.AIX || null,
+      technologyLevel: meta.TL || null,
+      hardware: meta.hardware || null,
+      kernel: meta.kernel || null,
+      captureTool: meta.version || null,
+      intervalSec: _xlsxNum(meta.interval) ?? (parseFloat(meta.interval) || null),
+      snapshots: zzzzDates.length || null,
+      capturedBy: meta.user || null,
+      command: meta.command || null,
+      startTime: zzzzDates.length ? _xlsxTimeLabel(zzzzDates[0]) : null,
+      endTime: zzzzDates.length ? _xlsxTimeLabel(zzzzDates[zzzzDates.length - 1]) : null,
+      startISO: zzzzDates.length ? _xlsxIso(zzzzDates[0]) : null,
+      endISO: zzzzDates.length ? _xlsxIso(zzzzDates[zzzzDates.length - 1]) : null,
+    },
+    cpu, lpar, memory, paging, proc, diskSumm, diskSummSource, fc, hasFC,
+    netTotals, netInterfaces, hasNetPerInterfaceData,
+    diskBusyTop: diskBusyAll.slice(0, 15), diskBusyCount: diskBusyAll.length,
+    vgBusy: vgBusyAll,
+    topProcesses: topProcesses.slice(0, 20), topPeak,
+    memUse, memNew,
+    fsUsedTop: fsUsedAll.slice(0, 20), fsUsedCount: fsUsedAll.length, fsUsedTrend,
+    fsInodeTop: fsInodeAll.slice(0, 20), fsInodeCount: fsInodeAll.length,
+    netPackets,
+    pagingSpaceDevices, pagingSpaceTotal,
+    pools, largePage,
+    ioAdaptTop: ioAdaptTop.slice(0, 15),
+    fileIO, procAio,
+    vgDetail,
+    perCpu,
+    sectionsFound, warnings,
+    diag: { totalLines: null, aaaLines: Object.keys(meta).length, zzzzCount: zzzzDates.length, sectionsFound }
+  };
+}
+
+// ── POST /api/nmon/parse-xlsx ────────────────────────────────────────────
+// Body: the raw bytes of the `.nmon.xlsx` file (application/octet-stream).
+// 60 MB limit — same reasoning as /api/nmon/parse (TOP sheet can be huge).
+app.post('/api/nmon/parse-xlsx', express.raw({ type: '*/*', limit: '60mb' }), (req, res) => {
+  try {
+    const buf = req.body;
+    if (!buf || !buf.length) return res.status(400).json({ error: 'Empty nmon .xlsx upload' });
+    let parsed;
+    try {
+      parsed = parseNmonXlsx(buf);
+    } catch (e) {
+      console.error('[nmon/parse-xlsx] workbook read error:', e);
+      return res.status(400).json({ error: 'Could not read this file as an Excel workbook: ' + e.message });
+    }
+    if (_nmonTotalPoints(parsed) === 0) {
+      return res.status(400).json({
+        error: 'No recognizable nmon time-series sheets found in this workbook. Make sure it\'s a complete, ' +
+               'un-truncated .nmon.xlsx export (it should contain sheets like CPU_ALL, MEM, DISK_SUMM, NET, ZZZZ…).',
+        diagnostics: parsed.diag
+      });
+    }
+    console.log(`[nmon/parse-xlsx] parsed ${buf.length} bytes → host=${parsed.meta.host||'?'} snapshots=${parsed.meta.snapshots} ` +
+      `cpu=${parsed.cpu.length} mem=${parsed.memory.length} disk=${parsed.diskSumm.length} net=${parsed.netTotals.length} ` +
+      `lpar=${parsed.lpar.length} top=${parsed.topProcesses.length}${parsed.warnings.length ? `  ⚠ ${parsed.warnings.length} section(s) missing` : ''}`);
+    res.json(parsed);
+  } catch (e) {
+    console.error('[nmon/parse-xlsx] error:', e);
+    res.status(500).json({ error: 'Failed to parse nmon .xlsx report: ' + e.message });
+  }
+});
+
+console.log('✓ NMON .xlsx report analysis endpoint attached (/api/nmon/parse-xlsx)');
 
 
 
@@ -6794,11 +9034,18 @@ function _attachSshPtyWs(server) {
     // 10 minutes of inactivity.
     const poolKey = _sshPoolKey(user, host, port);
 
-    _sshPoolGet(user, host, port, pass, pk)
-      .then(conn => {
-        // Mark as in-use; released when WS closes
-        // (ref already incremented inside _sshPoolGet)
-
+    // ── Stale-pooled-connection retry ─────────────────────────────────────────
+    // The pool's "alive" check (_sshPoolGet) only inspects the local socket
+    // object — it cannot detect a connection the *remote* side has silently
+    // dropped (idle timeout, NAT/firewall drop, MaxSessions limit, network
+    // blip). When that happens, conn.shell() fails with "Channel open
+    // failure" even though _sshPoolGet happily handed back a "ready" entry.
+    // Batch mode (POST /api/os/ssh-exec) already retries once with a fresh
+    // connection in this situation — the PTY path previously did NOT, which
+    // is why Batch could keep working ("credentials shared with Batch mode ✓")
+    // while the interactive Terminal still failed with "disconnected (1006)".
+    // Mirror the same evict-and-reconnect-once behaviour here.
+    function _openShell(conn, isRetry) {
       conn.shell(
         // PTY options: TERM must be set here for vi/sqlplus to render correctly.
         // DO NOT pass a second options object — { env: null } was here previously
@@ -6813,6 +9060,21 @@ function _attachSshPtyWs(server) {
         { term: 'xterm-256color', cols, rows },
         (err, stream) => {
           if (err) {
+            const isStale = /channel open failure|open failed/i.test(err.message);
+            if (isStale && !isRetry) {
+              console.warn('[ssh-pty] channel open failure on pooled conn — retrying fresh');
+              try { conn.end(); } catch(_e) {}
+              _sshPool.delete(poolKey);
+              _sshPoolGet(user, host, port, pass, pk)
+                .then(fresh => _openShell(fresh, true))
+                .catch(e2 => {
+                  if (ws.readyState === WS.OPEN) {
+                    ws.send(`\r\n\x1b[31mSSH connection failed: ${e2.message}\x1b[0m\r\n`);
+                    ws.close();
+                  }
+                });
+              return;
+            }
             // Evict broken pooled connection so next attempt creates a fresh SSH session
             const _badEntry = _sshPool.get(poolKey);
             if (_badEntry) { try { _badEntry.conn.end(); } catch(_e) {} _sshPool.delete(poolKey); }
@@ -7054,13 +9316,20 @@ function _attachSshPtyWs(server) {
           });
         }
       );
-    })  // end _sshPoolGet.then — conn.shell callback registered
-    .catch(err => {
-      if (ws.readyState === WS.OPEN) {
-        ws.send(`\r\n\x1b[31mSSH connection failed: ${err.message}\x1b[0m\r\n`);
-        ws.close();
-      }
-    });
+    } // end _openShell
+
+    _sshPoolGet(user, host, port, pass, pk)
+      .then(conn => {
+        // Mark as in-use; released when WS closes
+        // (ref already incremented inside _sshPoolGet)
+        _openShell(conn, false);
+      })
+      .catch(err => {
+        if (ws.readyState === WS.OPEN) {
+          ws.send(`\r\n\x1b[31mSSH connection failed: ${err.message}\x1b[0m\r\n`);
+          ws.close();
+        }
+      });
   });
 
   console.log('✓ SSH PTY WebSocket handler attached at /api/os/ssh-pty');
