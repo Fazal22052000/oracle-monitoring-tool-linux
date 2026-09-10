@@ -1,13 +1,15 @@
-# Alert.py – Oracle Alert Log Analyzer Pro (Enhanced UI with Mobile, Voice & Audio)
+# Alert.py – Oracle Alert Log Analyzer Pro (Enhanced UI with Mobile & Voice)
 # Run: streamlit run Alert.py
 
 import re
 import os
 import io
 import time
+import bisect
 import zipfile
 import traceback
 import pandas as pd
+import numpy as np
 import streamlit as st
 from datetime import datetime, timezone, timedelta, date, time as dtime
 from dateutil import parser
@@ -27,47 +29,25 @@ MAX_PROMPT_CHARS = 9000
 st.set_page_config(
     page_title="Oracle Alert Log Analyzer",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
     menu_items={
         'About': "Oracle Alert Log Analyzer Pro - Advanced diagnostic tool for DBAs"
     }
 )
 
 # ---------------- Initialize Session State ----------------
-if "audio_enabled" not in st.session_state:
-    st.session_state.audio_enabled = False
 if "voice_enabled" not in st.session_state:
     st.session_state.voice_enabled = False
 if "voice_command" not in st.session_state:
     st.session_state.voice_command = ""
-if "trigger_audio" not in st.session_state:
-    st.session_state.trigger_audio = False
-if "audio_severity" not in st.session_state:
-    st.session_state.audio_severity = "medium"
 if "voice_action" not in st.session_state:
     st.session_state.voice_action = None
 if "last_voice_command" not in st.session_state:
     st.session_state.last_voice_command = ""
 
-# ---------------- Audio Alerts Configuration ----------------
-AUDIO_ALERTS_ENABLED = st.sidebar.checkbox("🔊 Enable Audio Alerts", value=st.session_state.audio_enabled, key="audio_alerts_toggle")
-st.session_state.audio_enabled = AUDIO_ALERTS_ENABLED
-
-AUDIO_SEVERITY_LEVELS = {
-    "critical": {"frequency": 800, "duration": 500, "label": "🔴 Critical"},
-    "high": {"frequency": 600, "duration": 300, "label": "🟠 High"},
-    "medium": {"frequency": 400, "duration": 200, "label": "🟡 Medium"},
-    "low": {"frequency": 300, "duration": 150, "label": "🟢 Low"}
-}
-
-# ---------------- Theme Switcher ----------------
-theme_choice = st.sidebar.radio(
-    "🎨 Theme Mode", ["Light Mode", "Dark Mode"], index=0, key="theme_toggle"
-)
-
-
-# ---------------- Mobile View Toggle ----------------
-mobile_view = st.sidebar.checkbox("📱 Mobile View", value=False, key="mobile_view_toggle")
+# ---------------- Theme / Mobile View (sidebar removed, fixed defaults) ----------------
+theme_choice = "Light Mode"
+mobile_view = False
 
 if theme_choice == "Dark Mode":
     DARK_CSS = """
@@ -345,90 +325,177 @@ else:
         """, unsafe_allow_html=True)
 
 
-# ---------------- Audio Alert Functions ----------------
-def play_audio_alert(severity="medium"):
-    """Generate audio alert based on severity using HTML component"""
-    if not AUDIO_ALERTS_ENABLED:
-        return
-    
-    config = AUDIO_SEVERITY_LEVELS.get(severity, AUDIO_SEVERITY_LEVELS["medium"])
-    
-    audio_html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <script>
-            function playAlert() {{
-                try {{
-                    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                    const oscillator = audioContext.createOscillator();
-                    const gainNode = audioContext.createGain();
-                    
-                    oscillator.connect(gainNode);
-                    gainNode.connect(audioContext.destination);
-                    
-                    oscillator.frequency.value = {config['frequency']};
-                    oscillator.type = 'sine';
-                    
-                    gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
-                    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + {config['duration']/1000});
-                    
-                    oscillator.start(audioContext.currentTime);
-                    oscillator.stop(audioContext.currentTime + {config['duration']/1000});
-                }} catch(e) {{
-                    console.error('Audio error:', e);
-                }}
-            }}
-            
-            // Auto-play when loaded
-            window.onload = playAlert;
-        </script>
-    </head>
-    <body>
-        <div style="display:none;">Audio Alert Playing...</div>
-    </body>
-    </html>
-    """
-    
-    components.html(audio_html, height=0)
-
-def speak_text(text):
-    """Text-to-speech for critical alerts"""
-    if not AUDIO_ALERTS_ENABLED:
-        return
-    
-    speech_html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <script>
-            function speakText() {{
-                if ('speechSynthesis' in window) {{
-                    const utterance = new SpeechSynthesisUtterance("{text}");
-                    utterance.rate = 1.0;
-                    utterance.pitch = 1.0;
-                    utterance.volume = 0.8;
-                    window.speechSynthesis.speak(utterance);
-                }}
-            }}
-            
-            window.onload = speakText;
-        </script>
-    </head>
-    <body>
-        <div style="display:none;">Speaking...</div>
-    </body>
-    </html>
-    """
-    
-    components.html(speech_html, height=0)
-
 # ---------------- Regex & Helpers ----------------
 TIMESTAMP_RE = re.compile(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+(?:[\+\-]\d{2}:\d{2}))")
 ORA_RE = re.compile(r"\bORA-(\d{3,5}):?\s*(.*)")
 WARN_RE = re.compile(r"\bWARNING\b|\bWarning\b|\bwarning\b")
 TRACE_RE = re.compile(r"(\/[\w\/\.\-\+]*\.trc)")
 KILL_SESSION_RE = re.compile(r"KILL SESSION for sid=\((\d+),\s*(\d+)\)", re.IGNORECASE)
+
+# Notable non-"WARNING"-worded events that real alert logs are full of but
+# that WARN_RE alone misses because they never contain the literal word
+# "WARNING". Combined into one regex (named groups) rather than several
+# separate searches per line, since this runs against every line of what
+# can be million-line alert logs.
+#  - "Fatal NI connect error ..." / "TNS-nnnnn: ..." — listener/network
+#    connection failures (e.g. TNS-12564 connection refused). These can be
+#    the single most frequent event in a log when a remote listener is down,
+#    so missing them entirely misrepresents how healthy the instance is.
+#  - "Checkpoint not complete" / "cannot allocate new log" — redo log
+#    switches stalling because the checkpoint (or archiver) hasn't kept up;
+#    a classic, high-signal performance problem DBAs watch for.
+#  - RAC / Data Guard / Flashback patterns below are based on well-documented,
+#    standard Oracle alert log message text (consistent across 12c/19c/21c
+#    per Oracle's own diagnostics documentation). The RAC patterns are
+#    confirmed against a real node-eviction event found in this environment's
+#    own log; Data Guard and Flashback are not (this environment doesn't
+#    appear to be actively running either), so treat those two as a starting
+#    point to correct if your actual wording differs.
+#  - RMAN ("Control autobackup written to ...", RMAN-nnnnn error codes) and
+#    Data Pump ("DM00"/"DW00" master/worker process start/stop, "Started
+#    service SYS.KUPC$..." AQ queues) ARE confirmed against real matches in
+#    this environment's log (a control-file autobackup and a scheduled
+#    export job named FRSEXT.DAILY_BKUP_09082026).
+NOTABLE_EVENT_RE = re.compile(
+    r"(?P<tns>Fatal NI connect error\s+\d+|^\s*TNS-\d{4,5}\b)"
+    r"|(?P<ckpt>Checkpoint not complete)"
+    r"|(?P<logsw>cannot allocate new log)"
+    # RAC: cluster reconfiguration, interconnect problems, node eviction —
+    # all high-severity in a RAC environment even without an ORA- code.
+    r"|(?P<rac>Reconfiguration (?:started|complete)|IPC Send timeout|"
+    r"Global Resource Directory frozen|instance eviction|Evicted instance|"
+    r"Waiting for instances to leave|Communications reconfiguration underway|"
+    r"CLUSTER_INTERCONNECTS)"
+    # Data Guard / redo transport: standby shipping/apply falling behind or
+    # failing, which is exactly the kind of thing a DBA needs surfaced even
+    # if the individual line has no ORA- code.
+    r"|(?P<dg>\bRFS\[|\bFAL\[|Redo Shipping Client|Media Recovery (?:Log|Waiting for)|"
+    r"Managed Standby Recovery|\bMRP0\b|redo transport)"
+    # Flashback Database operations — restore points, flashback recovery.
+    r"|(?P<flashback>Flashback Database|Flashback Restore|Flashback Media Recovery|"
+    r"guaranteed restore point)"
+    # RMAN: control file/spfile autobackups and RMAN- error codes.
+    r"|(?P<rman>Control autobackup written to|RMAN-\d{4,5})"
+    # Data Pump: master (DM) / worker (DW) process lifecycle and the AQ
+    # command/status queues every expdp/impdp job starts.
+    r"|(?P<datapump>\bD[MW]\d{2}\s+(?:started|stopped)\s+with\s+pid=|"
+    r"Data Pump job|KUPC\$[CS]_)",
+    re.I
+)
+NOTABLE_EVENT_LABELS = {
+    "tns": "TNS/Listener", "ckpt": "Checkpoint Stall", "logsw": "Log Switch Stall",
+    "rac": "RAC/Cluster", "dg": "Data Guard/Redo Transport", "flashback": "Flashback",
+    "rman": "RMAN", "datapump": "Data Pump",
+}
+
+# "Fatal NI connect error ..." is always immediately followed by a
+# "(DESCRIPTION=(ADDRESS=...)(CONNECT_DATA=(...)(SERVICE_NAME=X)(CID=(PROGRAM=Y)(HOST=Z)...))))"
+# line naming the exact service and connecting client host — without this,
+# thousands of near-identical "TNS/Listener" rows are indistinguishable even
+# though they may span many different application services.
+TNS_DESCRIPTOR_RE = re.compile(
+    r"SERVICE_NAME=([^)]+)\).*?CID=\(PROGRAM=([^)]*)\)\(HOST=([^)]*)\)", re.I
+)
+
+# ---------------- Future-proofing catch-all ----------------
+# Everything above is a fixed, hand-written list of known message shapes.
+# That list will always lag behind reality — a new Oracle version, a
+# component this app has never seen (Sharding, GoldenGate, TDE wallet
+# errors, a brand-new RMAN/CRS code, etc.) can add messages tomorrow that
+# none of the patterns above recognize, and those would otherwise be
+# silently dropped with no way to know they exist.
+#
+# Rather than trying to keep hand-adding prefixes forever, this is a safety
+# net that runs ONLY on lines nothing else already classified:
+#  1. GENERIC_ERROR_CODE_RE — Oracle's "PREFIX-NNNNN" error code convention
+#     (ORA-, TNS-, RMAN-, CRS-, PRVG-, PLS-, KUP-, LRM-, DIA-, GSM-, XAG-,
+#     SP2-, ...) is extremely stable across products and versions even when
+#     the *specific* codes are brand new — so matching the pattern itself,
+#     not a fixed list of prefixes, catches future/unknown components for
+#     free. ORA/TNS are excluded here since those already get dedicated,
+#     richer handling above; this only fires for everything else.
+#  2. GENERIC_SEVERITY_RE — a short list of high-signal, low-noise plain-
+#     English phrases (deliberately NOT things like bare "abort"/"fail",
+#     which produced real false positives earlier in this file) for
+#     messages that don't use a coded format at all.
+# Matches land in a separate "Unclassified / New Pattern" bucket rather than
+# being folded into Warnings, so a DBA can scan specifically for "things
+# this tool doesn't yet have a name for" without that diluting the accuracy
+# of the named categories above.
+_MONTH_ABBRS = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"}
+GENERIC_ERROR_CODE_RE = re.compile(r"\b([A-Z]{2,6}-\d{3,6})\b")
+GENERIC_ERROR_CODE_SKIP_PREFIXES = {"ORA", "TNS"} | _MONTH_ABBRS
+GENERIC_SEVERITY_RE = re.compile(
+    r"\b(PANIC|OUT OF MEMORY|DISK FULL|NO SPACE LEFT|ACCESS DENIED|"
+    r"PERMISSION DENIED|CORRUPT(?:ED|ION)?|UNRECOVERABLE|FATAL ERROR)\b", re.I
+)
+
+# ---------------- ASM-Specific Regex Patterns ----------------
+ASM_LOG_MARKER_RE = re.compile(
+    r"\bASM instance\b|\basm_diskgroups\s*=|\bDiskgroup used for Voting\b|"
+    r"\bkfdp|\bASM client\b|remote asm mode|\+ASM\d*\b",
+    re.I
+)
+ASM_MOUNT_RE = re.compile(r"SUCCESS:\s*diskgroup\s+(\S+)\s+was\s+mounted", re.I)
+ASM_DISMOUNT_RE = re.compile(r"SUCCESS:\s*diskgroup\s+(\S+)\s+was\s+dismounted", re.I)
+ASM_MOUNT_FAIL_RE = re.compile(r"ERROR:\s*diskgroup\s+(\S+)\s+was\s+not\s+mounted", re.I)
+ASM_REBAL_START_RE = re.compile(
+    r"NOTE:\s*starting rebalance of group\s+\d+/\S+\s*\(([^)]+)\)(?:\s*at power\s*(\d+))?", re.I
+)
+ASM_REBAL_COMPLETE_RE = re.compile(
+    r"SUCCESS:\s*rebalance completed for group\s+\d+/\S+\s*\(([^)]+)\)", re.I
+)
+ASM_REBAL_INTERRUPT_RE = re.compile(
+    r"NOTE:\s*rebalance interrupted for group\s+\d+/\S+\s*\(([^)]+)\)", re.I
+)
+ASM_DISK_ADD_RE = re.compile(
+    r"SUCCESS:\s*ALTER DISKGROUP\s+(\S+)\s+ADD\s+.*?DISK\s+'([^']+)'", re.I
+)
+ASM_DISK_DROP_RE = re.compile(
+    r"SUCCESS:\s*ALTER DISKGROUP\s+(\S+)\s+DROP\s+DISK", re.I
+)
+ASM_CLIENT_DISCONNECT_RE = re.compile(
+    r"ASM client\s+(\S+)\s+disconnected", re.I
+)
+ASM_CLIENT_RECONNECT_RE = re.compile(
+    r"client\s+(\S+).*?(?:has reconnected to|attempting to (?:re)?connect)", re.I
+)
+ASM_ERROR_RE = re.compile(r"^\s*ERROR:\s*(.*)", re.I)
+# Fixed: was requiring whitespace right after "file", which missed plurals
+# like "Voting files is:" and "voting file(s)." — now matches file/files with a word boundary.
+ASM_VOTING_RE = re.compile(r"\bvoting files?\b", re.I)
+# WARNING-level voting risk: diskgroup holding voting files isn't mounted (quorum risk)
+ASM_VOTING_RISK_RE = re.compile(r"WARNING:.*voting files?.*not mounted", re.I)
+# Instance crash / termination events — high-severity, previously not captured at all
+ASM_TERM_INITIATED_RE = re.compile(
+    r"^([\w()]+)\s*\(ospid:\s*([\w]+)\):\s*terminating the instance"
+    r"(?:\s+due to ORA error\s+(\d+))?", re.I
+)
+ASM_TERM_COMPLETE_RE = re.compile(
+    r"Instance terminated by\s+([\w()]+),\s*pid\s*=\s*([\w]+)", re.I
+)
+# Disk-level offline initiation (distinct from a whole diskgroup dismount)
+ASM_DISK_OFFLINE_RE = re.compile(
+    r"initiating offline of disk\s+(\S+)\s*\(([^)]+)\).*?\bgroup\s+\d+\s*\(([^)]+)\)", re.I
+)
+# --- Patterns added after validating against a real ASM alert log ---
+# A disk being marked for de-assignment often precedes it actually dropping
+# out of the diskgroup — an early-warning storage signal that was
+# completely uncaptured (3,600+ occurrences found in real validation).
+ASM_DISK_DEASSIGN_RE = re.compile(
+    r"NOTE:\s*Disk\s+(\S+)\s+in\s+mode\s+\S+\s+marked for de-assignment", re.I
+)
+# Grid Infrastructure / ASM cluster reconfiguration — same phrasing as the
+# RAC pattern in the main DB alert-log parser, but ASM instances log their
+# own reconfiguration events independently of the RDBMS instances.
+ASM_RECONFIG_RE = re.compile(r"Reconfiguration (?:started|complete)", re.I)
+# A background/OS process being killed — found correlating with repeated
+# instance terminations in real validation (OS-level resource exhaustion).
+ASM_PROC_TERM_REQ_RE = re.compile(r"Process termination requested for pid\s+(\d+)", re.I)
+# Diskgroup name embedded in an ORA- message body (e.g. diskgroup "FRA_FRS"
+# space exhausted) so ASM ORA errors can be attributed to a diskgroup like
+# every other ASM event, instead of just showing the raw error text.
+ASM_ORA_DISKGROUP_NAME_RE = re.compile(r'diskgroup\s+"?([A-Za-z0-9_$]+)"?', re.I)
 
 def extract_zip_uploaded_file(uploaded_zip):
     extracted_files = {}
@@ -451,15 +518,79 @@ def analyze_alert_log_lines(lines, source_name="uploaded"):
     ora_errors = []
     warnings = []
     kill_sessions = []
+    unclassified_events = []
     current_timestamp = None
 
     trace_locations = [(i, TRACE_RE.search(line).group(1)) for i, line in enumerate(lines) if TRACE_RE.search(line)]
+    _trace_idxs = [t_idx for t_idx, _ in trace_locations]
+
+    # Effective "current timestamp" as of each line, so any .trc reference
+    # found anywhere in the file can be timestamped for the dedicated
+    # Trace Files section, independent of the ORA/warning/kill-session scan
+    # below (which only advances current_timestamp on pure timestamp lines).
+    line_timestamps = [None] * len(lines)
+    _running_ts = None
+    for _i, _raw in enumerate(lines):
+        _line = _raw.rstrip("\n")
+        if _line.strip():
+            _ts_m = TIMESTAMP_RE.search(_line)
+            if _ts_m:
+                _running_ts = _ts_m.group(1)
+        line_timestamps[_i] = _running_ts
+
+    trace_files = [
+        {
+            "Timestamp": line_timestamps[t_idx] or "Not Found",
+            "Trace File": t_path,
+            "Source": source_name,
+            "Raw Line": lines[t_idx].rstrip("\n").strip(),
+        }
+        for t_idx, t_path in trace_locations
+    ]
+
+    # How many lines away a trace reference is still allowed to count as
+    # "belonging" to an error. Real alert logs interleave several
+    # timestamp-only lines and unrelated event lines between an ORA- error
+    # and its "Errors in file .../xxx.trc" or "Refer trace file ... .trc"
+    # reference, so a tight 5-line window (the old behavior) missed a large
+    # fraction of real associations and reported "Not Found" even though a
+    # trace file was clearly present nearby in the log.
+    NEAR_WINDOW = 3       # highest-confidence: line immediately before/after
+    WIDE_WINDOW = 25      # fallback: closest trace reference in this range
 
     def find_nearby_trace(idx):
-        for t_idx, t_path in trace_locations:
-            if 0 <= t_idx - idx <= 5:
-                return t_path
-        return "Not Found"
+        if not trace_locations:
+            return "Not Found"
+
+        # Binary-search for the trace reference(s) closest to idx instead of
+        # scanning the full list for every error (important for large logs
+        # with many .trc mentions).
+        pos = bisect.bisect_left(_trace_idxs, idx)
+        candidates = []
+        if pos < len(trace_locations):
+            candidates.append(trace_locations[pos])
+        if pos > 0:
+            candidates.append(trace_locations[pos - 1])
+
+        # 1) Highest confidence: a trace reference within a tight window.
+        #    Oracle almost always writes "Errors in file .../xxx.trc
+        #    (incident=NN):" on the line immediately BEFORE the ORA- line,
+        #    so prefer a look-behind match, then look-ahead.
+        near = [(abs(t_idx - idx), t_idx, t_path) for t_idx, t_path in candidates if abs(t_idx - idx) <= NEAR_WINDOW]
+        if near:
+            near.sort(key=lambda x: x[0])
+            return near[0][2]
+
+        # 2) Fallback: widen the search so references that appear a bit
+        #    further away (e.g. "Refer trace file ... for details" logged
+        #    a few events later) are still picked up, rather than defaulting
+        #    to "Not Found" whenever the reference isn't right next door.
+        best_path, best_dist = None, None
+        for t_idx, t_path in candidates:
+            dist = abs(t_idx - idx)
+            if dist <= WIDE_WINDOW and (best_dist is None or dist < best_dist):
+                best_path, best_dist = t_path, dist
+        return best_path if best_path else "Not Found"
     
     def extract_kill_session_details(start_idx, lines):
         """Extract detailed information from KILL SESSION block - OPTIMIZED"""
@@ -540,17 +671,367 @@ def analyze_alert_log_lines(lines, source_name="uploaded"):
                     "Trace File": find_nearby_trace(i),
                     "Source": source_name,
                     "Raw Line": line,
+                    "_line_idx": i,
                 })
-        elif WARN_RE.search(line):
+        # Independent check (not elif): a line can legitimately be BOTH a
+        # WARNING and contain an ORA- code, e.g.
+        # "WARNING: inbound connection timed out (ORA-3136)". Previously
+        # such lines were only ever recorded as an ORA error and silently
+        # dropped from the Warnings table.
+        matched_warning = False
+        if WARN_RE.search(line):
             warnings.append({
                 "Timestamp": current_timestamp or "Not Found",
+                "Category": "General",
                 "Warning Message": line.strip(),
                 "Trace File": find_nearby_trace(i),
                 "Source": source_name,
                 "Raw Line": line,
             })
+            matched_warning = True
 
-    return ora_errors, warnings, kill_sessions
+        # Notable events that never contain the literal word "WARNING" (TNS
+        # listener failures, checkpoint/log-switch stalls) but are just as
+        # operationally significant — see NOTABLE_EVENT_RE above.
+        matched_notable = False
+        if not matched_warning:
+            notable_m = NOTABLE_EVENT_RE.search(line)
+            if notable_m:
+                matched_notable = True
+                label = NOTABLE_EVENT_LABELS[notable_m.lastgroup]
+                msg = line.strip()
+                # "Fatal NI connect error ..." is immediately followed by the
+                # DESCRIPTION= connect descriptor naming the actual service
+                # and client host involved — pull that in so, e.g., 43,000
+                # near-identical TNS/Listener rows aren't indistinguishable
+                # from each other when they actually span multiple services.
+                if notable_m.lastgroup == "tns" and i + 1 < len(lines):
+                    desc_m = TNS_DESCRIPTOR_RE.search(lines[i + 1])
+                    if desc_m:
+                        service, _program, client_host = desc_m.groups()
+                        msg += f"  [Service: {service.strip()}, Client Host: {client_host.strip()}]"
+                warnings.append({
+                    "Timestamp": current_timestamp or "Not Found",
+                    "Category": label,
+                    "Warning Message": msg,
+                    "Trace File": find_nearby_trace(i),
+                    "Source": source_name,
+                    "Raw Line": line,
+                })
+
+        # Future-proofing safety net — see GENERIC_ERROR_CODE_RE /
+        # GENERIC_SEVERITY_RE above. Runs ONLY on lines nothing above
+        # already recognized, so it can never duplicate an existing row; it
+        # only ever adds coverage for things this tool doesn't have a name
+        # for yet (new Oracle versions/components, brand-new error codes).
+        if not (ora_m or matched_warning or matched_notable):
+            code_m = GENERIC_ERROR_CODE_RE.search(line)
+            if code_m and code_m.group(1).split("-")[0] not in GENERIC_ERROR_CODE_SKIP_PREFIXES:
+                unclassified_events.append({
+                    "Timestamp": current_timestamp or "Not Found",
+                    "Match Type": "Unmapped Error Code",
+                    "Matched": code_m.group(1),
+                    "Trace File": find_nearby_trace(i),
+                    "Source": source_name,
+                    "Raw Line": line.strip(),
+                })
+            else:
+                sev_m = GENERIC_SEVERITY_RE.search(line)
+                if sev_m:
+                    unclassified_events.append({
+                        "Timestamp": current_timestamp or "Not Found",
+                        "Match Type": "Possible Severity Keyword",
+                        "Matched": sev_m.group(1).upper(),
+                        "Trace File": find_nearby_trace(i),
+                        "Source": source_name,
+                        "Raw Line": line.strip(),
+                    })
+
+    # ---- Group consecutive ORA- lines into logical error blocks ----
+    # Oracle commonly writes a root error immediately followed by chained /
+    # PL-SQL call-stack ORA- lines (e.g. an ORA-12012 job failure followed by
+    # ORA-03150, ORA-02063, ORA-06512 stack lines). A DBA reading the raw log
+    # sees these as ONE incident. Rows whose line indices are separated only
+    # by blank or timestamp-only lines are grouped into the same block so the
+    # full incident context is preserved, while each ORA code still gets its
+    # own row (so counts/filters/exports are unaffected).
+    if ora_errors:
+        blocks = []
+        current_block = [0]
+        for k in range(1, len(ora_errors)):
+            prev_idx = ora_errors[k - 1]["_line_idx"]
+            this_idx = ora_errors[k]["_line_idx"]
+            between_ok = True
+            for li in range(prev_idx + 1, this_idx):
+                content = lines[li].rstrip("\n").strip()
+                if content and not TIMESTAMP_RE.search(content):
+                    between_ok = False
+                    break
+            if between_ok:
+                current_block.append(k)
+            else:
+                blocks.append(current_block)
+                current_block = [k]
+        blocks.append(current_block)
+
+        for b_num, blk in enumerate(blocks, start=1):
+            block_raw_lines = [ora_errors[k]["Raw Line"] for k in blk]
+            block_codes = [ora_errors[k]["ORA Error"] for k in blk]
+            full_block_text = "\n".join(block_raw_lines)
+            for k in blk:
+                ora_errors[k]["Error Block ID"] = f"{source_name}-B{b_num}"
+                ora_errors[k]["Full Error Block"] = full_block_text
+                seen = set()
+                related_unique = [c for c in block_codes if c != ora_errors[k]["ORA Error"] and not (c in seen or seen.add(c))]
+                ora_errors[k]["Related ORA Codes"] = ", ".join(related_unique) if related_unique else "-"
+
+        for e in ora_errors:
+            e.pop("_line_idx", None)
+
+    return ora_errors, warnings, kill_sessions, trace_files, unclassified_events
+
+def is_asm_log(lines, sample_size=500):
+    """Heuristically detect whether a set of log lines belongs to an ASM
+    (Automatic Storage Management) instance rather than a regular RDBMS
+    alert log, by scanning for ASM-specific markers."""
+    checked = 0
+    for line in lines:
+        if ASM_LOG_MARKER_RE.search(line):
+            return True
+        checked += 1
+        if checked >= sample_size:
+            break
+    return False
+
+def analyze_asm_events(lines, source_name="uploaded"):
+    """Parse ASM alert log lines for diskgroup mount/dismount events,
+    rebalance operations, disk add/drop activity, client connect/disconnect
+    events, voting file activity, ORA- errors, and ASM-specific ERROR: lines."""
+    events = []
+    unclassified_events = []
+    current_timestamp = None
+
+    # Same trace-file association logic as the main DB alert-log parser —
+    # ASM ORA- errors (e.g. ORA-15041 diskgroup space exhausted) are
+    # frequently preceded by "Errors in file .../xxx.trc:" just like RDBMS
+    # errors are, and that association was previously only built for the
+    # regular alert-log parser, never for ASM logs.
+    trace_locations = [(i, TRACE_RE.search(line).group(1)) for i, line in enumerate(lines) if TRACE_RE.search(line)]
+    _trace_idxs = [t_idx for t_idx, _ in trace_locations]
+    NEAR_WINDOW = 3
+    WIDE_WINDOW = 25
+
+    def find_nearby_trace(idx):
+        if not trace_locations:
+            return "Not Found"
+        pos = bisect.bisect_left(_trace_idxs, idx)
+        candidates = []
+        if pos < len(trace_locations):
+            candidates.append(trace_locations[pos])
+        if pos > 0:
+            candidates.append(trace_locations[pos - 1])
+        near = [(abs(t_idx - idx), t_idx, t_path) for t_idx, t_path in candidates if abs(t_idx - idx) <= NEAR_WINDOW]
+        if near:
+            near.sort(key=lambda x: x[0])
+            return near[0][2]
+        best_path, best_dist = None, None
+        for t_idx, t_path in candidates:
+            dist = abs(t_idx - idx)
+            if dist <= WIDE_WINDOW and (best_dist is None or dist < best_dist):
+                best_path, best_dist = t_path, dist
+        return best_path if best_path else "Not Found"
+
+    for i, raw_line in enumerate(lines):
+        line = raw_line.rstrip("\n")
+        if not line.strip():
+            continue
+
+        ts_m = TIMESTAMP_RE.search(line)
+        if ts_m:
+            current_timestamp = ts_m.group(1)
+            continue
+
+        ts_now = current_timestamp or "Not Found"
+
+        # --- Instance crash / termination (highest severity, check first) ---
+        m = ASM_TERM_INITIATED_RE.search(line)
+        if m:
+            reason = f" — ORA error {m.group(3)}" if m.group(3) else ""
+            events.append({"Timestamp": ts_now, "Event Type": "Instance Termination Initiated",
+                            "Diskgroup": "-", "Detail": f"By {m.group(1)} (ospid {m.group(2)}){reason}",
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        # ORA- errors — previously not checked for at all in ASM logs. Real
+        # validation found ORA-15041 (diskgroup space exhausted) 149 times
+        # and ORA-00600 (internal error) in this environment's own ASM log,
+        # both completely invisible before this check existed.
+        ora_m = ORA_RE.search(line)
+        if ora_m:
+            code = f"ORA-{ora_m.group(1)}"
+            dg_m = ASM_ORA_DISKGROUP_NAME_RE.search(line)
+            events.append({"Timestamp": ts_now, "Event Type": "ORA Error",
+                            "Diskgroup": dg_m.group(1) if dg_m else "-",
+                            "Detail": f"{code}: {ora_m.group(2).strip()}" if ora_m.group(2) else line.strip(),
+                            "Trace File": find_nearby_trace(i),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_DISK_DEASSIGN_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Disk De-assignment",
+                            "Diskgroup": "-", "Detail": f"Disk {m.group(1)} marked for de-assignment",
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_RECONFIG_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Cluster Reconfiguration",
+                            "Diskgroup": "-", "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_PROC_TERM_REQ_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Process Termination Requested",
+                            "Diskgroup": "-", "Detail": f"pid {m.group(1)}",
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_TERM_COMPLETE_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Instance Terminated",
+                            "Diskgroup": "-", "Detail": f"By {m.group(1)}, pid={m.group(2)}",
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_MOUNT_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Diskgroup Mounted",
+                            "Diskgroup": m.group(1), "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_DISMOUNT_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Diskgroup Dismounted",
+                            "Diskgroup": m.group(1), "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_MOUNT_FAIL_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Diskgroup Mount Failed",
+                            "Diskgroup": m.group(1), "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_REBAL_START_RE.search(line)
+        if m:
+            power = f" (power {m.group(2)})" if m.group(2) else ""
+            events.append({"Timestamp": ts_now, "Event Type": "Rebalance Started",
+                            "Diskgroup": m.group(1), "Detail": f"{line.strip()}{power}",
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_REBAL_COMPLETE_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Rebalance Completed",
+                            "Diskgroup": m.group(1), "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_REBAL_INTERRUPT_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Rebalance Interrupted",
+                            "Diskgroup": m.group(1), "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_DISK_ADD_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Disk Added",
+                            "Diskgroup": m.group(1), "Detail": m.group(2),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_DISK_DROP_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Disk Dropped",
+                            "Diskgroup": m.group(1), "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_DISK_OFFLINE_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Disk Offline Initiated",
+                            "Diskgroup": m.group(3), "Detail": f"Disk {m.group(2)} ({m.group(1)})",
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_CLIENT_DISCONNECT_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Client Disconnected",
+                            "Diskgroup": "-", "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_CLIENT_RECONNECT_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Client Reconnected",
+                            "Diskgroup": "-", "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_VOTING_RISK_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Voting File At Risk",
+                            "Diskgroup": "-", "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_VOTING_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Voting File Activity",
+                            "Diskgroup": "-", "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_ERROR_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "ASM Error",
+                            "Diskgroup": "-", "Detail": m.group(1).strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        # Future-proofing safety net — same as the main alert-log parser
+        # (see GENERIC_ERROR_CODE_RE / GENERIC_SEVERITY_RE above). Only
+        # reached when none of the ASM-specific patterns above matched, so
+        # it never duplicates an existing row; it exists purely to catch
+        # ASM message types this tool doesn't have a dedicated rule for yet
+        # (e.g. a future ASM/CRS/GPnP feature or error code).
+        code_m = GENERIC_ERROR_CODE_RE.search(line)
+        if code_m and code_m.group(1).split("-")[0] not in GENERIC_ERROR_CODE_SKIP_PREFIXES:
+            unclassified_events.append({
+                "Timestamp": ts_now,
+                "Match Type": "Unmapped Error Code",
+                "Matched": code_m.group(1),
+                "Source": source_name,
+                "Raw Line": line.strip(),
+            })
+            continue
+
+        sev_m = GENERIC_SEVERITY_RE.search(line)
+        if sev_m:
+            unclassified_events.append({
+                "Timestamp": ts_now,
+                "Match Type": "Possible Severity Keyword",
+                "Matched": sev_m.group(1).upper(),
+                "Source": source_name,
+                "Raw Line": line.strip(),
+            })
+
+    return events, unclassified_events
 
 def parse_iso_timestamp(ts):
     if not ts or ts == "Not Found":
@@ -590,13 +1071,26 @@ def detect_instance_summary_and_events(all_lines):
 
     release_re = re.compile(r"(Release\s+\d+(?:\.\d+)*)", re.I)
     start_re = re.compile(r"(Starting\s+ORACLE\s+instance|PMON has started|Starting up ORACLE)", re.I)
-    shutdown_re = re.compile(r"(Shutting down|shutdown\s+complete|Shutdown\s+normal|shutdown complete)", re.I)
+    shutdown_re = re.compile(r"(Shutting down|shutdown\s+complete|Shutdown\s+normal|shutdown complete|ORACLE instance shut down)", re.I)
+    # NOTE: deliberately does NOT match bare "abort" or "ORA-609" — those
+    # match the extremely common, completely benign line
+    # "opiodr aborting process unknown ospid (nnnn) as a result of ORA-609",
+    # which fires on routine client disconnects/timeouts, not crashes. Using
+    # them here would flag that as a "Crash Event" on almost every
+    # production log and bury the real ones under noise.
     crash_re = re.compile(
-        r"(Instance terminated|terminated abnormally|abort|crash|ORA-00600|ORA-07445|core dump|ORA-609)",
+        r"(Instance terminated|terminated abnormally|core dump|ORA-00600|ORA-07445|ORA-00603"
+        r"|terminating the instance|Instance terminated by|System state dump|"
+        r"LMON received an instance eviction|Evicted instance)",
         re.I
     )
     inst_re = re.compile(r"Instance\s+name[:\s]*([A-Za-z0-9_\-\.]+)", re.I)
-    host_re = re.compile(r"Host\s*[:=]\s*([A-Za-z0-9\-\._]+)", re.I)
+    # Negative lookbehind excludes "(HOST=...)" as it appears inside TNS
+    # connect descriptors — e.g. "(ADDRESS=(PROTOCOL=TCP)(HOST=10.52.18.12)...)"
+    # or "(CID=(PROGRAM=oracle)(HOST=chfrsdb01)...)" — which are listener/
+    # client addresses, not the database server's own hostname, and were
+    # previously polluting this field with random client IPs.
+    host_re = re.compile(r"(?:(?<!\()Host\s*[:=]\s*|Node name:\s*)([A-Za-z0-9\-\._]+)", re.I)
 
     # ⭐ NEW: Detect ANY ALTER command
     alter_re = re.compile(r"\bALTER\s+[A-Z_]+\b", re.I)
@@ -789,18 +1283,18 @@ def ai_generate(prompt: str) -> str:
 st.markdown("""
 <div style='background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); margin-bottom: 2rem;'>
     <h3 style='margin-top: 0; color: #667eea;'>📂 Upload Alert Log Files</h3>
-    <p style='color: #666; margin-bottom: 1rem;'>Select one or more Oracle alert log files to analyze</p>
+    <p style='color: #666; margin-bottom: 1rem;'>Select one or more Oracle RDBMS alert logs and/or ASM (+ASM) alert logs to analyze — ASM logs are auto-detected</p>
 </div>
 """, unsafe_allow_html=True)
 
-uploaded_files = st.file_uploader("", type=["log","txt","zip"], accept_multiple_files=True, label_visibility="collapsed")
+uploaded_files = st.file_uploader("Upload Alert Log Files", type=["log","txt","zip"], accept_multiple_files=True, label_visibility="collapsed")
 
 if not uploaded_files:
     st.markdown("""
     <div style='background: white; padding: 3rem; border-radius: 12px; text-align: center; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);'>
         <h2 style='color: #667eea; margin-bottom: 1rem;'>👋 Welcome!</h2>
-        <p style='font-size: 1.1rem; color: #666;'>Upload your Oracle alert log files above to begin analysis</p>
-        <p style='color: #999; margin-top: 1rem;'>Supports .log and .txt files</p>
+        <p style='font-size: 1.1rem; color: #666;'>Upload your Oracle RDBMS and/or ASM alert log files above to begin analysis</p>
+        <p style='color: #999; margin-top: 1rem;'>Supports .log and .txt files (RDBMS &amp; ASM alert logs, auto-detected) as well as .zip archives</p>
     </div>
     """, unsafe_allow_html=True)
     st.stop()
@@ -811,6 +1305,10 @@ per_file_lines = {}
 combined_ora = []
 combined_warnings = []
 combined_kill_sessions = []
+combined_trace_files = []
+combined_unclassified = []
+combined_asm_events = []
+asm_source_files = set()
 
 with st.spinner("📄 Processing uploaded files..."):
     for f in uploaded_files:
@@ -825,10 +1323,18 @@ with st.spinner("📄 Processing uploaded files..."):
                 all_raw_lines.extend(zlines)
                 all_raw_lines.append(f"--- END FILE: {zname} ---")
 
-                o, w, k = analyze_alert_log_lines(zlines, source_name=zname)
+                o, w, k, tr, u = analyze_alert_log_lines(zlines, source_name=zname)
                 combined_ora.extend(o)
                 combined_warnings.extend(w)
                 combined_kill_sessions.extend(k)
+                combined_trace_files.extend(tr)
+                combined_unclassified.extend(u)
+
+                if is_asm_log(zlines):
+                    asm_source_files.add(zname)
+                    asm_events, asm_unclassified = analyze_asm_events(zlines, source_name=zname)
+                    combined_asm_events.extend(asm_events)
+                    combined_unclassified.extend(asm_unclassified)
             continue
 
         # Normal .log / .txt files
@@ -838,15 +1344,27 @@ with st.spinner("📄 Processing uploaded files..."):
         all_raw_lines.extend(lines)
         all_raw_lines.append(f"--- END FILE: {name} ---")
 
-        o, w, k = analyze_alert_log_lines(lines, source_name=name)
+        o, w, k, tr, u = analyze_alert_log_lines(lines, source_name=name)
         combined_ora.extend(o)
         combined_warnings.extend(w)
         combined_kill_sessions.extend(k)
+        combined_trace_files.extend(tr)
+        combined_unclassified.extend(u)
+
+        # 💽 ASM Log Auto-Detection & Parsing
+        if is_asm_log(lines):
+            asm_source_files.add(name)
+            asm_events, asm_unclassified = analyze_asm_events(lines, source_name=name)
+            combined_asm_events.extend(asm_events)
+            combined_unclassified.extend(asm_unclassified)
 
 
-df_ora_all = pd.DataFrame(combined_ora) if combined_ora else pd.DataFrame(columns=["Timestamp","ORA Error","Trace File","Source","Raw Line"])
-df_warn_all = pd.DataFrame(combined_warnings) if combined_warnings else pd.DataFrame(columns=["Timestamp","Warning Message","Trace File","Source","Raw Line"])
+df_ora_all = pd.DataFrame(combined_ora) if combined_ora else pd.DataFrame(columns=["Timestamp","ORA Error","Trace File","Source","Raw Line","Error Block ID","Full Error Block","Related ORA Codes"])
+df_warn_all = pd.DataFrame(combined_warnings) if combined_warnings else pd.DataFrame(columns=["Timestamp","Category","Warning Message","Trace File","Source","Raw Line"])
 df_kill_all = pd.DataFrame(combined_kill_sessions) if combined_kill_sessions else pd.DataFrame(columns=["Timestamp","SID","Serial#","Reason","Mode","Requestor","Owner","Result","Trace File","Source","Raw Line","Full Block"])
+df_asm_all = pd.DataFrame(combined_asm_events) if combined_asm_events else pd.DataFrame(columns=["Timestamp","Event Type","Diskgroup","Detail","Source","Raw Line"])
+df_unclassified_all = pd.DataFrame(combined_unclassified) if combined_unclassified else pd.DataFrame(columns=["Timestamp","Match Type","Matched","Trace File","Source","Raw Line"])
+df_trace_all = pd.DataFrame(combined_trace_files) if combined_trace_files else pd.DataFrame(columns=["Timestamp","Trace File","Source","Raw Line"])
 
 if not df_ora_all.empty:
     df_ora_all["ParsedTimestamp"] = df_ora_all["Timestamp"].apply(parse_iso_timestamp)
@@ -863,23 +1381,56 @@ if not df_kill_all.empty:
 else:
     df_kill_all["ParsedTimestamp"] = pd.Series(dtype="datetime64[ns]")
 
+if not df_asm_all.empty:
+    df_asm_all["ParsedTimestamp"] = df_asm_all["Timestamp"].apply(parse_iso_timestamp)
+else:
+    df_asm_all["ParsedTimestamp"] = pd.Series(dtype="datetime64[ns]")
+
+if not df_unclassified_all.empty:
+    df_unclassified_all["ParsedTimestamp"] = df_unclassified_all["Timestamp"].apply(parse_iso_timestamp)
+else:
+    df_unclassified_all["ParsedTimestamp"] = pd.Series(dtype="datetime64[ns]")
+
+if not df_trace_all.empty:
+    df_trace_all["ParsedTimestamp"] = df_trace_all["Timestamp"].apply(parse_iso_timestamp)
+    df_trace_all = df_trace_all.sort_values("ParsedTimestamp", na_position="last").reset_index(drop=True)
+else:
+    df_trace_all["ParsedTimestamp"] = pd.Series(dtype="datetime64[ns]")
+
 # ---------------- Quick Stats Dashboard ----------------
 st.markdown("### 📊 Quick Statistics")
 
-# Determine error severity and trigger audio alerts
 total_errors = len(combined_ora)
 total_warnings = len(combined_warnings)
 total_kills = len(combined_kill_sessions)
+total_asm_events = len(combined_asm_events)
+total_unclassified = len(combined_unclassified)
 
-if AUDIO_ALERTS_ENABLED and total_errors > 0:
-    if total_errors > 100:
-        play_audio_alert("critical")
-        speak_text(f"Critical alert. {total_errors} errors detected")
-    elif total_errors > 50:
-        play_audio_alert("high")
-        speak_text(f"High priority. {total_errors} errors found")
-    elif total_errors > 10:
-        play_audio_alert("medium")
+if asm_source_files:
+    st.info(f"💽 **ASM log(s) detected:** {', '.join(sorted(asm_source_files))} — ASM diskgroup analysis is available below.")
+    _term_types = {"Instance Termination Initiated", "Instance Terminated"}
+    _term_total = sum(1 for e in combined_asm_events if e.get("Event Type") in _term_types)
+    if _term_total > 0:
+        st.error(f"🚨 **{_term_total} ASM instance crash/termination event(s) found** in the uploaded logs. See '💽 ASM Diskgroup Analysis → 🚨 Instance Health' below.")
+
+    # ORA-15041 (diskgroup space exhausted) is one of the highest-impact,
+    # most actionable things that can appear in an ASM log — flag it
+    # specifically rather than letting it blend into the general ORA/ASM
+    # error count, since space exhaustion needs immediate attention.
+    _space_exhausted_total = sum(
+        1 for e in combined_asm_events
+        if e.get("Event Type") == "ORA Error" and "15041" in str(e.get("Detail", ""))
+    )
+    if _space_exhausted_total > 0:
+        _dgs = sorted({
+            e.get("Diskgroup") for e in combined_asm_events
+            if e.get("Event Type") == "ORA Error" and "15041" in str(e.get("Detail", "")) and e.get("Diskgroup", "-") != "-"
+        })
+        _dg_txt = f" (diskgroup(s): {', '.join(_dgs)})" if _dgs else ""
+        st.error(f"💾 **{_space_exhausted_total} diskgroup space-exhausted error(s) (ORA-15041)** found{_dg_txt} — see '💽 ASM Diskgroup Analysis → 🧨 ASM / ORA Errors' below.")
+
+if total_unclassified > 0:
+    st.warning(f"🆕 **{total_unclassified} line(s) didn't match any known pattern** — possibly a new/unfamiliar message type. See the '🆕 New/Unclassified' tab below to review.")
 
 if mobile_view:
     # Mobile: Stack metrics vertically
@@ -889,35 +1440,29 @@ if mobile_view:
     st.metric("⚡ Kill Sessions", total_kills)
     unique_ora = len(df_ora_all["ORA Error"].unique()) if not df_ora_all.empty else 0
     st.metric("🔢 Unique ORA Codes", unique_ora)
+    st.metric("🆕 Unclassified", total_unclassified)
+    if asm_source_files:
+        st.metric("💽 ASM Events", total_asm_events)
 else:
     # Desktop: Horizontal layout
-    col1, col2, col3, col4, col5 = st.columns(5)
-    with col1:
+    ncols = 7 if asm_source_files else 6
+    cols = st.columns(ncols)
+    with cols[0]:
         st.metric("📄 Files Uploaded", len(uploaded_files))
-    with col2:
+    with cols[1]:
         st.metric("🔴 ORA Errors", total_errors)
-    with col3:
+    with cols[2]:
         st.metric("🟡 Warnings", total_warnings)
-    with col4:
+    with cols[3]:
         st.metric("⚡ Kill Sessions", total_kills)
-    with col5:
+    with cols[4]:
         unique_ora = len(df_ora_all["ORA Error"].unique()) if not df_ora_all.empty else 0
         st.metric("🔢 Unique ORA Codes", unique_ora)
-
-# Audio alert severity indicator
-if AUDIO_ALERTS_ENABLED:
-    st.sidebar.markdown("### 📊 Alert Thresholds")
-    st.sidebar.info(f"""
-    **Current Status:**
-    - Errors: {total_errors}
-    - Warnings: {total_warnings}
-    
-    **Alert Levels:**
-    - 🔴 Critical: >100 errors (with voice)
-    - 🟠 High: >50 errors (with voice)
-    - 🟡 Medium: >10 errors
-    - 🟢 Low: <10 errors
-    """)
+    with cols[5]:
+        st.metric("🆕 Unclassified", total_unclassified)
+    if asm_source_files:
+        with cols[6]:
+            st.metric("💽 ASM Events", total_asm_events)
 
 st.markdown("---")
 
@@ -969,6 +1514,7 @@ if search_q:
     , axis=1)].copy()
     df_warn_display = df_warn_all[df_warn_all.apply(lambda r:
         q in str(r.get("Warning Message","")).lower()
+        or q in str(r.get("Category","")).lower()
         or q in str(r.get("Trace File","")).lower()
         or q in str(r.get("Source","")).lower()
     , axis=1)].copy()
@@ -980,14 +1526,36 @@ if search_q:
         or q in str(r.get("Owner","")).lower()
         or q in str(r.get("Source","")).lower()
     , axis=1)].copy()
+    df_asm_display = df_asm_all[df_asm_all.apply(lambda r:
+        q in str(r.get("Event Type","")).lower()
+        or q in str(r.get("Diskgroup","")).lower()
+        or q in str(r.get("Detail","")).lower()
+        or q in str(r.get("Source","")).lower()
+    , axis=1)].copy()
+    df_unclassified_display = df_unclassified_all[df_unclassified_all.apply(lambda r:
+        q in str(r.get("Match Type","")).lower()
+        or q in str(r.get("Matched","")).lower()
+        or q in str(r.get("Raw Line","")).lower()
+        or q in str(r.get("Source","")).lower()
+    , axis=1)].copy()
+    df_trace_display = df_trace_all[df_trace_all.apply(lambda r:
+        q in str(r.get("Trace File","")).lower()
+        or q in str(r.get("Source","")).lower()
+    , axis=1)].copy()
 else:
     df_ora_display = df_ora_all.copy()
     df_warn_display = df_warn_all.copy()
     df_kill_display = df_kill_all.copy()
+    df_asm_display = df_asm_all.copy()
+    df_unclassified_display = df_unclassified_all.copy()
+    df_trace_display = df_trace_all.copy()
 
 df_ora_display = apply_global_date_filter(df_ora_display, global_start_dt, global_end_dt)
 df_warn_display = apply_global_date_filter(df_warn_display, global_start_dt, global_end_dt)
 df_kill_display = apply_global_date_filter(df_kill_display, global_start_dt, global_end_dt)
+df_asm_display = apply_global_date_filter(df_asm_display, global_start_dt, global_end_dt)
+df_unclassified_display = apply_global_date_filter(df_unclassified_display, global_start_dt, global_end_dt)
+df_trace_display = apply_global_date_filter(df_trace_display, global_start_dt, global_end_dt)
 
 # ---- APPLY GLOBAL FILTERS TO INSTANCE EVENTS ----
 def filter_instance_events(event_list, search_q, start_dt, end_dt):
@@ -1073,13 +1641,143 @@ with st.expander("🗂️ Instance Summary & Events", expanded=expand_instance):
 
 
 
+# ---------------- ASM Diskgroup Analysis ----------------
+if asm_source_files:
+    expand_asm = st.session_state.get("voice_action") == "show_asm"
+    with st.expander("💽 ASM Diskgroup Analysis", expanded=expand_asm):
+        st.markdown("""
+        <div style='background: linear-gradient(135deg, #43cea2 0%, #185a9d 100%);
+                    padding: 1.5rem; border-radius: 8px; color: white; margin-bottom: 1rem;'>
+            <h4 style='margin: 0 0 0.5rem 0;'>💽 ASM Diskgroup Events</h4>
+            <p style='margin: 0; opacity: 0.9;'>Mount/dismount activity, rebalance operations, disk changes & ASM errors</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if df_asm_display.empty:
+            st.success("✅ No ASM diskgroup events found in selected range/search")
+        else:
+            # ---- ASM Quick Metrics ----
+            type_counts = df_asm_display["Event Type"].value_counts()
+
+            term_count = type_counts.get("Instance Termination Initiated", 0) + type_counts.get("Instance Terminated", 0)
+            if term_count > 0:
+                st.error(f"🚨 **{term_count} ASM instance termination event(s) detected** — check the Instance Health tab below immediately.")
+
+            voting_risk_count = type_counts.get("Voting File At Risk", 0)
+            if voting_risk_count > 0:
+                st.warning(f"🗳️ **{voting_risk_count} voting-file quorum risk warning(s)** — a diskgroup holding voting files was not mounted at some point.")
+
+            m_cols = st.columns(3) if mobile_view else st.columns(4)
+
+            def _m(idx, label, val):
+                with m_cols[idx % len(m_cols)]:
+                    st.metric(label, int(val))
+
+            _m(0, "🚨 Instance Terminations", term_count)
+            _m(1, "🟢 Mounts", type_counts.get("Diskgroup Mounted", 0))
+            _m(2, "🔴 Dismounts", type_counts.get("Diskgroup Dismounted", 0))
+            _m(3, "⚠️ Mount Failures", type_counts.get("Diskgroup Mount Failed", 0))
+            m_cols2 = st.columns(3) if mobile_view else st.columns(4)
+
+            def _m2(idx, label, val):
+                with m_cols2[idx % len(m_cols2)]:
+                    st.metric(label, int(val))
+
+            _m2(0, "⚖️ Rebalances", type_counts.get("Rebalance Started", 0))
+            _m2(1, "💾 Disk Add/Drop/Offline/De-assign",
+                type_counts.get("Disk Added", 0) + type_counts.get("Disk Dropped", 0)
+                + type_counts.get("Disk Offline Initiated", 0) + type_counts.get("Disk De-assignment", 0))
+            _m2(2, "🗳️ Voting Risks", voting_risk_count)
+            _m2(3, "🔴 ORA / ASM Errors", type_counts.get("ASM Error", 0) + type_counts.get("ORA Error", 0))
+
+            recfg_count = type_counts.get("Cluster Reconfiguration", 0)
+            procterm_count = type_counts.get("Process Termination Requested", 0)
+            if recfg_count > 0 or procterm_count > 0:
+                m_cols3 = st.columns(2)
+                with m_cols3[0]:
+                    st.metric("🔄 Cluster Reconfigurations", int(recfg_count))
+                with m_cols3[1]:
+                    st.metric("⚡ Process Terminations Requested", int(procterm_count))
+
+            asm_tab_labels = [
+                "🚨 Instance Health", "🔄 Mount / Dismount", "⚖️ Rebalance Ops",
+                "💾 Disk Add / Drop / Offline / De-assign", "🔌 Client & Voting",
+                "🧨 ASM / ORA Errors", "🔄 Reconfig & Proc Term", "📋 All ASM Events"
+            ]
+            asm_tabs = st.tabs(asm_tab_labels)
+
+            def _show_asm_subset(event_types, empty_msg):
+                sub = df_asm_display[df_asm_display["Event Type"].isin(event_types)]
+                if sub.empty:
+                    st.info(empty_msg)
+                else:
+                    st.dataframe(
+                        sub.drop(columns=["ParsedTimestamp"], errors="ignore"),
+                        use_container_width=True
+                    )
+
+            with asm_tabs[0]:
+                _show_asm_subset(
+                    ["Instance Termination Initiated", "Instance Terminated"],
+                    "✅ No instance crash/termination events found"
+                )
+            with asm_tabs[1]:
+                _show_asm_subset(
+                    ["Diskgroup Mounted", "Diskgroup Dismounted", "Diskgroup Mount Failed"],
+                    "✅ No mount/dismount events found"
+                )
+            with asm_tabs[2]:
+                _show_asm_subset(
+                    ["Rebalance Started", "Rebalance Completed", "Rebalance Interrupted"],
+                    "✅ No rebalance operations found"
+                )
+            with asm_tabs[3]:
+                _show_asm_subset(
+                    ["Disk Added", "Disk Dropped", "Disk Offline Initiated", "Disk De-assignment"],
+                    "✅ No disk add/drop/offline/de-assignment events found"
+                )
+            with asm_tabs[4]:
+                _show_asm_subset(
+                    ["Client Disconnected", "Client Reconnected", "Voting File Activity", "Voting File At Risk"],
+                    "✅ No client connection/voting events found"
+                )
+            with asm_tabs[5]:
+                _show_asm_subset(["ASM Error", "ORA Error"], "✅ No ASM/ORA error lines found")
+            with asm_tabs[6]:
+                st.caption(
+                    "Cluster reconfiguration events (Grid Infrastructure/ASM instance membership changes) and "
+                    "OS-level process termination requests — both are useful correlation signals around "
+                    "instance instability even when they aren't errors by themselves."
+                )
+                _show_asm_subset(
+                    ["Cluster Reconfiguration", "Process Termination Requested"],
+                    "✅ No reconfiguration or process termination events found"
+                )
+            with asm_tabs[7]:
+                st.dataframe(
+                    df_asm_display.drop(columns=["ParsedTimestamp"], errors="ignore"),
+                    use_container_width=True
+                )
+
+                st.markdown("#### 📊 ASM Event Distribution")
+                dist = df_asm_display["Event Type"].value_counts().reset_index()
+                dist.columns = ["Event Type", "Count"]
+                st.dataframe(dist, use_container_width=True)
+
+                if not df_asm_display.empty:
+                    dg_dist = df_asm_display[df_asm_display["Diskgroup"] != "-"]["Diskgroup"].value_counts().reset_index()
+                    if not dg_dist.empty:
+                        dg_dist.columns = ["Diskgroup", "Event Count"]
+                        st.markdown("#### 💽 Events by Diskgroup")
+                        st.dataframe(dg_dist, use_container_width=True)
+
 # ---------------- ORA Errors & Warnings Tabs ----------------
 expand_errors_tab = st.session_state.get("voice_action") == "show_errors"
 expand_warnings_tab = st.session_state.get("voice_action") == "show_warnings"
 
 # If either tab should be expanded, show that one
 if expand_errors_tab or expand_warnings_tab:
-    tab_ora, tab_warn = st.tabs(["🔴 ORA Errors", "🟡 Warnings"])
+    tab_ora, tab_warn, tab_new = st.tabs(["🔴 ORA Errors", "🟡 Warnings", "🆕 New/Unclassified"])
     
     with tab_ora:
         with st.expander("📋 ORA Error Details", expanded=expand_errors_tab):
@@ -1097,16 +1795,45 @@ if expand_errors_tab or expand_warnings_tab:
         with st.expander("📋 Warning Details", expanded=expand_warnings_tab):
             if not df_warn_display.empty:
                 st.dataframe(df_warn_display.drop(columns=["ParsedTimestamp"], errors="ignore"), use_container_width=True)
-                
+
+                if "Category" in df_warn_display.columns and df_warn_display["Category"].nunique() > 1:
+                    st.markdown("#### 🗂️ Warnings by Category")
+                    cat_counts = df_warn_display["Category"].value_counts().reset_index()
+                    cat_counts.columns = ["Category", "Count"]
+                    st.dataframe(cat_counts, use_container_width=True)
+
                 st.markdown("#### 📊 Top Warnings")
                 top_w = df_warn_display["Warning Message"].value_counts().head(20).reset_index()
                 top_w.columns = ["Warning Message", "Count"]
                 st.dataframe(top_w, use_container_width=True)
             else:
                 st.info("✅ No warnings found in selected range/search")
+
+    with tab_new:
+        with st.expander("🆕 Unclassified / Possible New Patterns", expanded=False):
+            st.caption(
+                "Lines that don't match any known ORA/Warning/RAC/DG/RMAN/Data Pump pattern, but either "
+                "look like an Oracle-style error code (e.g. a future/unfamiliar PREFIX-NNNNN) or contain "
+                "a high-signal severity word. This is a safety net for message types this tool doesn't "
+                "have a dedicated rule for yet — review it periodically so nothing new goes unnoticed."
+            )
+            if not df_unclassified_display.empty:
+                st.dataframe(df_unclassified_display.drop(columns=["ParsedTimestamp"], errors="ignore"), use_container_width=True)
+
+                st.markdown("#### 🗂️ By Match Type")
+                mt_counts = df_unclassified_display["Match Type"].value_counts().reset_index()
+                mt_counts.columns = ["Match Type", "Count"]
+                st.dataframe(mt_counts, use_container_width=True)
+
+                st.markdown("#### 📊 Most Frequent Unmapped Codes/Keywords")
+                matched_counts = df_unclassified_display["Matched"].value_counts().head(20).reset_index()
+                matched_counts.columns = ["Matched", "Count"]
+                st.dataframe(matched_counts, use_container_width=True)
+            else:
+                st.success("✅ Nothing unclassified in the selected range/search — everything matched a known pattern.")
 else:
     # Normal tabs without forced expansion
-    tab_ora, tab_warn = st.tabs(["🔴 ORA Errors", "🟡 Warnings"])
+    tab_ora, tab_warn, tab_new = st.tabs(["🔴 ORA Errors", "🟡 Warnings", "🆕 New/Unclassified"])
     
     with tab_ora:
         with st.expander("📋 ORA Error Details", expanded=True):
@@ -1124,13 +1851,42 @@ else:
         with st.expander("📋 Warning Details", expanded=True):
             if not df_warn_display.empty:
                 st.dataframe(df_warn_display.drop(columns=["ParsedTimestamp"], errors="ignore"), use_container_width=True)
-                
+
+                if "Category" in df_warn_display.columns and df_warn_display["Category"].nunique() > 1:
+                    st.markdown("#### 🗂️ Warnings by Category")
+                    cat_counts = df_warn_display["Category"].value_counts().reset_index()
+                    cat_counts.columns = ["Category", "Count"]
+                    st.dataframe(cat_counts, use_container_width=True)
+
                 st.markdown("#### 📊 Top Warnings")
                 top_w = df_warn_display["Warning Message"].value_counts().head(20).reset_index()
                 top_w.columns = ["Warning Message", "Count"]
                 st.dataframe(top_w, use_container_width=True)
             else:
                 st.info("✅ No warnings found in selected range/search")
+
+    with tab_new:
+        with st.expander("🆕 Unclassified / Possible New Patterns", expanded=False):
+            st.caption(
+                "Lines that don't match any known ORA/Warning/RAC/DG/RMAN/Data Pump pattern, but either "
+                "look like an Oracle-style error code (e.g. a future/unfamiliar PREFIX-NNNNN) or contain "
+                "a high-signal severity word. This is a safety net for message types this tool doesn't "
+                "have a dedicated rule for yet — review it periodically so nothing new goes unnoticed."
+            )
+            if not df_unclassified_display.empty:
+                st.dataframe(df_unclassified_display.drop(columns=["ParsedTimestamp"], errors="ignore"), use_container_width=True)
+
+                st.markdown("#### 🗂️ By Match Type")
+                mt_counts = df_unclassified_display["Match Type"].value_counts().reset_index()
+                mt_counts.columns = ["Match Type", "Count"]
+                st.dataframe(mt_counts, use_container_width=True)
+
+                st.markdown("#### 📊 Most Frequent Unmapped Codes/Keywords")
+                matched_counts = df_unclassified_display["Matched"].value_counts().head(20).reset_index()
+                matched_counts.columns = ["Matched", "Count"]
+                st.dataframe(matched_counts, use_container_width=True)
+            else:
+                st.success("✅ Nothing unclassified in the selected range/search — everything matched a known pattern.")
 
 # ---------------- Error Frequency Chart ----------------
 with st.expander("📈 ORA Error Frequency Chart", expanded=False):
@@ -1165,6 +1921,13 @@ with st.expander("📈 ORA Error Frequency Chart", expanded=False):
             overall_min = df_selected["ParsedTimestamp"].min()
             overall_max = df_selected["ParsedTimestamp"].max()
 
+            # Default to Daily granularity for wide date ranges. Hourly
+            # buckets across 1-2+ weeks produce hundreds of bars, which is
+            # what made the chart unreadable — Daily keeps it clean, and the
+            # user can still switch to Hourly for a narrower window.
+            _span_days = (overall_max - overall_min).days if pd.notna(overall_max) and pd.notna(overall_min) else 0
+            _default_granularity_idx = 1 if _span_days > 3 else 0
+
             col1, col2, col3 = st.columns([2, 2, 1])
             with col1:
                 chart_start_date = st.date_input("Chart start date",
@@ -1181,7 +1944,7 @@ with st.expander("📈 ORA Error Frequency Chart", expanded=False):
                                                overall_max.astimezone(LOCAL_TZ).time(),
                                                key="chart_end_time")
             with col3:
-                view_mode = st.radio("Granularity", ["Hourly", "Daily"], key="chart_view")
+                view_mode = st.radio("Granularity", ["Hourly", "Daily"], index=_default_granularity_idx, key="chart_view")
 
             chart_start_dt = datetime.combine(chart_start_date, chart_start_time).replace(tzinfo=LOCAL_TZ)
             chart_end_dt = datetime.combine(chart_end_date, chart_end_time).replace(tzinfo=LOCAL_TZ)
@@ -1196,10 +1959,10 @@ with st.expander("📈 ORA Error Frequency Chart", expanded=False):
                 st.warning("No ORA errors in the selected chart time window")
             else:
                 if view_mode == "Hourly":
-                    df_chart_base["TimeBucket"] = df_chart_base["ParsedTimestamp"].dt.floor("H")
+                    df_chart_base["TimeBucket"] = df_chart_base["ParsedTimestamp"].dt.floor("h")
                     df_chart_base["MinuteStr"] = df_chart_base["ParsedTimestamp"].dt.strftime("%Y-%m-%d %H:%M")
                 else:
-                    df_chart_base["TimeBucket"] = df_chart_base["ParsedTimestamp"].dt.floor("D")
+                    df_chart_base["TimeBucket"] = df_chart_base["ParsedTimestamp"].dt.floor("d")
                     df_chart_base["MinuteStr"] = df_chart_base["ParsedTimestamp"].dt.strftime("%Y-%m-%d")
 
                 freq = df_chart_base.groupby(["TimeBucket", "ORA Error"]).size().reset_index(name="Count")
@@ -1213,71 +1976,85 @@ with st.expander("📈 ORA Error Frequency Chart", expanded=False):
                     freq["SampleMinutes"] = freq["TimeBucket"].dt.strftime("%Y-%m-%d")
 
                 import plotly.graph_objects as go
-                x_vals = sorted(freq["TimeBucket"].unique())
-                ora_codes = sorted(freq["ORA Error"].unique())
 
-                fig = go.Figure()
-                colors = [
-                    '#667eea', '#764ba2', '#f093fb', '#f5576c',
-                    '#4facfe', '#00f2fe', '#43e97b', '#38f9d7'
+                total_by_code = freq.groupby("ORA Error")["Count"].sum().sort_values(ascending=False)
+                all_codes_sorted = list(total_by_code.index)
+                n_codes = len(all_codes_sorted)
+                n_buckets = freq["TimeBucket"].nunique()
+                label_fmt = "%d-%b %H:%M" if view_mode == "Hourly" else "%d-%b-%Y"
+                x_label = "Hour" if view_mode == "Hourly" else "Date"
+                tickformat = "%d-%b\n%H:%M" if view_mode == "Hourly" else "%d-%b-%Y"
+
+                # Heatmap is the only chart type now (Bar/Line removed).
+                pivot = freq.pivot_table(index="ORA Error", columns="TimeBucket", values="Count", fill_value=0)
+                pivot = pivot.reindex(all_codes_sorted)  # busiest code on top
+                z_raw = pivot.values
+                max_count = int(z_raw.max()) if z_raw.size else 0
+
+                # A linear color scale gets crushed whenever one code (like
+                # ORA-00132 above, in the thousands) massively outnumbers
+                # everything else — every other cell maps to ~0% of the
+                # scale and renders as near-invisible white-on-white.
+                # Coloring by log(1+count) instead spreads the scale out so
+                # low counts still get real, visible color, while the
+                # colorbar and hover still show true counts.
+                z_color = np.log1p(z_raw)
+
+                if max_count > 0:
+                    candidate_ticks = [0, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000]
+                    tick_actual = sorted(set([t for t in candidate_ticks if t <= max_count] + [max_count]))
+                    colorbar_kwargs = dict(
+                        title="Count",
+                        tickvals=np.log1p(tick_actual),
+                        ticktext=[str(t) for t in tick_actual],
+                    )
+                else:
+                    colorbar_kwargs = dict(title="Count")
+
+                # Build hover text in Python rather than relying on Plotly's
+                # %{customdata} template substitution, which was showing up
+                # as the literal, unresolved token "Count: %{customdata}"
+                # in the tooltip instead of the actual count.
+                row_labels = list(pivot.index)
+                col_labels = list(pivot.columns)
+                hover_text = [
+                    [
+                        f"<b>{row_labels[i]}</b><br>{pd.Timestamp(col_labels[j]).strftime(label_fmt)}<br>Count: {int(z_raw[i][j])}"
+                        for j in range(len(col_labels))
+                    ]
+                    for i in range(len(row_labels))
                 ]
 
-                for idx, ora in enumerate(ora_codes):
-                    sub = freq[freq["ORA Error"] == ora].set_index("TimeBucket").reindex(
-                        x_vals, fill_value=0
-                    ).reset_index()
-
-                    sample_map = dict(zip(sub["TimeBucket"], sub["SampleMinutes"]))
-
-                    hover_text = [
-                        f"<b>Time:</b> {x}<br>"
-                        f"<b>ORA:</b> {ora}<br>"
-                        f"<b>Count:</b> {int(cnt)}<br>"
-                        f"<b>Sample:</b> {sample_map.get(x, '')}"
-                        for x, cnt in zip(sub["TimeBucket"], sub["Count"])
-                    ]
-
-                    fig.add_trace(go.Bar(
-                        x=sub["TimeBucket"],
-                        y=sub["Count"],
-                        name=ora,
-                        text=sub["Count"],
-                        textposition="outside",
-                        hovertext=hover_text,
-                        hoverinfo="text",
-                        marker_color=colors[idx % len(colors)]
-                    ))
-
-                x_label = "Hour" if view_mode == "Hourly" else "Date"
-
+                fig = go.Figure(data=go.Heatmap(
+                    z=z_color,
+                    x=col_labels,
+                    y=row_labels,
+                    zmin=0,
+                    colorscale=[
+                        [0.0, '#ffffff'], [0.06, '#e6ebfb'], [0.18, '#c2cffb'],
+                        [0.38, '#8ea6f5'], [0.58, '#667eea'], [0.78, '#c2185b'],
+                        [1.0, '#7a0930'],
+                    ],
+                    colorbar=colorbar_kwargs,
+                    text=hover_text,
+                    hoverinfo="text",
+                    xgap=1, ygap=2,
+                ))
                 fig.update_layout(
-                    barmode="group",
-                    bargap=0.30,
-                    bargroupgap=0.05,
-                    title=f"ORA Error Frequency ({view_mode}) – {selected_log}",
+                    title=f"ORA Error Frequency Heatmap ({view_mode}) – {selected_log}",
                     xaxis=dict(
-                        title=x_label,
-                        tickangle=0,
-                        type="category",
-                        tickfont=dict(size=11),
-                        showgrid=True,
-                        gridcolor='rgba(0,0,0,0.05)',
+                        title=x_label, type="date", tickformat=tickformat,
+                        tickangle=-45 if view_mode == "Hourly" else 0,
+                        tickfont=dict(size=10), nticks=min(30, max(6, n_buckets)),
+                        automargin=True, showgrid=False,
                     ),
-                    yaxis=dict(
-                        title="Occurrences (Log Scale)",
-                        type="log",
-                        dtick=1,
-                        showgrid=True,
-                        gridcolor='rgba(0,0,0,0.15)',
-                    ),
-                    legend_title_text="ORA Error",
-                    height=600,
-                    margin=dict(l=30, r=30, t=60, b=120),
-                    plot_bgcolor="white",
+                    yaxis=dict(title="ORA Error", automargin=True, tickfont=dict(size=11), showgrid=False),
+                    height=max(420, 26 * n_codes + 160),
+                    margin=dict(l=110, r=30, t=70, b=80),
+                    plot_bgcolor="#fafbfd",
                     paper_bgcolor="white",
                     font=dict(family="Arial, sans-serif", size=12, color="#333"),
                 )
-
                 st.plotly_chart(fig, use_container_width=True)
 
 # ---------------- Kill Session Events ----------------
@@ -1316,6 +2093,49 @@ with st.expander("⚡ Kill Session Events", expanded=expand_kills):
         else:
             st.info("🔍 No kill session events found in the selected time range/search criteria")
 
+# ---------------- Trace Files Found ----------------
+expand_trace = st.session_state.get("voice_action") == "show_trace"
+with st.expander("🗂️ Trace Files Found", expanded=expand_trace):
+    if df_trace_all.empty:
+        st.info("🔭 No .trc trace file references found in the uploaded logs")
+    else:
+        st.markdown(f"""
+        <div style='background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); 
+                    padding: 1.5rem; border-radius: 8px; color: white; margin-bottom: 1rem;'>
+            <h4 style='margin: 0 0 0.5rem 0;'>🗂️ Trace File References</h4>
+            <p style='margin: 0; opacity: 0.9;'>Every .trc file mentioned in the logs, with its timestamp</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if not df_trace_display.empty:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("📄 Total References", len(df_trace_display))
+            with col2:
+                st.metric("🗂️ Unique Trace Files", df_trace_display["Trace File"].nunique())
+            with col3:
+                st.metric("📦 Source Logs", df_trace_display["Source"].nunique())
+
+            st.markdown("---")
+            st.markdown("#### 📋 Trace File Details")
+            display_cols = ["Timestamp", "Trace File", "Source", "Raw Line"]
+            st.dataframe(
+                df_trace_display[display_cols].sort_values("Timestamp"),
+                use_container_width=True,
+                height=400
+            )
+
+            csv_data = df_trace_display[display_cols].to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "📥 Download Trace File List (CSV)",
+                data=csv_data,
+                file_name=f"trace_files_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+        else:
+            st.info("🔍 No trace file references found in the selected time range/search criteria")
+
 # ---------------- Compare Two Logs ----------------
 with st.expander("🔄 Compare Two Uploaded Logs", expanded=False):
     file_names = list(per_file_lines.keys())
@@ -1330,8 +2150,8 @@ with st.expander("🔄 Compare Two Uploaded Logs", expanded=False):
 
         if st.button("🔍 Run Compare", use_container_width=True):
             with st.spinner("Comparing logs..."):
-                ora_a, warn_a, kill_a = analyze_alert_log_lines(per_file_lines[file_a], source_name=file_a)
-                ora_b, warn_b, kill_b = analyze_alert_log_lines(per_file_lines[file_b], source_name=file_b)
+                ora_a, warn_a, kill_a, trace_a, _u_a = analyze_alert_log_lines(per_file_lines[file_a], source_name=file_a)
+                ora_b, warn_b, kill_b, trace_b, _u_b = analyze_alert_log_lines(per_file_lines[file_b], source_name=file_b)
                 comp = compare_two_parsed_lists(ora_a, ora_b)
             
             st.markdown("#### 📊 Counts by ORA Error (A vs B)")
@@ -1450,7 +2270,7 @@ Alert Log Extract:
 # ---------------- Download Section ----------------
 expand_download = st.session_state.get("voice_action") == "export"
 with st.expander("💾 Download Parsed Results", expanded=expand_download):
-    if (not combined_ora) and (not combined_warnings) and (not combined_kill_sessions):
+    if (not combined_ora) and (not combined_warnings) and (not combined_kill_sessions) and (not combined_asm_events) and (not combined_trace_files):
         st.info("🔭 No parsed data to download")
     else:
         st.markdown("""
@@ -1494,6 +2314,36 @@ with st.expander("💾 Download Parsed Results", expanded=expand_download):
                         except:
                             pass
                 df_kill_export.to_excel(writer, index=False, sheet_name="Kill_Sessions")
+
+            if not df_asm_all.empty:
+                df_asm_export = df_asm_all.copy()
+                for col in df_asm_export.columns:
+                    if ptypes.is_datetime64_any_dtype(df_asm_export[col]):
+                        try:
+                            df_asm_export[col] = df_asm_export[col].dt.tz_localize(None)
+                        except:
+                            pass
+                df_asm_export.to_excel(writer, index=False, sheet_name="ASM_Events")
+
+            if not df_unclassified_all.empty:
+                df_unclassified_export = df_unclassified_all.copy()
+                for col in df_unclassified_export.columns:
+                    if ptypes.is_datetime64_any_dtype(df_unclassified_export[col]):
+                        try:
+                            df_unclassified_export[col] = df_unclassified_export[col].dt.tz_localize(None)
+                        except:
+                            pass
+                df_unclassified_export.to_excel(writer, index=False, sheet_name="Unclassified_New")
+
+            if not df_trace_all.empty:
+                df_trace_export = df_trace_all.copy()
+                for col in df_trace_export.columns:
+                    if ptypes.is_datetime64_any_dtype(df_trace_export[col]):
+                        try:
+                            df_trace_export[col] = df_trace_export[col].dt.tz_localize(None)
+                        except:
+                            pass
+                df_trace_export.to_excel(writer, index=False, sheet_name="Trace_Files")
 
         filename = f"parsed_alert_log_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         st.download_button(
