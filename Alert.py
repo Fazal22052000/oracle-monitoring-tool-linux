@@ -379,13 +379,83 @@ NOTABLE_EVENT_RE = re.compile(
     # Data Pump: master (DM) / worker (DW) process lifecycle and the AQ
     # command/status queues every expdp/impdp job starts.
     r"|(?P<datapump>\bD[MW]\d{2}\s+(?:started|stopped)\s+with\s+pid=|"
-    r"Data Pump job|KUPC\$[CS]_)",
+    r"Data Pump job|KUPC\$[CS]_)"
+    # Instance crash / abnormal termination — confirmed against real matches
+    # in this environment's own alert logs ("Instance terminated by USER,
+    # pid = ...", "USER (ospid: NNNNN): terminating the instance"). This is
+    # the single highest-severity event an alert log can contain and was
+    # previously invisible in the main RDBMS parser (it has no ORA- code and
+    # never contains the word "WARNING").
+    r"|(?P<instcrash>Instance terminated by\s+\S+|terminating the instance\b|"
+    r"System state dump requested.*abnormal instance termination)"
+    # OS-level process kill — "Killed process oracle@host (Q003) with pid is
+    # NNNN, OS pid NNNNNNNN" — an external/OS-initiated kill of an Oracle
+    # background/shadow process, distinct from a SQL "KILL SESSION".
+    r"|(?P<oskill>Killed process\s+\S+.*\bwith pid\b)"
+    # Archiver / redo log stuck — "Cannot allocate log, archival required"
+    # means redo generation is about to stall the whole instance because the
+    # archiver can't keep up; extremely high signal for a DBA.
+    r"|(?P<archiver>Cannot allocate log,\s*archival required|"
+    r"Archival required, cannot allocate log)"
+    # Latch contention severe enough that a process gives up entirely
+    # ("CL00 failed to acquire latch") rather than just waiting/spinning.
+    r"|(?P<latch>failed to acquire latch)"
+    # Process spawn / startup failures — job queue slaves, parallel query
+    # (PX) servers, or a generic background process failing to start.
+    r"|(?P<spawnfail>unable to spawn\s+\S*\s*process|Process startup failed|"
+    r"Error occured? while spawning process|PX server failed to join)"
+    # SQL parse failures reported directly in the alert log (as opposed to
+    # ORA- errors returned to a client) — "PARSE ERROR: ospid=..." and
+    # "Parse failure in sqlid=...".
+    r"|(?P<parsefail>Parse failure in sqlid=|PARSE ERROR:\s*ospid=)"
+    # Distributed transaction (two-phase commit) errors — "Error NNNN
+    # trapped in 2PC on transaction ...".
+    r"|(?P<twopc>trapped in 2PC)"
+    # OS-level error lines that immediately follow an NI/IPC failure and
+    # name the underlying OS error (e.g. "IBM AIX RISC System/6000 Error:
+    # 2: No such file or directory") — platform-agnostic so it still fires
+    # on Linux/Solaris/HP-UX/Windows environments.
+    r"|(?P<oserr>\b(?:IBM AIX RISC System/6000|Linux(?:-x86_64)?|Solaris|"
+    r"HP-?UX|Windows(?:\sNT)?)\s+Error:\s*\d+)"
+    # Multitenant (CDB/PDB) lifecycle — confirmed exact wording from Oracle
+    # docs/support examples: "Pluggable database ORCLPDB1 opened read
+    # write", "Pluggable Database closed", "Opening pdb <name> (<con_id>)
+    # with Resource Manager plan: ...", and the "PDB altered with errors"
+    # warning when a PDB opens in restricted mode due to a plug-in
+    # violation. Near-universal in 12c+/19c+ production, previously not
+    # tracked at all despite having no ORA- code of its own.
+    r"|(?P<pdb>Pluggable [Dd]atabase\s+\S+\s+(?:opened|closed)|"
+    r"PDB altered with errors|Opening pdb\s)"
+    # Hang Manager (DIA0) — ORA-32701 itself is already caught generically
+    # via ORA_RE, but the surrounding narrative lines that explain WHAT is
+    # about to happen (a session or the whole instance being killed to
+    # resolve a detected hang) carry no ORA- code of their own and were
+    # previously invisible.
+    r"|(?P<hang>DIA0 (?:requesting termination|Instance \d+ requires instance termination)|"
+    r"Hang Resolution Reason|GLOBAL,\s*HIGH confidence hang|Possible hangs up to hang ID)"
+    # Instance lifecycle — startup/shutdown milestones a DBA needs to know
+    # happened even though they're purely informational (no ORA- code, no
+    # "WARNING"): was the instance bounced, and when.
+    r"|(?P<instlife>Starting ORACLE instance|ORACLE instance started|"
+    r"Instance shutdown complete|Shutting down instance|"
+    r"\bDatabase mounted\b|\bDatabase opened\b)"
+    # Resumable space allocation — a session was SUSPENDED (not failed) due
+    # to a space/quota condition (e.g. tablespace full) and is waiting for
+    # someone to fix it; genuinely different from a hard ORA- failure and
+    # easy to miss since the client-side error is delayed/never seen.
+    r"|(?P<resumable>statement in resumable session '[^']*' was suspended)",
     re.I
 )
 NOTABLE_EVENT_LABELS = {
     "tns": "TNS/Listener", "ckpt": "Checkpoint Stall", "logsw": "Log Switch Stall",
     "rac": "RAC/Cluster", "dg": "Data Guard/Redo Transport", "flashback": "Flashback",
     "rman": "RMAN", "datapump": "Data Pump",
+    "instcrash": "Instance Crash/Termination", "oskill": "OS Process Kill",
+    "archiver": "Archiver/Redo Stuck", "latch": "Latch Contention/Failure",
+    "spawnfail": "Process Spawn Failure", "parsefail": "SQL Parse Failure",
+    "twopc": "Distributed Transaction (2PC) Error", "oserr": "OS-Level Error",
+    "pdb": "Pluggable Database (PDB) Lifecycle", "hang": "Hang Manager (DIA0)",
+    "instlife": "Instance Startup/Shutdown", "resumable": "Resumable Session Suspended",
 }
 
 # "Fatal NI connect error ..." is always immediately followed by a
@@ -427,7 +497,10 @@ GENERIC_ERROR_CODE_RE = re.compile(r"\b([A-Z]{2,6}-\d{3,6})\b")
 GENERIC_ERROR_CODE_SKIP_PREFIXES = {"ORA", "TNS"} | _MONTH_ABBRS
 GENERIC_SEVERITY_RE = re.compile(
     r"\b(PANIC|OUT OF MEMORY|DISK FULL|NO SPACE LEFT|ACCESS DENIED|"
-    r"PERMISSION DENIED|CORRUPT(?:ED|ION)?|UNRECOVERABLE|FATAL ERROR)\b", re.I
+    r"PERMISSION DENIED|CORRUPT(?:ED|ION)?|UNRECOVERABLE|FATAL ERROR|"
+    r"CRASH(?:ED)?|DEADLOCK|HUNG|UNAVAILABLE|EMERGENCY|SEVERE|"
+    r"DATA LOSS|SECURITY VIOLATION|SEGMENTATION FAULT|CORE DUMP|"
+    r"STACK TRACE|ASSERTION (?:FAILED|VIOLATION)|INTERNAL ERROR)\b", re.I
 )
 
 # ---------------- ASM-Specific Regex Patterns ----------------
@@ -496,6 +569,654 @@ ASM_PROC_TERM_REQ_RE = re.compile(r"Process termination requested for pid\s+(\d+
 # space exhausted) so ASM ORA errors can be attributed to a diskgroup like
 # every other ASM event, instead of just showing the raw error text.
 ASM_ORA_DISKGROUP_NAME_RE = re.compile(r'diskgroup\s+"?([A-Za-z0-9_$]+)"?', re.I)
+
+# Quorum loss ("no read quorum in group: required N, found M disks") means
+# the disk group cannot reliably read its own metadata and is at imminent
+# risk of forced dismount / data unavailability — confirmed real-world
+# wording (Oracle Support/community incident reports). Technically this
+# already starts with "ERROR:" and would be caught by the generic
+# ASM_ERROR_RE below, but it's severe enough to deserve its own distinct,
+# higher-visibility category rather than being buried in generic "ASM
+# Error" rows.
+ASM_QUORUM_LOSS_RE = re.compile(r"no read quorum in group", re.I)
+
+# "WARNING: Waited N secs for write IO to PST disk M in group G" — the PST
+# (Partnership and Status Table) heartbeat write is stalling, which is the
+# direct precursor to ASM force-offlining that disk (and, if it repeats
+# across enough disks, dismounting the whole disk group). Same reasoning
+# as the quorum-loss pattern above: already covered by generic WARN_RE,
+# but distinct/severe enough to name explicitly.
+ASM_PST_IO_WAIT_RE = re.compile(r"Waited\s+\d+\s+secs?\s+for\s+write\s+IO\s+to\s+PST\s+disk", re.I)
+
+# Disk group structural changes (CREATE/DROP) — Oracle echoes the
+# executed SQL/ASMCMD command back as "SUCCESS: <command text>" (confirmed
+# real wording, e.g. "SUCCESS: /* ASMCMD */ALTER DISKGROUP data CHECK
+# NOREPAIR"). MOUNT/DISMOUNT already have their own dedicated patterns
+# above; this catches the create/drop lifecycle those don't cover.
+ASM_DISKGROUP_CREATE_RE = re.compile(r"SUCCESS:.*\bCREATE\s+DISKGROUP\b", re.I)
+ASM_DISKGROUP_DROP_RE = re.compile(r"SUCCESS:.*\bDROP\s+DISKGROUP\b", re.I)
+
+# Disk-repair-timer expiry — "WARNING: PST-initiated drop of N disk(s) in
+# group G(.NNNNNNNN))". This is what happens when a disk stays OFFLINE
+# (see ASM_DISK_OFFLINE_RE above) longer than its disk_repair_time and ASM
+# gives up and permanently drops it — a real, often-missed redundancy-loss
+# event that triggers an automatic rebalance. Confirmed exact wording from
+# Oracle community/support incident write-ups. Previously only caught
+# generically as a plain "WARNING:" line with no distinct category.
+ASM_DISK_REPAIR_TIMER_DROP_RE = re.compile(
+    r"PST-initiated drop of\s+(\d+)\s+disk\(s\)\s+in\s+group\s+(\d+)", re.I
+)
+
+# ---------------- CRS / Grid Infrastructure (Clusterware) Regex Patterns ----------------
+# Oracle Clusterware (CRS/GI) alert logs interleave two line shapes:
+#   1) "YYYY-MM-DD HH:MM:SS.mmm [COMPONENT(PID)]CRS-NNNNN: message text"
+#      — the normal, self-timestamped, self-attributed CRS event line emitted
+#        by every clusterware daemon (OHASD, CRSD, OCSSD, CSSD, CRSCTL,
+#        ORAAGENT, ORAROOTAGENT, GPNPD, OCTSSD, GIPCD, MDNSD, CVUD, CLSECHO...).
+#   2) Bare continuation lines with NO timestamp/component prefix at all —
+#      e.g. raw `crsctl`/CVU command output ("CRS-4639: Could not contact
+#      Oracle High Availability Services", individual "PRVG-nnnnn : ..."
+#      findings) that gets appended verbatim under the CRS-10051 line that
+#      triggered it. These must still be captured and timestamped using the
+#      most recently seen timestamp, exactly like the main alert-log and ASM
+#      parsers already do for their own un-timestamped lines.
+CRS_LOG_MARKER_RE = re.compile(
+    r"\[OHASD\(|\[CRSD\(|\[OCSSD\(|\[CSSD\(|\[GPNPD\(|\[MDNSD\(|\[GIPCD\(|\[OCTSSD\(|"
+    r"\[CRSCTL\(|\[ORAAGENT\(|\[ORAROOTAGENT\(|\[CVUD\(|\bCRS-\d{4,6}\b|"
+    r"Oracle Clusterware (?:OHASD|CRSD)? ?process|Cluster Ready Service",
+    re.I
+)
+
+# Header shape shared by every self-attributed CRS log line. Accepts both the
+# space-separated CRS timestamp ("2026-08-10 10:05:58.030") and, defensively,
+# an ISO "T" separated one, in case a future GI version changes formatting.
+CRS_HEADER_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\.\d+(?:[+\-]\d{2}:\d{2})?)\s*"
+    r"\[(?P<comp>[A-Za-z_]+)\((?P<pid>\d+)\)\](?P<msg>.*)$"
+)
+
+# Any CRS-coded line at all — the future-proofing safety net for THIS parser.
+# Every line that contains a CRS-NNNNN code gets an event row no matter what,
+# even if none of the specific category regexes below recognize it (a brand
+# new GI version / a code this tool has no dedicated rule for yet).
+CRS_CODE_RE = re.compile(r"\bCRS-(\d{4,6}):?\s*(.*)")
+
+# Related Oracle prerequisite/verification code families that show up
+# embedded inside (or right after) CRS-10051 "CVU found following errors"
+# blocks — captured as their own findings so nothing inside those blocks is
+# silently dropped.
+CVU_CODE_RE = re.compile(r"\b(PRVG|PRVF|PRCT|PRVH|PRCI|PRCR|PRCC|PRKO)-(\d{3,6})\b")
+
+# PRKC/PRKN — SRVCTL/CVU node-connectivity & remote-command prerequisite
+# checks (e.g. "PRKC-1191: Remote command execution setup check ... failed",
+# "PRKN-1035: Host ... is unreachable"). Confirmed at real, recurring volume
+# in this environment's own CRS log (paired with an SSH "Permission denied"
+# line) — an SSH/node-reachability problem serious enough to block cluster
+# operations, so it deserves its own category rather than sitting in the
+# generic "Unclassified / New Pattern" bucket.
+CRS_SSH_CONNECTIVITY_RE = re.compile(r"\b(PRKC|PRKN)-(\d{3,6})\b")
+
+# ACFS (ASM Cluster File System) / AFD (ASM Filter Driver) install & runtime
+# messages — a distinct, high-volume message family in real GI logs.
+CRS_ACFS_AFD_RE = re.compile(r"\b(ACFS|AFD)-(\d{3,6})\b")
+
+# --- Clusterware daemon startup ---
+CRS_PROC_STARTING_RE = re.compile(
+    r"Oracle Clusterware (\S+) process is starting with operating system process ID\s*(\d+)", re.I)
+CRS_RELEASE_RE = re.compile(r"Oracle Clusterware Release\s+([\d.]+)", re.I)
+CRS_CSSD_STARTED_RE = re.compile(r"CSSD daemon is started in (\S+) mode", re.I)
+CRS_CSSD_READY_RE = re.compile(r"Cluster Synchronization Services daemon \(CSSD\) is ready for operation", re.I)
+CRS_OCR_STARTED_RE = re.compile(r"The OCR service started on node\s+(\S+)", re.I)
+CRS_OLR_STARTED_RE = re.compile(r"The OLR service started on node\s+(\S+)", re.I)
+CRS_TIMESYNC_STARTED_RE = re.compile(r"Cluster Time Synchronization Service started on host\s+(\S+)", re.I)
+CRS_GPNPD_STARTED_RE = re.compile(r"Grid Plug and Play Daemon\(?GPNPD\)?\s*started on node\s+(\S+)", re.I)
+CRS_CSSD_RECONFIG_COMPLETE_RE = re.compile(r"CSSD Reconfiguration complete\.?\s*Active nodes are\s*(.*)", re.I)
+
+# --- Clusterware daemon / cluster shutdown ---
+CRS_SHUTDOWN_START_RE = re.compile(
+    r"Starting shutdown of Oracle High Availability Services-managed resources on\s*'([^']+)'", re.I)
+CRS_SHUTDOWN_COMPLETE_RE = re.compile(
+    r"Shutdown of Oracle High Availability Services-managed resources on\s*'([^']+)'\s*has completed", re.I)
+CRS_CSSD_SHUTDOWN_RE = re.compile(r"CSSD on node\s+(\S+)\s+has been shut down", re.I)
+CRS_GPNPD_SHUTDOWN_RE = re.compile(r"Grid Plug and Play Daemon\(?GPNPD\)?\s*on node\s+(\S+)\s+shut down", re.I)
+CRS_TIMESYNC_SHUTDOWN_RE = re.compile(
+    r"Cluster Time Synchronization Service on host\s+(\S+)\s+is shutdown by user", re.I)
+CRS_PROC_EXITING_RE = re.compile(
+    r"Oracle Clusterware (\S+) process(?: with operating system process ID\s*\d+)? is exiting", re.I)
+CRS_MDNS_STOPPING_RE = re.compile(r"mDNS service stopping by request", re.I)
+
+# --- Node eviction / fencing / reboot advisory — HIGHEST severity ---
+CRS_FENCE_REQUEST_RE = re.compile(
+    r"Fence request issued for an entity node\s*(\S+)(?:\s+with a timeout of\s*(\d+))?", re.I)
+CRS_NODE_SHUTDOWN_RE = re.compile(r"Node\s+(\S+),\s*number\s*(\d+),\s*was shut down", re.I)
+CRS_NODE_EVICT_RE = re.compile(
+    r"Node\s+\S+\s+is being evicted|This node was evicted|"
+    r"going down to preserve cluster integrity|"
+    r"is unable to communicate with other nodes|"
+    r"Evicting node|Split[- ]?brain", re.I)
+CRS_REBOOT_ADVISORY_RE = re.compile(
+    r"reboot advisory log files,\s*(\d+)\s*were announced\s+and\s+(\d+)\s*errors occurred", re.I)
+
+# --- Node down / cluster membership / server pool ---
+CRS_NODE_DOWN_RE = re.compile(r"Node down event reported for node\s*'([^']+)'", re.I)
+CRS_SERVER_POOL_ASSIGN_RE = re.compile(r"Server\s*'([^']+)'\s*has been assigned to pool\s*'([^']+)'", re.I)
+CRS_SERVER_POOL_REMOVE_RE = re.compile(r"Server\s*'([^']+)'\s*has been removed from pool\s*'([^']+)'", re.I)
+
+# --- OCR / OLR / Voting — cluster registry & quorum, CRITICAL when it fails ---
+CRS_OCR_CRITICAL_RE = re.compile(
+    r"OCR location.*inaccessible|"
+    r"aborted due to Oracle Cluster Registry error|"
+    r"Oracle Cluster Registry.*(?:error|corrupt|unavailable)|"
+    r"Insufficient quorum to open OCR devices", re.I)
+CRS_VOTING_DISK_RISK_RE = re.compile(
+    r"[Vv]oting (?:disk|file)s?.*(?:not mounted|offline|inaccessible|lost|below.*quorum)|"
+    r"Unable to communicate with (?:one or more )?voting (?:disk|file)s?|"
+    # CRS-1606: "number of voting files available, N, is less than the
+    # minimum number of voting files required" — doesn't use any of the
+    # wording above, but is one of the most severe voting-disk messages
+    # there is: it directly precedes CSSD termination to protect data
+    # integrity. Confirmed against real Oracle Clusterware alert logs.
+    r"number of voting files available.*is less than the minimum", re.I)
+
+# --- Agent / resource start-stop-check failures ---
+CRS_AGENT_FAIL_RE = re.compile(
+    r"Agent\s*\"?\S*\"?\s*failed to start process|"
+    r"Agent\s*\"?\S*\"?\s*timed out starting process|"
+    r"Check of resource\s*\"[^\"]+\"\s*failed|"
+    r"The resource action\s*\"[^\"]+\"\s*encountered the following error|"
+    r"spawned by agent\s*\"[^\"]+\"\s*for action\s*\"[^\"]+\"\s*failed|"
+    r"Aborted command\s*'[^']+'\s*for resource\s*'[^']+'|"
+    r"Agent\s*'[^']+'\s*disconnected from server|"
+    r"Could not start agent", re.I)
+CRS_RESOURCE_STATE_RE = re.compile(
+    r"Attempting to (?:start|stop)\s*'([^']+)'|"
+    r"(?:Start|Stop) of\s*'([^']+)'\s*(?:on member\s*'[^']+'\s*)?(?:succeeded|failed)", re.I)
+
+# --- Network / interconnect ---
+CRS_NETWORK_ISSUE_RE = re.compile(
+    r"failed to identify the Fast Node Death Detection|"
+    r"disabled an IP route associated with destination|"
+    r"[Nn]etwork communication with node.*(?:missing|lost)|"
+    r"[Ii]nterconnect.*(?:down|lost|missing|unavailable)|"
+    r"misconfigured|"
+    # No network interfaces matching the configured cluster_interconnects /
+    # public network definition were found on the node (CRS-42216) —
+    # confirmed at real volume (hundreds of occurrences) in this
+    # environment's own CRS log; previously fell into the generic,
+    # unhelpful "CRS Info" bucket since it doesn't contain any of the
+    # fail/error/timeout keywords the catch-all bucket looks for.
+    r"No interfaces are configured on the local node|"
+    # Node-to-node interconnect health check flagging a communication
+    # problem without using the word "lost"/"missing" (CRS-7503).
+    r"observed communication issues between node", re.I)
+
+# --- Cluster Verification Utility (CVU) findings ---
+CRS_CVU_HEADER_RE = re.compile(r"CVU found following errors with Clusterware setup", re.I)
+
+# --- Time Sync Service (non startup/shutdown states, e.g. observer mode) ---
+CRS_TIMESYNC_OBSERVER_RE = re.compile(
+    r"Cluster Time Synchronization Service on host\s+(\S+)\s+is in observer mode", re.I)
+
+# Generic node-name fallback extractor used when a category matched but had
+# no dedicated capture group for the node name.
+CRS_NODE_FALLBACK_RE = re.compile(r"\bnode\s+['\"]?([A-Za-z0-9_\-\.]+)['\"]?", re.I)
+
+# Keyword heuristics used ONLY for the generic "CRS Event" catch-all bucket
+# (i.e. a CRS-NNNNN code matched CRS_CODE_RE but none of the specific,
+# named category regexes above recognized it) so a future/unknown CRS code
+# still gets a sensible severity instead of an unlabeled row.
+CRS_GENERIC_ERROR_KEYWORDS_RE = re.compile(
+    r"\b(fail|failed|failure|error|abort|aborted|unable|could not|cannot|lost|"
+    r"corrupt|timeout|timed out|denied|critical|panic|terminat)\b", re.I)
+CRS_GENERIC_WARN_KEYWORDS_RE = re.compile(
+    r"\b(warning|not mounted|inconsistent|missing|disabled|deprecated|retry|retrying|incomplete)\b", re.I)
+
+# ---------------- Listener Log (TNSLSNR) Regex Patterns ----------------
+# Oracle's listener.log uses a distinct, semi-structured line shape — NOT
+# the free-text alert-log format every parser above is built for:
+#   DD-MON-YYYY HH:MI:SS * <CONNECT_DATA/ADDRESS/command fields...> * <return_code>
+# Real production listener logs in this environment also interleave a
+# separate ISO-8601-only timestamp line before groups of classic lines (an
+# artifact of whatever tool is tailing/shipping the file) — those carry no
+# event data of their own and are treated as timestamp context only.
+LISTENER_ISO_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[\+\-]\d{2}:\d{2}\s*$")
+LISTENER_LINE_RE = re.compile(r"^(\d{2}-[A-Za-z]{3}-\d{4}\s+\d{2}:\d{2}:\d{2})\s*\*\s*(.*)$", re.I)
+
+# Auto-detection: the classic "DD-MON-YYYY HH:MI:SS * ... * <digits>" line
+# shape is extremely distinctive to listener.log, as is the startup banner
+# every listener.log begins with — either is sufficient to identify the file.
+LISTENER_LOG_MARKER_RE = re.compile(
+    r"^\d{2}-[A-Z]{3}-\d{4}\s+\d{2}:\d{2}:\d{2}\s*\*.*\*\s*\d+\s*$|"
+    r"TNSLSNR for .*?Version|Listening on:\s*\(DESCRIPTION", re.I
+)
+
+# Startup / banner lines (no leading DD-MON-YYYY timestamp of their own)
+LISTENER_BANNER_START_RE = re.compile(r"TNSLSNR for .*?Version\s+([\d.]+)", re.I)
+LISTENER_LISTENING_ON_RE = re.compile(r"Listening on:\s*(\(DESCRIPTION=.*\))", re.I)
+LISTENER_STARTED_PID_RE = re.compile(r"Started with pid\s*=\s*(\d+)", re.I)
+LISTENER_CRS_NOTIFY_RE = re.compile(r"Listener completed notification to CRS on (start|stop)", re.I)
+
+# Field extractors, applied to a single (CONNECT_DATA=...) or (ADDRESS=...)
+# field's text only — never to the whole line — so e.g. the client HOST
+# inside CONNECT_DATA's CID is never confused with the ADDRESS block's HOST
+# (the peer IP actually carrying the TCP/TCPS connection).
+_LSNR_HOST_RE = re.compile(r"HOST=([^)]*)")
+_LSNR_USER_RE = re.compile(r"USER=([^)]*)")
+_LSNR_PROGRAM_RE = re.compile(r"PROGRAM=([^)]*)")
+_LSNR_SERVICE_NAME_RE = re.compile(r"SERVICE_NAME=([^)]*)")
+_LSNR_SERVICE_ONLY_RE = re.compile(r"\bSERVICE=([^)]*)")
+_LSNR_COMMAND_RE = re.compile(r"\bCOMMAND=([^)]*)")
+_LSNR_INSTANCE_RE = re.compile(r"INSTANCE_NAME=([^)]*)")
+_LSNR_PORT_RE = re.compile(r"PORT=([^)]*)")
+_LSNR_PROTOCOL_RE = re.compile(r"PROTOCOL=([^)]*)")
+_LSNR_KEY_RE = re.compile(r"\bKEY=([^)]*)")  # IPC/BEQ protocol local connections have no HOST/PORT, only KEY=
+
+# A continuation/detail line immediately following a non-zero return-code
+# entry — normally "TNS-nnnnn: <message>", but NL-/NZ-/SSL- (Oracle Net
+# native services / crypto / wallet layer) codes also appear on SSL/TCPS
+# failures, so the prefix itself is matched generically rather than
+# hardcoding "TNS".
+LISTENER_ERROR_CODE_LINE_RE = re.compile(r"^\s*([A-Z]{2,4})-(\d{3,6}):\s*(.*)$")
+
+# lsnrctl administrative/control commands — these change listener state or
+# configuration and always deserve high visibility regardless of outcome.
+LISTENER_ADMIN_COMMANDS = {
+    "save_config", "trc_level", "debug", "relocate", "trace", "spawn",
+    "set_displaymode", "set_log_directory", "set_log_file", "set_trc_directory",
+    "set_trc_file", "set_rawmode", "set_current_listener", "set_password",
+    "set_inbound_connect_timeout", "set_connect_timeout", "set_snmp_visible",
+    "set_startup_waittime", "set_save_config_on_stop", "set_log_status",
+    "change_password",
+}
+LISTENER_INFO_COMMANDS = {"version", "services", "help", "ping", "log_status", "show", "service"}
+
+# Well-known TNS- error codes seen in listener.log, with a short description
+# and severity bucket. Deliberately NOT exhaustive — anything not listed
+# here is still fully captured (Error Code + raw detail line), just without
+# a friendly description; see the future-proofing safety net further down.
+TNS_ERROR_INFO = {
+    "00505": ("Connect failed because target host or object does not exist", "Critical"),
+    "00507": ("Connection closed", "Warning"),
+    "00530": ("Protocol adapter error", "Critical"),
+    "00542": ("SSL Handshake failed", "Warning"),
+    "01150": ("Missing or invalid TNS listener address", "Critical"),
+    "01169": ("Net service name resolves to multiple addresses/protocol mismatch", "Warning"),
+    "01189": ("The listener could not authenticate the user", "Critical"),
+    "01201": ("Listener could not execute the SET command", "Warning"),
+    "12500": ("TNS:listener failed to start a dedicated server process", "Critical"),
+    "12502": ("TNS:listener received no CONNECT_DATA from client", "Warning"),
+    "12504": ("TNS:listener was not given the SERVICE_NAME in CONNECT_DATA", "Warning"),
+    "12505": ("TNS:listener does not currently know of SID given in connect descriptor", "Critical"),
+    "12506": ("TNS:listener rejected connection based on service ACL filtering", "Critical"),
+    "12508": ("TNS:listener could not resolve the COMMAND given", "Warning"),
+    "12509": ("TNS:listener failed to redirect client to service handler", "Critical"),
+    "12510": ("TNS:database temporarily lacks resources to handle the request", "Warning"),
+    "12511": ("TNS:service handler found but it is not accepting connections", "Warning"),
+    "12514": ("TNS:listener does not currently know of service requested in connect descriptor", "Critical"),
+    "12516": ("TNS:listener could not find available handler with matching protocol stack", "Critical"),
+    "12518": ("TNS:listener could not hand off client connection", "Critical"),
+    "12519": ("TNS:no appropriate service handler found", "Critical"),
+    "12520": ("TNS:listener could not find available handler for requested type of server", "Critical"),
+    "12523": ("TNS:listener could not find instance appropriate for the client connection", "Critical"),
+    "12528": ("TNS:listener: all appropriate instances are blocking new connections", "Critical"),
+    "12529": ("TNS:listener: all appropriate instances are in restricted mode", "Warning"),
+    "12533": ("TNS:illegal ADDRESS parameters", "Warning"),
+    "12535": ("TNS:operation timed out", "Warning"),
+    "12536": ("TNS:operation would block", "Info"),
+    "12537": ("TNS:connection closed", "Warning"),
+    "12541": ("TNS:no listener", "Critical"),
+    "12545": ("Connect failed because target host or object does not exist", "Critical"),
+    "12547": ("TNS:lost contact", "Warning"),
+    "12549": ("TNS:operating system resource quota exceeded", "Critical"),
+    "12550": ("TNS:operating system resource quota exceeded", "Critical"),
+    "12560": ("TNS:protocol adapter error", "Critical"),
+    "12564": ("TNS:connection refused", "Warning"),
+    "12570": ("TNS:packet reader failure", "Warning"),
+    "12571": ("TNS:packet writer failure", "Warning"),
+    "12599": ("TNS:cryptographic checksum mismatch", "Critical"),
+    "12606": ("TNS:Application timeout occurred", "Warning"),
+    "12609": ("TNS:Receive timeout occurred", "Warning"),
+    "12637": ("Packet receive failed", "Warning"),
+    "12649": ("Unknown encryption or data integrity algorithm", "Critical"),
+    "28860": ("SSL3/TLS handshake failed", "Critical"),
+    # --- Added after cross-referencing Oracle Net Services documentation ---
+    # (16 Troubleshooting Oracle Net Services / Networking Error Messages).
+    # These were previously still captured (Error Code + raw line, via the
+    # future-proofing safety net) but showed no friendly description.
+    "00510": ("Internal limit restriction exceeded", "Warning"),
+    "00516": ("Permission denied", "Critical"),
+    "00519": ("Operating system resource quota exceeded", "Critical"),
+    "12521": ("TNS:listener does not currently know of instance requested in connect descriptor", "Critical"),
+    "12525": ("TNS:listener has not received client's request in time allowed", "Warning"),
+    "12540": ("TNS:internal limit restriction exceeded", "Warning"),
+    "12546": ("TNS:permission denied", "Critical"),
+    "12548": ("TNS:incomplete read or write", "Warning"),
+    "12551": ("TNS:missing keyword", "Warning"),
+    "12552": ("TNS:operation was interrupted", "Warning"),
+    "12554": ("TNS:current operation still in progress", "Info"),
+    "12556": ("TNS:no caller", "Warning"),
+    "12557": ("TNS:protocol adapter not loadable", "Critical"),
+    "12558": ("TNS:protocol adapter not loaded", "Critical"),
+    "12561": ("TNS:unknown error", "Warning"),
+    "12562": ("TNS:bad global handle", "Warning"),
+    "12566": ("TNS:protocol error", "Warning"),
+    "12569": ("TNS:packet checksum failure", "Critical"),
+    "12574": ("TNS:redirection denied", "Warning"),
+    "12582": ("TNS:invalid operation", "Warning"),
+}
+
+# TNS codes that represent an EXPLICIT security control blocking a client
+# (as opposed to a routine connectivity failure) — flagged as a security
+# alert on every single occurrence, not just after crossing the repeat
+# threshold, since even one ACL rejection or auth failure is worth a look.
+LISTENER_ACL_REJECTION_CODES = {"12506"}
+
+# A burst of failed connection attempts from the SAME source IP/host is the
+# single highest-value security signal a listener log can carry — repeated
+# SSL/TNS failures from one address typically mean a scanner, an
+# unauthorized/misconfigured client, or an expired certificate hammering
+# the listener. This threshold drives the post-parse aggregation below.
+LISTENER_REPEAT_FAILURE_THRESHOLD = 5
+
+
+def is_listener_log(lines, sample_size=300):
+    """Heuristically detect a TNSLSNR (listener.log / SCAN listener log) file."""
+    checked = 0
+    for line in lines:
+        if LISTENER_LOG_MARKER_RE.search(line):
+            return True
+        checked += 1
+        if checked >= sample_size:
+            break
+    return False
+
+
+def _listener_split_fields(remainder):
+    """Split a listener.log line's remainder (everything after the leading
+    DD-MON-YYYY timestamp) on ' * ', WITHOUT ever splitting inside a
+    parenthesised (CONNECT_DATA=...)/(ADDRESS=...) field — those fields are
+    long and structured but must stay as one single field."""
+    fields, buf, depth = [], [], 0
+    i, n = 0, len(remainder)
+    while i < n:
+        ch = remainder[i]
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+        elif ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif depth == 0 and remainder[i:i + 3] == " * ":
+            fields.append("".join(buf).strip())
+            buf = []
+            i += 3
+            continue
+        else:
+            buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        fields.append(tail)
+    return fields
+
+
+def _listener_extract(pattern, text):
+    if not text:
+        return None
+    m = pattern.search(text)
+    return m.group(1) if m else None
+
+
+def analyze_listener_log_lines(lines, source_name="uploaded"):
+    """Parse an Oracle Net Listener log (listener.log or a SCAN/node listener
+    log — LISTENER_SCAN1/2/3, node listeners, etc; all share the same format).
+
+    Returns (connection_events, security_events, unclassified_events):
+      - connection_events: one row per parsed listener line — connection
+        establish/refuse, service registration & health (service_update /
+        service_register / service_died), status polls, admin/control
+        commands, and the listener startup banner. This is the full audit
+        trail, exactly like the ORA/Warning rows the main alert-log parser
+        produces.
+      - security_events: post-processed, higher-signal alerts built on top
+        of connection_events — repeated-failure bursts from one source,
+        unknown-service/SID probing (TNS-12505/12514), authentication
+        failures (TNS-01189), and listener stop/reload commands — the
+        "look here first" list for a DBA/security reviewer.
+      - unclassified_events: any line matching the listener line shape whose
+        command this parser has no specific rule for yet, PLUS any stray
+        PREFIX-NNNNN error code or high-signal keyword found on a
+        continuation/detail line. Same future-proofing safety net used by
+        the RDBMS/ASM/CRS parsers above (GENERIC_ERROR_CODE_RE /
+        GENERIC_SEVERITY_RE) — so a brand-new TNS/NL/NZ code, or any error
+        text this tool has never seen before, is still surfaced instead of
+        being silently dropped. This is what keeps the analyzer accurate on
+        production traffic patterns beyond the limited sample logs used to
+        build it.
+    """
+    events = []
+    unclassified_events = []
+    current_iso_ts = None  # from the interleaved ISO-only marker lines, if present
+
+    n = len(lines)
+    i = 0
+    while i < n:
+        raw_line = lines[i]
+        line = raw_line.rstrip("\n")
+        if not line.strip():
+            i += 1
+            continue
+
+        if LISTENER_ISO_ONLY_RE.match(line):
+            current_iso_ts = line.strip()
+            i += 1
+            continue
+
+        m = LISTENER_LINE_RE.match(line)
+        if not m:
+            stripped = line.strip()
+
+            # Startup banner lines (no DD-MON-YYYY prefix of their own) —
+            # captured as their own event rather than silently merged into
+            # whatever event happened to precede them.
+            if (LISTENER_BANNER_START_RE.search(stripped) or LISTENER_LISTENING_ON_RE.search(stripped)
+                    or LISTENER_STARTED_PID_RE.search(stripped) or LISTENER_CRS_NOTIFY_RE.search(stripped)):
+                events.append({
+                    "Timestamp": current_iso_ts or (events[-1]["Timestamp"] if events else "Not Found"),
+                    "Event Type": "Listener Startup", "Command": "-", "Service": "-",
+                    "Client Host": "-", "Client IP": "-", "Program": "-", "User": "-",
+                    "Return Code": "-", "Error Code": None, "Detail": stripped,
+                    "Source": source_name, "Raw Line": line,
+                })
+                i += 1
+                continue
+
+            # Otherwise this is a continuation/detail line trailing the
+            # PREVIOUS event — a "TNS-nnnnn: <message>" error explanation,
+            # an OS-level error line, or an informational follow-up (e.g.
+            # "Dynamic address is already listened on ..."). Fold it into
+            # that event's Detail instead of dropping it.
+            if events:
+                err_m = LISTENER_ERROR_CODE_LINE_RE.match(stripped)
+                if err_m:
+                    full_code = f"{err_m.group(1)}-{err_m.group(2)}"
+                    extra = f"{full_code}: {err_m.group(3)}".strip()
+                    if not events[-1]["Error Code"]:
+                        events[-1]["Error Code"] = full_code
+                    if extra and extra not in events[-1]["Detail"]:
+                        events[-1]["Detail"] = (events[-1]["Detail"] + " | " + extra) if events[-1]["Detail"] else extra
+                elif stripped and stripped not in events[-1]["Detail"]:
+                    events[-1]["Detail"] = (events[-1]["Detail"] + " | " + stripped) if events[-1]["Detail"] else stripped
+
+            # Future-proofing safety net — also run on continuation lines,
+            # so a brand-new error prefix/severity phrase on a detail line
+            # is never silently lost.
+            code_m = GENERIC_ERROR_CODE_RE.search(stripped)
+            ts_fallback = events[-1]["Timestamp"] if events else (current_iso_ts or "Not Found")
+            if code_m and code_m.group(1).split("-")[0] not in GENERIC_ERROR_CODE_SKIP_PREFIXES:
+                unclassified_events.append({
+                    "Timestamp": ts_fallback, "Match Type": "Unmapped Error Code (Listener)",
+                    "Matched": code_m.group(1), "Source": source_name, "Raw Line": stripped,
+                })
+            else:
+                sev_m = GENERIC_SEVERITY_RE.search(stripped)
+                if sev_m:
+                    unclassified_events.append({
+                        "Timestamp": ts_fallback, "Match Type": "Possible Severity Keyword (Listener)",
+                        "Matched": sev_m.group(1).upper(), "Source": source_name, "Raw Line": stripped,
+                    })
+            i += 1
+            continue
+
+        ts_str, remainder = m.group(1), m.group(2)
+        fields = _listener_split_fields(remainder)
+        if not fields:
+            i += 1
+            continue
+
+        last = fields[-1]
+        return_code = last if last.isdigit() else None
+        structured = [f for f in fields if f.startswith("(")]
+        plain = [f for f in fields if not f.startswith("(") and f != return_code]
+
+        connect_data = next((f for f in structured if f.upper().startswith("(CONNECT_DATA")), None)
+        address = next((f for f in structured if f.upper().startswith("(ADDRESS")), None)
+
+        command = plain[0] if plain else None
+        service_field = plain[1] if len(plain) > 1 else None
+
+        client_host = _listener_extract(_LSNR_HOST_RE, connect_data)
+        client_user = _listener_extract(_LSNR_USER_RE, connect_data)
+        program = _listener_extract(_LSNR_PROGRAM_RE, connect_data)
+        cd_command = _listener_extract(_LSNR_COMMAND_RE, connect_data)
+        instance_name = _listener_extract(_LSNR_INSTANCE_RE, connect_data)
+        service_name = (_listener_extract(_LSNR_SERVICE_NAME_RE, connect_data)
+                         or _listener_extract(_LSNR_SERVICE_ONLY_RE, connect_data)
+                         or service_field or instance_name)
+        client_ip = _listener_extract(_LSNR_HOST_RE, address)
+        client_port = _listener_extract(_LSNR_PORT_RE, address)
+        protocol = _listener_extract(_LSNR_PROTOCOL_RE, address)
+        # IPC/BEQ (local, same-machine) connections have no HOST/PORT at
+        # all — only a KEY= identifier. Fall back to it so local
+        # connections aren't shown as blank "-" in Client IP.
+        if not client_ip:
+            client_ip = _listener_extract(_LSNR_KEY_RE, address)
+
+        row = {
+            "Timestamp": ts_str, "Event Type": "Unclassified",
+            "Command": command or cd_command or "-",
+            "Service": service_name or "-",
+            "Client Host": client_host or "-",
+            "Client IP": client_ip or "-", "Client Port": client_port or "-",
+            "Program": program or "-", "User": client_user or "-",
+            "Protocol": (protocol or "-").upper(),
+            "Return Code": return_code or "-", "Error Code": None, "Detail": "",
+            "Source": source_name, "Raw Line": line,
+        }
+
+        rc_is_error = return_code not in (None, "0")
+
+        if command == "establish":
+            row["Event Type"] = "Connection Refused/Error" if rc_is_error else "Connection Established"
+        elif command in ("<unknown connect data>", "refuse"):
+            row["Event Type"] = "Connection Refused/Error"
+        elif command == "status":
+            row["Event Type"] = "Status Check"
+        elif command == "service_update":
+            row["Event Type"] = "Service Update"
+        elif command and command.startswith("service_register"):
+            row["Event Type"] = "Service Registered"
+        elif command == "service_died":
+            # Always high-signal regardless of the accompanying code — a
+            # registered service instance dropped its listener registration
+            # connection (instance bounce, PMON registration timeout, or a
+            # network blip all show up this way).
+            row["Event Type"] = "Service Died"
+        elif command == "stop":
+            row["Event Type"] = "Listener Stop Command"
+        elif command == "reload":
+            row["Event Type"] = "Listener Reload Command"
+        elif command in LISTENER_ADMIN_COMMANDS:
+            row["Event Type"] = "Admin Command"
+        elif command in LISTENER_INFO_COMMANDS:
+            row["Event Type"] = "Status Check"
+        elif command:
+            row["Event Type"] = "Other Command"
+
+        if rc_is_error:
+            rc_padded = return_code.zfill(5)
+            desc, sev = TNS_ERROR_INFO.get(rc_padded, ("Unrecognized/undocumented TNS error code — review the raw line and any detail below.", "Warning"))
+            row["Error Code"] = f"TNS-{rc_padded}"
+            row["Detail"] = f"TNS-{rc_padded}: {desc}"
+            # Escalate unknown-service/SID probing, ACL rejections, and
+            # auth failures to their own security-relevant event types so
+            # they surface separately from generic "Connection
+            # Refused/Error" noise.
+            if rc_padded in LISTENER_ACL_REJECTION_CODES:
+                row["Event Type"] = "Access Denied (ACL)"
+            elif rc_padded in {"12505", "12514"} and row["Event Type"] == "Connection Refused/Error":
+                row["Event Type"] = "Unknown Service/SID Requested"
+            elif rc_padded == "01189":
+                row["Event Type"] = "Authentication Failure"
+
+        events.append(row)
+        i += 1
+
+    # ---- Post-process: security-relevant alert aggregation ----
+    security_events = []
+    fail_types = {"Connection Refused/Error", "Unknown Service/SID Requested", "Authentication Failure", "Access Denied (ACL)"}
+    by_source = {}
+    for e in events:
+        if e["Event Type"] in fail_types:
+            key = e["Client IP"] if e["Client IP"] != "-" else e["Client Host"]
+            by_source.setdefault(key, []).append(e)
+
+    for src, evs in by_source.items():
+        if src == "-" or len(evs) < LISTENER_REPEAT_FAILURE_THRESHOLD:
+            continue
+        codes = sorted({e["Error Code"] for e in evs if e["Error Code"]})
+        security_events.append({
+            "Timestamp": evs[0]["Timestamp"], "Alert Type": "Repeated Connection Failures From Single Source",
+            "Source Host/IP": src, "Occurrences": len(evs),
+            "Error Codes": ", ".join(codes) if codes else "-",
+            "First Seen": evs[0]["Timestamp"], "Last Seen": evs[-1]["Timestamp"],
+            "Source": source_name,
+            "Detail": (f"{len(evs)} failed connection attempt(s) from {src} — possible port scan, "
+                       f"expired/misconfigured client certificate, or unauthorized probing."),
+        })
+
+    for e in events:
+        if e["Event Type"] in {"Authentication Failure", "Unknown Service/SID Requested", "Access Denied (ACL)"}:
+            # Every single occurrence is reported — even one ACL rejection
+            # or auth failure is a deliberate security control firing and
+            # is worth a DBA/security reviewer's attention, not just bursts.
+            security_events.append({
+                "Timestamp": e["Timestamp"], "Alert Type": e["Event Type"],
+                "Source Host/IP": e["Client IP"] if e["Client IP"] != "-" else e["Client Host"],
+                "Occurrences": 1, "Error Codes": e["Error Code"] or "-",
+                "First Seen": e["Timestamp"], "Last Seen": e["Timestamp"],
+                "Source": source_name, "Detail": e["Detail"] or e["Raw Line"],
+            })
+        elif e["Event Type"] in {"Listener Stop Command", "Listener Reload Command"}:
+            security_events.append({
+                "Timestamp": e["Timestamp"], "Alert Type": e["Event Type"],
+                "Source Host/IP": e["Client IP"] if e["Client IP"] != "-" else e["Client Host"],
+                "Occurrences": 1, "Error Codes": "-",
+                "First Seen": e["Timestamp"], "Last Seen": e["Timestamp"],
+                "Source": source_name,
+                "Detail": f"{e['Command']} issued from host={e['Client Host']} user={e['User']} program={e['Program']} — verify this was planned maintenance.",
+            })
+        elif e["Event Type"] == "Service Died":
+            security_events.append({
+                "Timestamp": e["Timestamp"], "Alert Type": "Service Died",
+                "Source Host/IP": "-", "Occurrences": 1, "Error Codes": e["Error Code"] or "-",
+                "First Seen": e["Timestamp"], "Last Seen": e["Timestamp"],
+                "Source": source_name,
+                "Detail": f"Service '{e['Service']}' lost its listener registration — check instance/PMON health.",
+            })
+
+    return events, security_events, unclassified_events
+
 
 def extract_zip_uploaded_file(uploaded_zip):
     extracted_files = {}
@@ -969,6 +1690,14 @@ def analyze_asm_events(lines, source_name="uploaded"):
                             "Source": source_name, "Raw Line": line})
             continue
 
+        m = ASM_DISK_REPAIR_TIMER_DROP_RE.search(line)
+        if m:
+            events.append({"Timestamp": ts_now, "Event Type": "Disk Repair Timer Expired (Forced Drop)",
+                            "Diskgroup": f"group {m.group(2)}",
+                            "Detail": f"{m.group(1)} disk(s) permanently dropped after disk_repair_time expired — redundancy reduced, rebalance will follow. {line.strip()}",
+                            "Source": source_name, "Raw Line": line})
+            continue
+
         m = ASM_CLIENT_DISCONNECT_RE.search(line)
         if m:
             events.append({"Timestamp": ts_now, "Event Type": "Client Disconnected",
@@ -997,10 +1726,75 @@ def analyze_asm_events(lines, source_name="uploaded"):
                             "Source": source_name, "Raw Line": line})
             continue
 
+        # --- Quorum loss / PST heartbeat stall / diskgroup create-drop ---
+        # Checked BEFORE the generic ASM_ERROR_RE / WARN_RE catches below so
+        # these severe, well-known patterns get their own distinct event
+        # type instead of being buried in generic "ASM Error"/"Warning" rows.
+        m = ASM_QUORUM_LOSS_RE.search(line)
+        if m:
+            dg_m = ASM_ORA_DISKGROUP_NAME_RE.search(line)
+            events.append({"Timestamp": ts_now, "Event Type": "Quorum Loss (Diskgroup At Risk)",
+                            "Diskgroup": dg_m.group(1) if dg_m else "-", "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_PST_IO_WAIT_RE.search(line)
+        if m:
+            dg_m = ASM_ORA_DISKGROUP_NAME_RE.search(line)
+            events.append({"Timestamp": ts_now, "Event Type": "PST Disk I/O Stall",
+                            "Diskgroup": dg_m.group(1) if dg_m else "-", "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_DISKGROUP_CREATE_RE.search(line)
+        if m:
+            dg_m = ASM_ORA_DISKGROUP_NAME_RE.search(line)
+            events.append({"Timestamp": ts_now, "Event Type": "Diskgroup Created",
+                            "Diskgroup": dg_m.group(1) if dg_m else "-", "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        m = ASM_DISKGROUP_DROP_RE.search(line)
+        if m:
+            dg_m = ASM_ORA_DISKGROUP_NAME_RE.search(line)
+            events.append({"Timestamp": ts_now, "Event Type": "Diskgroup Dropped",
+                            "Diskgroup": dg_m.group(1) if dg_m else "-", "Detail": line.strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
         m = ASM_ERROR_RE.search(line)
         if m:
             events.append({"Timestamp": ts_now, "Event Type": "ASM Error",
                             "Diskgroup": "-", "Detail": m.group(1).strip(),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        # Plain "WARNING:" lines — previously NOT checked at all in ASM
+        # logs. Real validation against this environment's own ASM log
+        # found 189 WARNING lines completely invisible before this check
+        # existed, including operationally critical ones such as
+        # "WARNING: failed to online diskgroup resource ora.DATA_FRS.dg"
+        # and "WARNING: Disk Group OCR containing voting files is not
+        # mounted" — i.e. quorum/availability risks a DBA must see.
+        if WARN_RE.search(line):
+            dg_m = ASM_ORA_DISKGROUP_NAME_RE.search(line)
+            events.append({"Timestamp": ts_now, "Event Type": "Warning",
+                            "Diskgroup": dg_m.group(1) if dg_m else "-",
+                            "Detail": line.strip(), "Trace File": find_nearby_trace(i),
+                            "Source": source_name, "Raw Line": line})
+            continue
+
+        # Notable non-"WARNING"-worded events (see NOTABLE_EVENT_RE above) —
+        # TNS/listener "Fatal NI connect error", checkpoint/log-switch
+        # stalls, RAC reconfiguration, instance crash/termination, etc.
+        # Shared with the main RDBMS parser so an ASM instance's own
+        # listener failures or termination events get the same treatment.
+        notable_m = NOTABLE_EVENT_RE.search(line)
+        if notable_m:
+            label = NOTABLE_EVENT_LABELS[notable_m.lastgroup]
+            events.append({"Timestamp": ts_now, "Event Type": f"Notable: {label}",
+                            "Diskgroup": "-", "Detail": line.strip(),
+                            "Trace File": find_nearby_trace(i),
                             "Source": source_name, "Raw Line": line})
             continue
 
@@ -1033,6 +1827,377 @@ def analyze_asm_events(lines, source_name="uploaded"):
 
     return events, unclassified_events
 
+def is_crs_log(lines, sample_size=None):
+    """Heuristically detect whether a set of log lines belongs to an Oracle
+    Clusterware / Grid Infrastructure (CRS) alert log, by scanning for
+    CRS-specific markers ([OHASD(...], [CRSD(...], CRS-NNNNN codes, etc).
+
+    Unlike a plain per-node RDBMS or ASM alert log, real-world CRS logs are
+    frequently found interleaved with unrelated content (TNS/listener
+    connect errors, etc) near the top of the file, with the actual CRS
+    events starting much later. Capping the scan to the first few hundred
+    lines (as the ASM detector does) would silently MISS the log entirely
+    in that situation, so by default this scans the WHOLE file — accuracy
+    over speed, per production requirements. Pass an explicit sample_size
+    to cap the scan for very large files if needed.
+    """
+    checked = 0
+    for line in lines:
+        if CRS_LOG_MARKER_RE.search(line):
+            return True
+        checked += 1
+        if sample_size and checked >= sample_size:
+            break
+    return False
+
+def analyze_crs_events(lines, source_name="uploaded"):
+    """Parse Oracle Clusterware / Grid Infrastructure (CRS) alert log lines
+    for daemon startup/shutdown, node eviction & fencing, node membership
+    changes, OCR/OLR/voting-disk failures, agent & resource failures,
+    network/interconnect issues, Cluster Verification Utility (CVU)
+    findings, ACFS/AFD driver messages, and any other CRS-coded event.
+
+    Every single line that carries a CRS-NNNNN (or related PRVG/PRVF/ACFS/
+    AFD/...) code is guaranteed to produce a row — named categories get a
+    specific, human-readable Event Type; anything this tool doesn't have a
+    dedicated rule for yet still lands in a generic 'CRS Event' bucket with
+    a best-effort severity, rather than being silently dropped. This keeps
+    the analyzer accurate today AND future-proof against new/unseen CRS
+    codes, exactly like the existing ORA/ASM parsers above.
+    """
+    events = []
+    unclassified_events = []
+    current_timestamp = None
+    current_component = "-"
+    current_pid = "-"
+
+    def node_of(m, *group_indices):
+        for gi in group_indices:
+            try:
+                val = m.group(gi)
+                if val:
+                    return val
+            except Exception:
+                continue
+        return "-"
+
+    def fallback_node(text):
+        nm = CRS_NODE_FALLBACK_RE.search(text)
+        return nm.group(1) if nm else "-"
+
+    def extract_code(text):
+        cm = CRS_CODE_RE.search(text)
+        if cm:
+            return f"CRS-{cm.group(1)}"
+        gm = GENERIC_ERROR_CODE_RE.search(text)
+        if gm:
+            return gm.group(1)
+        return "-"
+
+    for i, raw_line in enumerate(lines):
+        line = raw_line.rstrip("\n")
+        if not line.strip():
+            continue
+
+        header_m = CRS_HEADER_RE.match(line)
+        if header_m:
+            current_timestamp = header_m.group("ts")
+            current_component = header_m.group("comp")
+            current_pid = header_m.group("pid")
+            msg = header_m.group("msg").strip()
+        else:
+            # Pure timestamp-only separator line (same ISO format used by
+            # the surrounding RDBMS-style portion of a mixed log) — just
+            # advance the running clock, nothing to classify.
+            ts_only_m = TIMESTAMP_RE.fullmatch(line.strip())
+            if ts_only_m:
+                current_timestamp = ts_only_m.group(1)
+                continue
+            # Free-standing continuation line (raw crsctl/CVU output,
+            # PRVG-nnnnn bullet findings, etc) — no header of its own, but
+            # still needs to be captured and attributed to the most
+            # recently seen timestamp/component, exactly like the main
+            # alert-log parser does for trace-file references.
+            msg = line.strip()
+
+        ts_now = current_timestamp or "Not Found"
+        comp_now = current_component
+
+        base = {"Timestamp": ts_now, "Component": comp_now, "Source": source_name, "Raw Line": line}
+
+        # 1) Node eviction / fencing / reboot advisory — highest severity,
+        #    checked first so it's never masked by a lower-priority match.
+        m = CRS_FENCE_REQUEST_RE.search(msg)
+        if m:
+            timeout_txt = f" (timeout {m.group(2)}ms)" if m.group(2) else ""
+            events.append({**base, "Event Type": "Node Eviction / Fencing",
+                            "Node": m.group(1), "CRS Code": "CRS-1735",
+                            "Detail": f"Fence request issued for node {m.group(1)}{timeout_txt}"})
+            continue
+        m = CRS_NODE_SHUTDOWN_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Node Eviction / Fencing",
+                            "Node": m.group(1), "CRS Code": "CRS-1625",
+                            "Detail": f"Node {m.group(1)} (number {m.group(2)}) was shut down"})
+            continue
+        m = CRS_NODE_EVICT_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Node Eviction / Fencing",
+                            "Node": fallback_node(msg), "CRS Code": extract_code(msg),
+                            "Detail": msg})
+            continue
+        m = CRS_REBOOT_ADVISORY_RE.search(msg)
+        if m:
+            announced, errors = int(m.group(1)), int(m.group(2))
+            severity_note = " — ⚠️ reboot WAS announced" if announced > 0 else ""
+            events.append({**base, "Event Type": "Node Eviction / Fencing",
+                            "Node": "-", "CRS Code": "CRS-8017",
+                            "Detail": f"Reboot advisory log check: {announced} announced, {errors} error(s){severity_note}"})
+            continue
+
+        # 2) OCR / OLR / voting-disk critical failures
+        m = CRS_OCR_CRITICAL_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "OCR/OLR Critical Failure",
+                            "Node": fallback_node(msg), "CRS Code": extract_code(msg), "Detail": msg})
+            continue
+        m = CRS_VOTING_DISK_RISK_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "OCR/OLR Critical Failure",
+                            "Node": fallback_node(msg), "CRS Code": extract_code(msg), "Detail": msg})
+            continue
+
+        # 3) Node down / cluster membership / server pool changes
+        m = CRS_NODE_DOWN_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Node Down / Membership",
+                            "Node": m.group(1), "CRS Code": "CRS-5504",
+                            "Detail": f"Node down event reported for '{m.group(1)}'"})
+            continue
+        m = CRS_SERVER_POOL_ASSIGN_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Server Pool Change",
+                            "Node": m.group(1), "CRS Code": "CRS-2772",
+                            "Detail": f"Server '{m.group(1)}' assigned to pool '{m.group(2)}'"})
+            continue
+        m = CRS_SERVER_POOL_REMOVE_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Server Pool Change",
+                            "Node": m.group(1), "CRS Code": "CRS-2773",
+                            "Detail": f"Server '{m.group(1)}' removed from pool '{m.group(2)}'"})
+            continue
+
+        # 4) Agent / resource start-stop-check failures
+        m = CRS_AGENT_FAIL_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Agent / Resource Failure",
+                            "Node": fallback_node(msg), "CRS Code": extract_code(msg), "Detail": msg})
+            continue
+        m = CRS_RESOURCE_STATE_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Resource State Change",
+                            "Node": fallback_node(msg), "CRS Code": extract_code(msg), "Detail": msg})
+            continue
+
+        # 5) Network / interconnect issues
+        m = CRS_NETWORK_ISSUE_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Network / Interconnect Issue",
+                            "Node": fallback_node(msg), "CRS Code": extract_code(msg), "Detail": msg})
+            continue
+
+        # 6) Cluster Verification Utility (CVU) findings — both the
+        #    triggering CRS-10051 line and every un-prefixed PRVG/PRVF/...
+        #    continuation line that follows it.
+        m = CRS_CVU_HEADER_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Cluster Verification (CVU) Finding",
+                            "Node": fallback_node(msg), "CRS Code": "CRS-10051", "Detail": msg})
+            continue
+        m = CVU_CODE_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Cluster Verification (CVU) Finding",
+                            "Node": fallback_node(msg), "CRS Code": f"{m.group(1)}-{m.group(2)}",
+                            "Detail": msg})
+            continue
+        m = CRS_SSH_CONNECTIVITY_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Node Connectivity / SSH Issue",
+                            "Node": fallback_node(msg), "CRS Code": f"{m.group(1)}-{m.group(2)}",
+                            "Detail": msg})
+            continue
+
+        # 7) Time Sync Service state (non start/stop — e.g. observer mode)
+        m = CRS_TIMESYNC_OBSERVER_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Time Sync Service",
+                            "Node": m.group(1), "CRS Code": "CRS-2403", "Detail": msg})
+            continue
+
+        # 8) Clusterware daemon startup
+        m = CRS_PROC_STARTING_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Clusterware Startup",
+                            "Node": "-", "CRS Code": "CRS-8500",
+                            "Detail": f"{m.group(1)} process starting (pid {m.group(2)})"})
+            continue
+        m = CRS_RELEASE_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Clusterware Startup",
+                            "Node": "-", "CRS Code": "CRS-0714", "Detail": msg})
+            continue
+        m = CRS_CSSD_STARTED_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Clusterware Startup",
+                            "Node": "-", "CRS Code": "CRS-1713", "Detail": msg})
+            continue
+        m = CRS_CSSD_READY_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Clusterware Startup",
+                            "Node": "-", "CRS Code": "CRS-1720", "Detail": msg})
+            continue
+        m = CRS_OCR_STARTED_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Clusterware Startup",
+                            "Node": m.group(1), "CRS Code": "CRS-1012", "Detail": msg})
+            continue
+        m = CRS_OLR_STARTED_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Clusterware Startup",
+                            "Node": m.group(1), "CRS Code": "CRS-2112", "Detail": msg})
+            continue
+        m = CRS_TIMESYNC_STARTED_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Time Sync Service",
+                            "Node": m.group(1), "CRS Code": "CRS-2401", "Detail": msg})
+            continue
+        m = CRS_GPNPD_STARTED_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Clusterware Startup",
+                            "Node": m.group(1), "CRS Code": "CRS-2328", "Detail": msg})
+            continue
+        m = CRS_CSSD_RECONFIG_COMPLETE_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Node Down / Membership",
+                            "Node": "-", "CRS Code": "CRS-1601",
+                            "Detail": f"CSSD reconfiguration complete. Active nodes: {m.group(1).strip()}"})
+            continue
+
+        # 9) Clusterware daemon / cluster shutdown
+        m = CRS_SHUTDOWN_START_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Clusterware Shutdown",
+                            "Node": m.group(1), "CRS Code": "CRS-2791", "Detail": msg})
+            continue
+        m = CRS_SHUTDOWN_COMPLETE_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Clusterware Shutdown",
+                            "Node": m.group(1), "CRS Code": "CRS-2793", "Detail": msg})
+            continue
+        m = CRS_CSSD_SHUTDOWN_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Clusterware Shutdown",
+                            "Node": m.group(1), "CRS Code": "CRS-1603", "Detail": msg})
+            continue
+        m = CRS_GPNPD_SHUTDOWN_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Clusterware Shutdown",
+                            "Node": m.group(1), "CRS Code": "CRS-2329", "Detail": msg})
+            continue
+        m = CRS_TIMESYNC_SHUTDOWN_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Time Sync Service",
+                            "Node": m.group(1), "CRS Code": "CRS-2405", "Detail": msg})
+            continue
+        m = CRS_PROC_EXITING_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Clusterware Shutdown",
+                            "Node": "-", "CRS Code": "CRS-8504", "Detail": msg})
+            continue
+        m = CRS_MDNS_STOPPING_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "Clusterware Shutdown",
+                            "Node": "-", "CRS Code": "CRS-5602", "Detail": msg})
+            continue
+
+        # 10) ACFS / AFD driver messages
+        m = CRS_ACFS_AFD_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "ACFS / AFD Driver",
+                            "Node": "-", "CRS Code": f"{m.group(1)}-{m.group(2)}", "Detail": msg})
+            continue
+
+        # 10.5) ORA- errors embedded in the CRS log — CRS/GI alert logs are
+        # frequently interleaved with output from the ASM instance or GIMR
+        # (management repository) database they host, which can log real
+        # ORA- errors (e.g. ORA-01034 instance not available, ORA-27101
+        # shared memory realm errors) with no CRS-NNNNN code at all.
+        # Previously invisible in this parser.
+        m = ORA_RE.search(msg)
+        if m:
+            events.append({**base, "Event Type": "ORA Error", "Node": fallback_node(msg),
+                            "CRS Code": f"ORA-{m.group(1)}", "Detail": msg})
+            continue
+
+        # 10.6) TNS/Listener and other notable non-CRS-coded events (see
+        # NOTABLE_EVENT_RE above). Real CRS/mixed logs interleave enormous
+        # volumes of "Fatal NI connect error"/"TNS-nnnnn" lines — commonly
+        # the Grid Infrastructure Management Repository (GIMR/MGMTDB)
+        # listener being unreachable — that carry no CRS- code and were
+        # previously silently dropped in their entirety by this parser
+        # (over half a million lines in real validation against this
+        # environment's own CRS log). TNS is NOT in
+        # GENERIC_ERROR_CODE_SKIP_PREFIXES's exemption for nothing: the
+        # exemption assumes something else already handles it — this is
+        # that handling, for this parser.
+        notable_m = NOTABLE_EVENT_RE.search(msg)
+        if notable_m:
+            label = NOTABLE_EVENT_LABELS[notable_m.lastgroup]
+            events.append({**base, "Event Type": f"Notable: {label}",
+                            "Node": fallback_node(msg), "CRS Code": extract_code(msg), "Detail": msg})
+            continue
+
+        # 11) Future-proofing safety net #1 — ANY remaining CRS-NNNNN coded
+        #     line that none of the named categories above recognized still
+        #     gets captured here, with a best-effort severity guess, rather
+        #     than being silently dropped. This is what guarantees new/future
+        #     CRS codes are never missed even before this tool has a
+        #     dedicated rule for them.
+        m = CRS_CODE_RE.search(msg)
+        if m:
+            code = f"CRS-{m.group(1)}"
+            body = m.group(2).strip() if m.group(2) else msg
+            if CRS_GENERIC_ERROR_KEYWORDS_RE.search(msg):
+                etype = "CRS Error"
+            elif CRS_GENERIC_WARN_KEYWORDS_RE.search(msg):
+                etype = "CRS Warning"
+            else:
+                etype = "CRS Info"
+            events.append({**base, "Event Type": etype,
+                            "Node": fallback_node(msg), "CRS Code": code, "Detail": body or msg})
+            continue
+
+        # 12) Future-proofing safety net #2 — same generic prefix-code /
+        #     severity-keyword net used by the main alert-log & ASM parsers,
+        #     for anything with a non-CRS coded prefix (a future PRVx/PRCx/
+        #     component code this parser has no dedicated rule for) or a
+        #     high-signal plain-English severity phrase with no code at all.
+        code_m = GENERIC_ERROR_CODE_RE.search(msg)
+        if code_m and code_m.group(1).split("-")[0] not in GENERIC_ERROR_CODE_SKIP_PREFIXES:
+            unclassified_events.append({
+                "Timestamp": ts_now, "Match Type": "Unmapped Error Code",
+                "Matched": code_m.group(1), "Source": source_name, "Raw Line": line.strip(),
+            })
+            continue
+        sev_m = GENERIC_SEVERITY_RE.search(msg)
+        if sev_m:
+            unclassified_events.append({
+                "Timestamp": ts_now, "Match Type": "Possible Severity Keyword",
+                "Matched": sev_m.group(1).upper(), "Source": source_name, "Raw Line": line.strip(),
+            })
+
+    return events, unclassified_events
+
 def parse_iso_timestamp(ts):
     if not ts or ts == "Not Found":
         return None
@@ -1049,6 +2214,61 @@ def parse_iso_timestamp(ts):
             return dt
         except Exception:
             return None
+
+
+def strip_tz_for_excel(df):
+    """
+    Make a DataFrame safe to write with df.to_excel(...).
+
+    Excel/xlsxwriter cannot store timezone-aware datetimes at all, so every
+    tz-aware value must become naive before export.
+
+    The previous version of this helper only handled the case where a
+    column had already been coerced by pandas into a uniform
+    `datetime64[ns, tz]` dtype (checked via
+    `ptypes.is_datetime64_any_dtype`) and called `.dt.tz_localize(None)` on
+    it. That works ONLY when every value in the column carries the exact
+    same UTC offset.
+
+    Real alert logs don't guarantee that: lines can be parsed with
+    different offsets (e.g. a mix of "+05:30" timestamps and lines that had
+    no offset at all and got LOCAL_TZ assigned as a fallback in
+    parse_iso_timestamp), or a log can genuinely span a DST change or a
+    node in a different timezone. Whenever a column's tz-aware datetimes
+    don't all share one offset, pandas is unable to represent the column as
+    a single `datetime64[ns, tz]` dtype and silently falls back to plain
+    Python `object` dtype holding raw `datetime`/`Timestamp` instances.
+    `is_datetime64_any_dtype` returns False for that, so the old code's
+    tz-strip branch never ran, and xlsxwriter blew up on the first
+    tz-aware cell it tried to format — this is exactly the
+    "Excel does not support datetimes with timezones" crash on CRS_Events
+    (a CRS/mixed log is the most likely place to have inconsistent
+    offsets across lines, since it can interleave several components).
+
+    Fix: handle both cases explicitly, per column —
+      1. Uniform tz-aware dtype -> vectorised `.dt.tz_localize(None)`.
+      2. Object dtype -> strip tzinfo from every individual
+         datetime/Timestamp cell (leaving non-datetime cells untouched).
+    """
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    for col in df.columns:
+        try:
+            if ptypes.is_datetime64_any_dtype(df[col]):
+                if getattr(df[col].dt, "tz", None) is not None:
+                    df[col] = df[col].dt.tz_localize(None)
+            elif df[col].dtype == object:
+                def _naive(v):
+                    if isinstance(v, (pd.Timestamp, datetime)) and getattr(v, "tzinfo", None) is not None:
+                        return v.replace(tzinfo=None)
+                    return v
+                df[col] = df[col].map(_naive)
+        except Exception:
+            # Never let export formatting break the download — worst case
+            # a column is left as-is and Excel shows it as text.
+            pass
+    return df
 
 
 def detect_instance_summary_and_events(all_lines):
@@ -1203,11 +2423,13 @@ def compare_two_parsed_lists(list_a, list_b):
     # ---- Unique in B (new) ----
     df_a_keys = df_a.astype(str).agg("|".join, axis=1).tolist()
     df_b_keys = df_b.astype(str).agg("|".join, axis=1).tolist()
+    df_a_keys_set = set(df_a_keys)
+    df_b_keys_set = set(df_b_keys)
 
-    new_in_b = [b for bkey, b in zip(df_b_keys, list_b) if bkey not in df_a_keys]
+    new_in_b = [b for bkey, b in zip(df_b_keys, list_b) if bkey not in df_a_keys_set]
 
     # ---- Unique in A (missing in B) ----
-    new_in_a = [a for akey, a in zip(df_a_keys, list_a) if akey not in df_b_keys]
+    new_in_a = [a for akey, a in zip(df_a_keys, list_a) if akey not in df_b_keys_set]
 
     return {
         "counts": counts.reset_index().rename(columns={"index": "ORA Error"}),
@@ -1283,119 +2505,261 @@ def ai_generate(prompt: str) -> str:
 st.markdown("""
 <div style='background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); margin-bottom: 2rem;'>
     <h3 style='margin-top: 0; color: #667eea;'>📂 Upload Alert Log Files</h3>
-    <p style='color: #666; margin-bottom: 1rem;'>Select one or more Oracle RDBMS alert logs and/or ASM (+ASM) alert logs to analyze — ASM logs are auto-detected</p>
+    <p style='color: #666; margin-bottom: 1rem;'>Select one or more Oracle RDBMS alert logs, ASM (+ASM) alert logs, CRS/Clusterware alert logs, and/or listener.log files to analyze — all are auto-detected</p>
 </div>
 """, unsafe_allow_html=True)
 
-uploaded_files = st.file_uploader("Upload Alert Log Files", type=["log","txt","zip"], accept_multiple_files=True, label_visibility="collapsed")
+uploaded_files = st.file_uploader(
+    "Upload Alert Log Files", type=["log","txt","zip"], accept_multiple_files=True,
+    label_visibility="collapsed", key=f"file_uploader_{st.session_state.get('_uploader_reset_count', 0)}"
+)
+
+_uc1, _uc2 = st.columns([5, 1])
+with _uc2:
+    if st.button("🔄 Clear / New Analysis", use_container_width=True, help="Removes all currently uploaded files so you can start a fresh analysis"):
+        # Bumping this counter changes the file_uploader's `key` above, which
+        # Streamlit treats as a brand-new widget instance — the old one
+        # (with its previously selected files) is discarded entirely rather
+        # than needing each file chip removed by hand.
+        st.session_state["_uploader_reset_count"] = st.session_state.get("_uploader_reset_count", 0) + 1
+        for _k in ("global_start_date", "global_end_date", "global_start_time", "global_end_time", "_uploaded_file_sig"):
+            st.session_state.pop(_k, None)
+        st.rerun()
+
+if uploaded_files:
+    # Streamlit quirk: once a widget with a given `key` has rendered, its
+    # `session_state[key]` value sticks — changing the `default`/`value`
+    # argument in code has NO effect on later reruns until that key is
+    # cleared. The global date filter's default is computed from the
+    # uploaded files' own timestamps, so when a *different* set of files is
+    # uploaded, the old date-filter selection (possibly from a totally
+    # different log, or the very first "today" fallback) would otherwise
+    # keep being reused — silently filtering every row out of every table
+    # below Quick Stats. Detect a change in the uploaded file set and drop
+    # the stale keys so the date filter recomputes fresh for the new data.
+    _file_sig = tuple(sorted((f.name, f.size) for f in uploaded_files))
+    if st.session_state.get("_uploaded_file_sig") != _file_sig:
+        st.session_state["_uploaded_file_sig"] = _file_sig
+        for _k in ("global_start_date", "global_end_date", "global_start_time", "global_end_time"):
+            st.session_state.pop(_k, None)
 
 if not uploaded_files:
     st.markdown("""
     <div style='background: white; padding: 3rem; border-radius: 12px; text-align: center; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);'>
         <h2 style='color: #667eea; margin-bottom: 1rem;'>👋 Welcome!</h2>
-        <p style='font-size: 1.1rem; color: #666;'>Upload your Oracle RDBMS and/or ASM alert log files above to begin analysis</p>
-        <p style='color: #999; margin-top: 1rem;'>Supports .log and .txt files (RDBMS &amp; ASM alert logs, auto-detected) as well as .zip archives</p>
+        <p style='font-size: 1.1rem; color: #666;'>Upload your Oracle RDBMS, ASM, CRS and/or listener log files above to begin analysis</p>
+        <p style='color: #999; margin-top: 1rem;'>Supports .log and .txt files (RDBMS, ASM, CRS/Clusterware &amp; TNSLSNR listener logs, all auto-detected) as well as .zip archives</p>
     </div>
     """, unsafe_allow_html=True)
     st.stop()
 
-# Parse uploaded files
-all_raw_lines = []
-per_file_lines = {}
-combined_ora = []
-combined_warnings = []
-combined_kill_sessions = []
-combined_trace_files = []
-combined_unclassified = []
-combined_asm_events = []
-asm_source_files = set()
+# ---------------- Cached parsing pipeline ----------------
+# Everything here (decoding files, ORA/warning/kill/trace parsing, ASM/CRS/
+# listener auto-detection, the instance-summary scan, and building the
+# per-category DataFrames) is the expensive part of this app. Streamlit
+# reruns the WHOLE script on every single interaction — ticking a checkbox,
+# moving the date filter, typing in the search box, clicking a tab — and
+# without caching, all of that work was being redone from scratch every
+# time, which is why the app felt slow both right after upload and on every
+# click afterwards. Wrapping it in @st.cache_data means this only actually
+# re-runs when the uploaded files themselves change; every other
+# interaction reuses the cached result instantly. Per-file caching (on the
+# file's own bytes) also means adding one more file to an existing upload
+# doesn't force every previously-uploaded file to be re-parsed.
 
-with st.spinner("📄 Processing uploaded files..."):
+@st.cache_data(show_spinner=False, max_entries=8)
+def _parse_zip_bytes(zip_bytes):
+    """Extract .log/.txt members from an uploaded .zip as raw bytes."""
+    extracted = {}
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        for file_name in z.namelist():
+            if file_name.lower().endswith((".log", ".txt")):
+                extracted[file_name] = z.open(file_name).read()
+    return extracted
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _parse_one_log_file(file_bytes, file_name):
+    """Parse a single log file's bytes. Cached per (name, content), so the
+    same file is never re-parsed twice, no matter how many times the app
+    reruns."""
+    lines = file_bytes.decode("utf-8", errors="ignore").splitlines()
+    result = {"lines": lines}
+
+    # 📡 Listener Log Auto-Detection & Parsing (checked first — a
+    # listener.log has its own dedicated format and never also contains
+    # ORA-/ASM/CRS markers, so it's parsed instead of, not in addition to,
+    # the RDBMS/ASM/CRS parsers below).
+    if is_listener_log(lines):
+        l_events, l_security, l_unclassified = analyze_listener_log_lines(lines, source_name=file_name)
+        result.update(
+            is_listener=True,
+            listener_events=l_events,
+            listener_security=l_security,
+            listener_unclassified=l_unclassified,
+        )
+        return result
+
+    o, w, k, tr, u = analyze_alert_log_lines(lines, source_name=file_name)
+    result.update(ora=o, warnings=w, kill=k, trace=tr, unclassified=u)
+
+    # 💽 ASM Log Auto-Detection & Parsing
+    if is_asm_log(lines):
+        asm_events, asm_unclassified = analyze_asm_events(lines, source_name=file_name)
+        result.update(is_asm=True, asm_events=asm_events, asm_unclassified=asm_unclassified)
+
+    # 🧬 CRS / Grid Infrastructure Log Auto-Detection & Parsing
+    if is_crs_log(lines):
+        crs_events, crs_unclassified = analyze_crs_events(lines, source_name=file_name)
+        result.update(is_crs=True, crs_events=crs_events, crs_unclassified=crs_unclassified)
+
+    return result
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def build_dashboard_data(uploaded_files):
+    all_raw_lines = []
+    per_file_lines = {}
+    combined_ora = []
+    combined_warnings = []
+    combined_kill_sessions = []
+    combined_trace_files = []
+    combined_unclassified = []
+    combined_asm_events = []
+    asm_source_files = set()
+    combined_crs_events = []
+    crs_source_files = set()
+    combined_listener_events = []
+    combined_listener_security = []
+    listener_source_files = set()
+
+    def _merge(parsed, src_name):
+        per_file_lines[src_name] = parsed["lines"]
+        all_raw_lines.append(f"--- BEGIN FILE: {src_name} ---")
+        all_raw_lines.extend(parsed["lines"])
+        all_raw_lines.append(f"--- END FILE: {src_name} ---")
+
+        if parsed.get("is_listener"):
+            listener_source_files.add(src_name)
+            combined_listener_events.extend(parsed["listener_events"])
+            combined_listener_security.extend(parsed["listener_security"])
+            combined_unclassified.extend(parsed["listener_unclassified"])
+            return
+
+        combined_ora.extend(parsed["ora"])
+        combined_warnings.extend(parsed["warnings"])
+        combined_kill_sessions.extend(parsed["kill"])
+        combined_trace_files.extend(parsed["trace"])
+        combined_unclassified.extend(parsed["unclassified"])
+
+        if parsed.get("is_asm"):
+            asm_source_files.add(src_name)
+            combined_asm_events.extend(parsed["asm_events"])
+            combined_unclassified.extend(parsed["asm_unclassified"])
+
+        if parsed.get("is_crs"):
+            crs_source_files.add(src_name)
+            combined_crs_events.extend(parsed["crs_events"])
+            combined_unclassified.extend(parsed["crs_unclassified"])
+
     for f in uploaded_files:
         name = f.name
 
         # 🔥 ZIP FILE SUPPORT
         if name.lower().endswith(".zip"):
-            extracted = extract_zip_uploaded_file(f)
-            for zname, zlines in extracted.items():
-                per_file_lines[zname] = zlines
-                all_raw_lines.append(f"--- BEGIN FILE: {zname} ---")
-                all_raw_lines.extend(zlines)
-                all_raw_lines.append(f"--- END FILE: {zname} ---")
-
-                o, w, k, tr, u = analyze_alert_log_lines(zlines, source_name=zname)
-                combined_ora.extend(o)
-                combined_warnings.extend(w)
-                combined_kill_sessions.extend(k)
-                combined_trace_files.extend(tr)
-                combined_unclassified.extend(u)
-
-                if is_asm_log(zlines):
-                    asm_source_files.add(zname)
-                    asm_events, asm_unclassified = analyze_asm_events(zlines, source_name=zname)
-                    combined_asm_events.extend(asm_events)
-                    combined_unclassified.extend(asm_unclassified)
+            extracted = _parse_zip_bytes(f.getvalue())
+            for zname, zbytes in extracted.items():
+                parsed = _parse_one_log_file(zbytes, zname)
+                _merge(parsed, zname)
             continue
 
         # Normal .log / .txt files
-        lines = lines_from_uploaded_file(f)
-        per_file_lines[name] = lines
-        all_raw_lines.append(f"--- BEGIN FILE: {name} ---")
-        all_raw_lines.extend(lines)
-        all_raw_lines.append(f"--- END FILE: {name} ---")
+        parsed = _parse_one_log_file(f.getvalue(), name)
+        _merge(parsed, name)
 
-        o, w, k, tr, u = analyze_alert_log_lines(lines, source_name=name)
-        combined_ora.extend(o)
-        combined_warnings.extend(w)
-        combined_kill_sessions.extend(k)
-        combined_trace_files.extend(tr)
-        combined_unclassified.extend(u)
+    df_ora_all = pd.DataFrame(combined_ora) if combined_ora else pd.DataFrame(columns=["Timestamp","ORA Error","Trace File","Source","Raw Line","Error Block ID","Full Error Block","Related ORA Codes"])
+    df_warn_all = pd.DataFrame(combined_warnings) if combined_warnings else pd.DataFrame(columns=["Timestamp","Category","Warning Message","Trace File","Source","Raw Line"])
+    df_kill_all = pd.DataFrame(combined_kill_sessions) if combined_kill_sessions else pd.DataFrame(columns=["Timestamp","SID","Serial#","Reason","Mode","Requestor","Owner","Result","Trace File","Source","Raw Line","Full Block"])
+    df_asm_all = pd.DataFrame(combined_asm_events) if combined_asm_events else pd.DataFrame(columns=["Timestamp","Event Type","Diskgroup","Detail","Source","Raw Line"])
+    df_crs_all = pd.DataFrame(combined_crs_events) if combined_crs_events else pd.DataFrame(columns=["Timestamp","Event Type","Component","Node","CRS Code","Detail","Source","Raw Line"])
+    df_listener_all = pd.DataFrame(combined_listener_events) if combined_listener_events else pd.DataFrame(columns=["Timestamp","Event Type","Command","Service","Client Host","Client IP","Client Port","Program","User","Protocol","Return Code","Error Code","Detail","Source","Raw Line"])
+    df_listener_security_all = pd.DataFrame(combined_listener_security) if combined_listener_security else pd.DataFrame(columns=["Timestamp","Alert Type","Source Host/IP","Occurrences","Error Codes","First Seen","Last Seen","Source","Detail"])
+    df_unclassified_all = pd.DataFrame(combined_unclassified) if combined_unclassified else pd.DataFrame(columns=["Timestamp","Match Type","Matched","Trace File","Source","Raw Line"])
+    df_trace_all = pd.DataFrame(combined_trace_files) if combined_trace_files else pd.DataFrame(columns=["Timestamp","Trace File","Source","Raw Line"])
 
-        # 💽 ASM Log Auto-Detection & Parsing
-        if is_asm_log(lines):
-            asm_source_files.add(name)
-            asm_events, asm_unclassified = analyze_asm_events(lines, source_name=name)
-            combined_asm_events.extend(asm_events)
-            combined_unclassified.extend(asm_unclassified)
+    for _df in (df_ora_all, df_warn_all, df_kill_all, df_asm_all, df_crs_all,
+                df_listener_all, df_listener_security_all, df_unclassified_all, df_trace_all):
+        if not _df.empty:
+            _df["ParsedTimestamp"] = _df["Timestamp"].apply(parse_iso_timestamp)
+        else:
+            _df["ParsedTimestamp"] = pd.Series(dtype="datetime64[ns]")
+
+    if not df_trace_all.empty:
+        df_trace_all = df_trace_all.sort_values("ParsedTimestamp", na_position="last").reset_index(drop=True)
+
+    # Instance summary / startup / shutdown / crash / ALTER / RESIZE scan —
+    # also expensive on big multi-file uploads (it walks every line with
+    # several regexes), so it's computed once here instead of on every
+    # rerun. Uses the same "no BEGIN/END markers" line set the old inline
+    # version used.
+    clean_lines = [line for _lines in per_file_lines.values() for line in _lines]
+    instance_info = detect_instance_summary_and_events(clean_lines)
+
+    return {
+        "all_raw_lines": all_raw_lines,
+        "per_file_lines": per_file_lines,
+        "combined_ora": combined_ora,
+        "combined_warnings": combined_warnings,
+        "combined_kill_sessions": combined_kill_sessions,
+        "combined_trace_files": combined_trace_files,
+        "combined_unclassified": combined_unclassified,
+        "combined_asm_events": combined_asm_events,
+        "asm_source_files": asm_source_files,
+        "combined_crs_events": combined_crs_events,
+        "crs_source_files": crs_source_files,
+        "combined_listener_events": combined_listener_events,
+        "combined_listener_security": combined_listener_security,
+        "listener_source_files": listener_source_files,
+        "df_ora_all": df_ora_all,
+        "df_warn_all": df_warn_all,
+        "df_kill_all": df_kill_all,
+        "df_asm_all": df_asm_all,
+        "df_crs_all": df_crs_all,
+        "df_listener_all": df_listener_all,
+        "df_listener_security_all": df_listener_security_all,
+        "df_unclassified_all": df_unclassified_all,
+        "df_trace_all": df_trace_all,
+        "instance_info": instance_info,
+    }
 
 
-df_ora_all = pd.DataFrame(combined_ora) if combined_ora else pd.DataFrame(columns=["Timestamp","ORA Error","Trace File","Source","Raw Line","Error Block ID","Full Error Block","Related ORA Codes"])
-df_warn_all = pd.DataFrame(combined_warnings) if combined_warnings else pd.DataFrame(columns=["Timestamp","Category","Warning Message","Trace File","Source","Raw Line"])
-df_kill_all = pd.DataFrame(combined_kill_sessions) if combined_kill_sessions else pd.DataFrame(columns=["Timestamp","SID","Serial#","Reason","Mode","Requestor","Owner","Result","Trace File","Source","Raw Line","Full Block"])
-df_asm_all = pd.DataFrame(combined_asm_events) if combined_asm_events else pd.DataFrame(columns=["Timestamp","Event Type","Diskgroup","Detail","Source","Raw Line"])
-df_unclassified_all = pd.DataFrame(combined_unclassified) if combined_unclassified else pd.DataFrame(columns=["Timestamp","Match Type","Matched","Trace File","Source","Raw Line"])
-df_trace_all = pd.DataFrame(combined_trace_files) if combined_trace_files else pd.DataFrame(columns=["Timestamp","Trace File","Source","Raw Line"])
+with st.spinner("📄 Processing uploaded files..."):
+    _dashboard_data = build_dashboard_data(tuple(uploaded_files))
 
-if not df_ora_all.empty:
-    df_ora_all["ParsedTimestamp"] = df_ora_all["Timestamp"].apply(parse_iso_timestamp)
-else:
-    df_ora_all["ParsedTimestamp"] = pd.Series(dtype="datetime64[ns]")
-
-if not df_warn_all.empty:
-    df_warn_all["ParsedTimestamp"] = df_warn_all["Timestamp"].apply(parse_iso_timestamp)
-else:
-    df_warn_all["ParsedTimestamp"] = pd.Series(dtype="datetime64[ns]")
-
-if not df_kill_all.empty:
-    df_kill_all["ParsedTimestamp"] = df_kill_all["Timestamp"].apply(parse_iso_timestamp)
-else:
-    df_kill_all["ParsedTimestamp"] = pd.Series(dtype="datetime64[ns]")
-
-if not df_asm_all.empty:
-    df_asm_all["ParsedTimestamp"] = df_asm_all["Timestamp"].apply(parse_iso_timestamp)
-else:
-    df_asm_all["ParsedTimestamp"] = pd.Series(dtype="datetime64[ns]")
-
-if not df_unclassified_all.empty:
-    df_unclassified_all["ParsedTimestamp"] = df_unclassified_all["Timestamp"].apply(parse_iso_timestamp)
-else:
-    df_unclassified_all["ParsedTimestamp"] = pd.Series(dtype="datetime64[ns]")
-
-if not df_trace_all.empty:
-    df_trace_all["ParsedTimestamp"] = df_trace_all["Timestamp"].apply(parse_iso_timestamp)
-    df_trace_all = df_trace_all.sort_values("ParsedTimestamp", na_position="last").reset_index(drop=True)
-else:
-    df_trace_all["ParsedTimestamp"] = pd.Series(dtype="datetime64[ns]")
+all_raw_lines = _dashboard_data["all_raw_lines"]
+per_file_lines = _dashboard_data["per_file_lines"]
+combined_ora = _dashboard_data["combined_ora"]
+combined_warnings = _dashboard_data["combined_warnings"]
+combined_kill_sessions = _dashboard_data["combined_kill_sessions"]
+combined_trace_files = _dashboard_data["combined_trace_files"]
+combined_unclassified = _dashboard_data["combined_unclassified"]
+combined_asm_events = _dashboard_data["combined_asm_events"]
+asm_source_files = _dashboard_data["asm_source_files"]
+combined_crs_events = _dashboard_data["combined_crs_events"]
+crs_source_files = _dashboard_data["crs_source_files"]
+combined_listener_events = _dashboard_data["combined_listener_events"]
+combined_listener_security = _dashboard_data["combined_listener_security"]
+listener_source_files = _dashboard_data["listener_source_files"]
+df_ora_all = _dashboard_data["df_ora_all"]
+df_warn_all = _dashboard_data["df_warn_all"]
+df_kill_all = _dashboard_data["df_kill_all"]
+df_asm_all = _dashboard_data["df_asm_all"]
+df_crs_all = _dashboard_data["df_crs_all"]
+df_listener_all = _dashboard_data["df_listener_all"]
+df_listener_security_all = _dashboard_data["df_listener_security_all"]
+df_unclassified_all = _dashboard_data["df_unclassified_all"]
+df_trace_all = _dashboard_data["df_trace_all"]
+instance_info = _dashboard_data["instance_info"]
 
 # ---------------- Quick Stats Dashboard ----------------
 st.markdown("### 📊 Quick Statistics")
@@ -1404,6 +2768,8 @@ total_errors = len(combined_ora)
 total_warnings = len(combined_warnings)
 total_kills = len(combined_kill_sessions)
 total_asm_events = len(combined_asm_events)
+total_crs_events = len(combined_crs_events)
+total_listener_events = len(combined_listener_events)
 total_unclassified = len(combined_unclassified)
 
 if asm_source_files:
@@ -1429,6 +2795,65 @@ if asm_source_files:
         _dg_txt = f" (diskgroup(s): {', '.join(_dgs)})" if _dgs else ""
         st.error(f"💾 **{_space_exhausted_total} diskgroup space-exhausted error(s) (ORA-15041)** found{_dg_txt} — see '💽 ASM Diskgroup Analysis → 🧨 ASM / ORA Errors' below.")
 
+if crs_source_files:
+    st.info(f"🧬 **CRS/Clusterware log(s) detected:** {', '.join(sorted(crs_source_files))} — CRS/Grid Infrastructure analysis is available below.")
+
+    _evict_total = sum(1 for e in combined_crs_events if e.get("Event Type") == "Node Eviction / Fencing")
+    if _evict_total > 0:
+        st.error(f"🚨 **{_evict_total} node eviction/fencing event(s) found** — see '🧬 CRS/Clusterware Analysis → 🚨 Node Eviction & Fencing' below.")
+
+    _ocr_total = sum(1 for e in combined_crs_events if e.get("Event Type") == "OCR/OLR Critical Failure")
+    if _ocr_total > 0:
+        st.error(f"🗄️ **{_ocr_total} OCR/OLR/voting-disk critical failure event(s) found** — see '🧬 CRS/Clusterware Analysis → 🗄️ OCR / OLR / Voting' below.")
+
+    _agent_fail_total = sum(1 for e in combined_crs_events if e.get("Event Type") in {"Agent / Resource Failure", "Resource State Change"})
+    if _agent_fail_total > 0:
+        st.warning(f"⚙️ **{_agent_fail_total} agent/resource failure or state-change event(s) found** — see '🧬 CRS/Clusterware Analysis → ⚙️ Agent & Resource Failures' below.")
+
+    _cvu_total = sum(1 for e in combined_crs_events if e.get("Event Type") == "Cluster Verification (CVU) Finding")
+    if _cvu_total > 0:
+        st.warning(f"🔍 **{_cvu_total} Cluster Verification Utility (CVU) finding(s)** — pre-req/config issue(s) flagged by CVU. See '🧬 CRS/Clusterware Analysis → 🔍 CVU Findings' below.")
+
+if listener_source_files:
+    st.info(f"📡 **Listener log(s) detected:** {', '.join(sorted(listener_source_files))} — Listener Log Analysis is available below.")
+
+    _refused_total = sum(1 for e in combined_listener_events if e.get("Event Type") == "Connection Refused/Error")
+    if _refused_total > 0:
+        st.warning(f"🔌 **{_refused_total} refused/failed connection attempt(s) found** — see '📡 Listener Log Analysis → 🚫 Connection Errors' below.")
+
+    _repeat_total = sum(1 for s in combined_listener_security if s.get("Alert Type") == "Repeated Connection Failures From Single Source")
+    if _repeat_total > 0:
+        st.error(f"🚨 **{_repeat_total} source(s) with repeated connection failures** — possible scanning/unauthorized access attempts. See '📡 Listener Log Analysis → 🛡️ Security Alerts' below immediately.")
+
+    _svc_died_total = sum(1 for e in combined_listener_events if e.get("Event Type") == "Service Died")
+    if _svc_died_total > 0:
+        st.error(f"💀 **{_svc_died_total} 'service_died' event(s) found** — a registered instance/service dropped its listener registration. See '📡 Listener Log Analysis → 💀 Service Health' below.")
+
+    _auth_fail_total = sum(1 for e in combined_listener_events if e.get("Event Type") == "Authentication Failure")
+    if _auth_fail_total > 0:
+        st.error(f"🔐 **{_auth_fail_total} listener authentication failure(s) (TNS-01189)** found — see '📡 Listener Log Analysis → 🛡️ Security Alerts' below immediately.")
+
+    _acl_total = sum(1 for e in combined_listener_events if e.get("Event Type") == "Access Denied (ACL)")
+    if _acl_total > 0:
+        st.error(f"⛔ **{_acl_total} connection(s) rejected by Service ACL filtering (TNS-12506)** — a client was explicitly blocked by listener.ora's ACL rules. See '📡 Listener Log Analysis → 🛡️ Security Alerts' below immediately.")
+
+    _admin_total = sum(1 for e in combined_listener_events if e.get("Event Type") in {"Listener Stop Command", "Listener Reload Command"})
+    if _admin_total > 0:
+        st.warning(f"🛠️ **{_admin_total} listener STOP/RELOAD admin command(s) found** — verify these were planned. See '📡 Listener Log Analysis → 🛠️ Admin Commands' below.")
+
+    _other_cmd_total = sum(1 for e in combined_listener_events if e.get("Event Type") == "Other Command")
+    if _other_cmd_total > 0:
+        _other_cmd_names = sorted({e.get("Command") for e in combined_listener_events if e.get("Event Type") == "Other Command" and e.get("Command")})
+        st.warning(f"🆕 **{_other_cmd_total} listener event(s) used a command this analyzer has no specific rule for yet** ({', '.join(_other_cmd_names[:8])}{'...' if len(_other_cmd_names) > 8 else ''}) — still fully captured with all fields, visible under '📡 Listener Log Analysis → 📋 All Listener Events'.")
+
+    _unknown_tns_total = sum(
+        1 for e in combined_listener_events
+        if e.get("Error Code") and e["Error Code"].replace("TNS-", "").zfill(5) not in TNS_ERROR_INFO
+    )
+    if _unknown_tns_total > 0:
+        _unknown_tns_codes = sorted({e["Error Code"] for e in combined_listener_events if e.get("Error Code") and e["Error Code"].replace("TNS-", "").zfill(5) not in TNS_ERROR_INFO})
+        st.warning(f"🆕 **{_unknown_tns_total} error(s) with a TNS/NL/NZ code not in the built-in description dictionary** ({', '.join(_unknown_tns_codes[:8])}{'...' if len(_unknown_tns_codes) > 8 else ''}) — still captured with the raw error line, just without a friendly description. See '📡 Listener Log Analysis → 🚫 Connection Errors'.")
+
 if total_unclassified > 0:
     st.warning(f"🆕 **{total_unclassified} line(s) didn't match any known pattern** — possibly a new/unfamiliar message type. See the '🆕 New/Unclassified' tab below to review.")
 
@@ -1443,9 +2868,13 @@ if mobile_view:
     st.metric("🆕 Unclassified", total_unclassified)
     if asm_source_files:
         st.metric("💽 ASM Events", total_asm_events)
+    if crs_source_files:
+        st.metric("🧬 CRS Events", total_crs_events)
+    if listener_source_files:
+        st.metric("📡 Listener Events", total_listener_events)
 else:
     # Desktop: Horizontal layout
-    ncols = 7 if asm_source_files else 6
+    ncols = 6 + (1 if asm_source_files else 0) + (1 if crs_source_files else 0) + (1 if listener_source_files else 0)
     cols = st.columns(ncols)
     with cols[0]:
         st.metric("📄 Files Uploaded", len(uploaded_files))
@@ -1460,9 +2889,19 @@ else:
         st.metric("🔢 Unique ORA Codes", unique_ora)
     with cols[5]:
         st.metric("🆕 Unclassified", total_unclassified)
+    _next_col = 6
     if asm_source_files:
-        with cols[6]:
+        with cols[_next_col]:
             st.metric("💽 ASM Events", total_asm_events)
+        _next_col += 1
+    if crs_source_files:
+        with cols[_next_col]:
+            st.metric("🧬 CRS Events", total_crs_events)
+        _next_col += 1
+    if listener_source_files:
+        with cols[_next_col]:
+            st.metric("📡 Listener Events", total_listener_events)
+        _next_col += 1
 
 st.markdown("---")
 
@@ -1472,9 +2911,23 @@ with st.expander("🔍 Filters & Search", expanded=False):
     
     with tab1:
         today = date.today()
-        if not df_ora_all.empty and df_ora_all["ParsedTimestamp"].notna().any():
-            min_ts = df_ora_all["ParsedTimestamp"].min()
-            max_ts = df_ora_all["ParsedTimestamp"].max()
+        # Bug fix: this used to look ONLY at df_ora_all for the default date
+        # range. For a listener-only (or ASM/CRS-only) upload with zero ORA
+        # errors, df_ora_all is empty, so the default silently fell back to
+        # "today" — which then filtered EVERY row out of every table below
+        # (Listener Events, Security Alerts, etc.) since the log's real
+        # dates (e.g. Oct 2025) don't match today's date. Quick Stats still
+        # showed correct counts (those are computed before filtering), so
+        # only the tables below looked blank. Now the default range is
+        # taken from whichever categories actually have data.
+        _all_ts_frames = [df_ora_all, df_warn_all, df_kill_all, df_asm_all,
+                           df_crs_all, df_listener_all, df_trace_all]
+        _ts_parts = [f["ParsedTimestamp"].dropna() for f in _all_ts_frames
+                     if not f.empty and "ParsedTimestamp" in f.columns and f["ParsedTimestamp"].notna().any()]
+        if _ts_parts:
+            _all_ts = pd.concat(_ts_parts)
+            min_ts = _all_ts.min()
+            max_ts = _all_ts.max()
             default_start = min_ts.astimezone(LOCAL_TZ).date()
             default_end = max_ts.astimezone(LOCAL_TZ).date()
         else:
@@ -1505,48 +2958,37 @@ def apply_global_date_filter(df, start_dt, end_dt):
     df = df[(df["ParsedTimestamp"] >= start_dt) & (df["ParsedTimestamp"] <= end_dt)]
     return df
 
+def _search_mask(df, columns, q):
+    """Vectorized replacement for the old per-row df.apply(axis=1) scan:
+    case-insensitive substring match across several columns, OR'd together.
+    Same semantics as before, but runs as fast native pandas string ops
+    instead of a slow Python-level function call per row — this matters a
+    lot since it used to re-run on every keystroke in the search box."""
+    mask = pd.Series(False, index=df.index)
+    for col in columns:
+        if col in df.columns:
+            mask = mask | df[col].astype(str).str.lower().str.contains(q, regex=False, na=False)
+    return mask
+
 if search_q:
     q = search_q.lower()
-    df_ora_display = df_ora_all[df_ora_all.apply(lambda r:
-        q in str(r.get("ORA Error","")).lower()
-        or q in str(r.get("Trace File","")).lower()
-        or q in str(r.get("Source","")).lower()
-    , axis=1)].copy()
-    df_warn_display = df_warn_all[df_warn_all.apply(lambda r:
-        q in str(r.get("Warning Message","")).lower()
-        or q in str(r.get("Category","")).lower()
-        or q in str(r.get("Trace File","")).lower()
-        or q in str(r.get("Source","")).lower()
-    , axis=1)].copy()
-    df_kill_display = df_kill_all[df_kill_all.apply(lambda r:
-        q in str(r.get("SID","")).lower()
-        or q in str(r.get("Serial#","")).lower()
-        or q in str(r.get("Reason","")).lower()
-        or q in str(r.get("Requestor","")).lower()
-        or q in str(r.get("Owner","")).lower()
-        or q in str(r.get("Source","")).lower()
-    , axis=1)].copy()
-    df_asm_display = df_asm_all[df_asm_all.apply(lambda r:
-        q in str(r.get("Event Type","")).lower()
-        or q in str(r.get("Diskgroup","")).lower()
-        or q in str(r.get("Detail","")).lower()
-        or q in str(r.get("Source","")).lower()
-    , axis=1)].copy()
-    df_unclassified_display = df_unclassified_all[df_unclassified_all.apply(lambda r:
-        q in str(r.get("Match Type","")).lower()
-        or q in str(r.get("Matched","")).lower()
-        or q in str(r.get("Raw Line","")).lower()
-        or q in str(r.get("Source","")).lower()
-    , axis=1)].copy()
-    df_trace_display = df_trace_all[df_trace_all.apply(lambda r:
-        q in str(r.get("Trace File","")).lower()
-        or q in str(r.get("Source","")).lower()
-    , axis=1)].copy()
+    df_ora_display = df_ora_all[_search_mask(df_ora_all, ["ORA Error", "Trace File", "Source"], q)].copy()
+    df_warn_display = df_warn_all[_search_mask(df_warn_all, ["Warning Message", "Category", "Trace File", "Source"], q)].copy()
+    df_kill_display = df_kill_all[_search_mask(df_kill_all, ["SID", "Serial#", "Reason", "Requestor", "Owner", "Source"], q)].copy()
+    df_asm_display = df_asm_all[_search_mask(df_asm_all, ["Event Type", "Diskgroup", "Detail", "Source"], q)].copy()
+    df_crs_display = df_crs_all[_search_mask(df_crs_all, ["Event Type", "CRS Code", "Component", "Node", "Detail", "Source"], q)].copy()
+    df_listener_display = df_listener_all[_search_mask(df_listener_all, ["Event Type", "Command", "Service", "Client Host", "Client IP", "Program", "User", "Error Code", "Detail", "Source"], q)].copy()
+    df_listener_security_display = df_listener_security_all[_search_mask(df_listener_security_all, ["Alert Type", "Source Host/IP", "Error Codes", "Detail", "Source"], q)].copy()
+    df_unclassified_display = df_unclassified_all[_search_mask(df_unclassified_all, ["Match Type", "Matched", "Raw Line", "Source"], q)].copy()
+    df_trace_display = df_trace_all[_search_mask(df_trace_all, ["Trace File", "Source"], q)].copy()
 else:
     df_ora_display = df_ora_all.copy()
     df_warn_display = df_warn_all.copy()
     df_kill_display = df_kill_all.copy()
     df_asm_display = df_asm_all.copy()
+    df_crs_display = df_crs_all.copy()
+    df_listener_display = df_listener_all.copy()
+    df_listener_security_display = df_listener_security_all.copy()
     df_unclassified_display = df_unclassified_all.copy()
     df_trace_display = df_trace_all.copy()
 
@@ -1554,6 +2996,9 @@ df_ora_display = apply_global_date_filter(df_ora_display, global_start_dt, globa
 df_warn_display = apply_global_date_filter(df_warn_display, global_start_dt, global_end_dt)
 df_kill_display = apply_global_date_filter(df_kill_display, global_start_dt, global_end_dt)
 df_asm_display = apply_global_date_filter(df_asm_display, global_start_dt, global_end_dt)
+df_crs_display = apply_global_date_filter(df_crs_display, global_start_dt, global_end_dt)
+df_listener_display = apply_global_date_filter(df_listener_display, global_start_dt, global_end_dt)
+df_listener_security_display = apply_global_date_filter(df_listener_security_display, global_start_dt, global_end_dt)
 df_unclassified_display = apply_global_date_filter(df_unclassified_display, global_start_dt, global_end_dt)
 df_trace_display = apply_global_date_filter(df_trace_display, global_start_dt, global_end_dt)
 
@@ -1582,13 +3027,9 @@ def filter_instance_events(event_list, search_q, start_dt, end_dt):
 expand_instance = st.session_state.get("voice_action") == "show_stats"
 with st.expander("🗂️ Instance Summary & Events", expanded=expand_instance):
 
-    # Build a clean list of raw lines from uploaded files (no wrapper markers)
-    clean_lines = []
-    for name, lines in per_file_lines.items():
-        clean_lines.extend(lines)
-
-    # Use the improved detector 
-    info = detect_instance_summary_and_events(clean_lines)
+    # Computed once inside the cached build_dashboard_data() pipeline above,
+    # instead of re-scanning every line of every file on every rerun.
+    info = instance_info
 
     st.markdown("#### 🖥️ Instance Information")
     cols = st.columns(3)
@@ -1770,6 +3211,359 @@ if asm_source_files:
                         dg_dist.columns = ["Diskgroup", "Event Count"]
                         st.markdown("#### 💽 Events by Diskgroup")
                         st.dataframe(dg_dist, use_container_width=True)
+
+# ---------------- CRS / Clusterware (Grid Infrastructure) Analysis ----------------
+if crs_source_files:
+    expand_crs = st.session_state.get("voice_action") == "show_crs"
+    with st.expander("🧬 CRS/Clusterware Analysis", expanded=expand_crs):
+        st.markdown("""
+        <div style='background: linear-gradient(135deg, #ff9966 0%, #ff5e62 100%);
+                    padding: 1.5rem; border-radius: 8px; color: white; margin-bottom: 1rem;'>
+            <h4 style='margin: 0 0 0.5rem 0;'>🧬 CRS/Grid Infrastructure Events</h4>
+            <p style='margin: 0; opacity: 0.9;'>Daemon startup/shutdown, node eviction & fencing, OCR/OLR/voting-disk health, agent & resource failures, network issues, and CVU findings</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if df_crs_display.empty:
+            st.success("✅ No CRS/Clusterware events found in selected range/search")
+        else:
+            # ---- CRS Quick Metrics ----
+            crs_type_counts = df_crs_display["Event Type"].value_counts()
+
+            evict_count = crs_type_counts.get("Node Eviction / Fencing", 0)
+            if evict_count > 0:
+                st.error(f"🚨 **{evict_count} node eviction/fencing event(s) detected** — check the Node Eviction & Fencing tab below immediately.")
+
+            ocr_count = crs_type_counts.get("OCR/OLR Critical Failure", 0)
+            if ocr_count > 0:
+                st.error(f"🗄️ **{ocr_count} OCR/OLR/voting-disk critical failure(s) detected** — check the OCR / OLR / Voting tab below immediately.")
+
+            crs_m_cols = st.columns(3) if mobile_view else st.columns(4)
+
+            def _crs_m(idx, label, val):
+                with crs_m_cols[idx % len(crs_m_cols)]:
+                    st.metric(label, int(val))
+
+            _crs_m(0, "🚨 Evictions/Fencing", evict_count)
+            _crs_m(1, "🗄️ OCR/OLR Failures", ocr_count)
+            _crs_m(2, "🟢 Daemon Startups", crs_type_counts.get("Clusterware Startup", 0))
+            _crs_m(3, "🔴 Daemon Shutdowns", crs_type_counts.get("Clusterware Shutdown", 0))
+
+            crs_m_cols2 = st.columns(3) if mobile_view else st.columns(4)
+
+            def _crs_m2(idx, label, val):
+                with crs_m_cols2[idx % len(crs_m_cols2)]:
+                    st.metric(label, int(val))
+
+            _crs_m2(0, "⚙️ Agent/Resource Failures",
+                    crs_type_counts.get("Agent / Resource Failure", 0) + crs_type_counts.get("Resource State Change", 0))
+            _crs_m2(1, "🌐 Network/Interconnect", crs_type_counts.get("Network / Interconnect Issue", 0))
+            _crs_m2(2, "🔍 CVU Findings", crs_type_counts.get("Cluster Verification (CVU) Finding", 0))
+            _crs_m2(3, "🧩 Node Down/Membership",
+                    crs_type_counts.get("Node Down / Membership", 0) + crs_type_counts.get("Server Pool Change", 0))
+
+            generic_err = crs_type_counts.get("CRS Error", 0)
+            generic_warn = crs_type_counts.get("CRS Warning", 0)
+            if generic_err > 0 or generic_warn > 0:
+                crs_m_cols3 = st.columns(2)
+                with crs_m_cols3[0]:
+                    st.metric("🔴 Other CRS Errors (unmapped)", int(generic_err))
+                with crs_m_cols3[1]:
+                    st.metric("🟡 Other CRS Warnings (unmapped)", int(generic_warn))
+
+            crs_tab_labels = [
+                "🚨 Node Eviction & Fencing", "🗄️ OCR / OLR / Voting", "🔄 Startup / Shutdown",
+                "⚙️ Agent & Resource Failures", "🌐 Network / Interconnect",
+                "🔍 CVU Findings", "🧩 Membership / Time Sync / ACFS", "📋 All CRS Events"
+            ]
+            crs_tabs = st.tabs(crs_tab_labels)
+
+            def _show_crs_subset(event_types, empty_msg):
+                sub = df_crs_display[df_crs_display["Event Type"].isin(event_types)]
+                if sub.empty:
+                    st.info(empty_msg)
+                else:
+                    st.dataframe(
+                        sub.drop(columns=["ParsedTimestamp"], errors="ignore"),
+                        use_container_width=True
+                    )
+
+            with crs_tabs[0]:
+                _show_crs_subset(
+                    ["Node Eviction / Fencing"],
+                    "✅ No node eviction/fencing events found"
+                )
+            with crs_tabs[1]:
+                _show_crs_subset(
+                    ["OCR/OLR Critical Failure"],
+                    "✅ No OCR/OLR/voting-disk failures found"
+                )
+            with crs_tabs[2]:
+                _show_crs_subset(
+                    ["Clusterware Startup", "Clusterware Shutdown"],
+                    "✅ No daemon startup/shutdown events found"
+                )
+            with crs_tabs[3]:
+                _show_crs_subset(
+                    ["Agent / Resource Failure", "Resource State Change"],
+                    "✅ No agent/resource failure events found"
+                )
+            with crs_tabs[4]:
+                _show_crs_subset(
+                    ["Network / Interconnect Issue"],
+                    "✅ No network/interconnect issues found"
+                )
+            with crs_tabs[5]:
+                st.caption(
+                    "Cluster Verification Utility (CVU) findings — pre-requisite and configuration checks "
+                    "(PRVG/PRVF/PRCT/... codes) that CRS-10051 surfaces. These are diagnostic/config issues, "
+                    "not always active failures, but worth reviewing."
+                )
+                _show_crs_subset(
+                    ["Cluster Verification (CVU) Finding"],
+                    "✅ No CVU findings recorded"
+                )
+            with crs_tabs[6]:
+                st.caption(
+                    "Node membership/server-pool changes, Cluster Time Synchronization Service state, "
+                    "and ACFS/AFD driver messages — useful correlation signals around cluster stability."
+                )
+                _show_crs_subset(
+                    ["Node Down / Membership", "Server Pool Change", "Time Sync Service", "ACFS / AFD Driver"],
+                    "✅ No membership/time-sync/ACFS events found"
+                )
+            with crs_tabs[7]:
+                st.dataframe(
+                    df_crs_display.drop(columns=["ParsedTimestamp"], errors="ignore"),
+                    use_container_width=True
+                )
+
+                st.markdown("#### 📊 CRS Event Distribution")
+                crs_dist = df_crs_display["Event Type"].value_counts().reset_index()
+                crs_dist.columns = ["Event Type", "Count"]
+                st.dataframe(crs_dist, use_container_width=True)
+
+                if not df_crs_display.empty:
+                    code_dist = df_crs_display[df_crs_display["CRS Code"] != "-"]["CRS Code"].value_counts().reset_index()
+                    if not code_dist.empty:
+                        code_dist.columns = ["CRS Code", "Event Count"]
+                        st.markdown("#### 🔢 Events by CRS Code")
+                        st.dataframe(code_dist.head(30), use_container_width=True)
+
+                    node_dist = df_crs_display[df_crs_display["Node"] != "-"]["Node"].value_counts().reset_index()
+                    if not node_dist.empty:
+                        node_dist.columns = ["Node", "Event Count"]
+                        st.markdown("#### 🖥️ Events by Node")
+                        st.dataframe(node_dist, use_container_width=True)
+
+# ---------------- Listener Log Analysis ----------------
+if listener_source_files:
+    expand_listener = st.session_state.get("voice_action") == "show_listener"
+    with st.expander("📡 Listener Log Analysis", expanded=expand_listener):
+        st.markdown("""
+        <div style='background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%);
+                    padding: 1.5rem; border-radius: 8px; color: white; margin-bottom: 1rem;'>
+            <h4 style='margin: 0 0 0.5rem 0;'>📡 TNS Listener Events</h4>
+            <p style='margin: 0; opacity: 0.9;'>Connections, service registration/health, status polls, admin commands, TNS errors & security alerts</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if df_listener_display.empty:
+            st.success("✅ No listener events found in selected range/search")
+        else:
+            # ---- Listener Quick Metrics ----
+            lsnr_type_counts = df_listener_display["Event Type"].value_counts()
+
+            repeat_fail_count = int((df_listener_security_display["Alert Type"] == "Repeated Connection Failures From Single Source").sum()) if not df_listener_security_display.empty else 0
+            if repeat_fail_count > 0:
+                st.error(f"🚨 **{repeat_fail_count} source(s) with repeated connection failures** — check the 🛡️ Security Alerts tab below immediately.")
+
+            svc_died_count = lsnr_type_counts.get("Service Died", 0)
+            if svc_died_count > 0:
+                st.error(f"💀 **{svc_died_count} 'service_died' event(s)** — a service lost its listener registration. Check 💀 Service Health below.")
+
+            auth_fail_count = lsnr_type_counts.get("Authentication Failure", 0)
+            if auth_fail_count > 0:
+                st.error(f"🔐 **{auth_fail_count} authentication failure(s) (TNS-01189)** — check 🛡️ Security Alerts below immediately.")
+
+            lsnr_m_cols = st.columns(3) if mobile_view else st.columns(5)
+
+            def _lsnr_m(idx, label, val):
+                with lsnr_m_cols[idx % len(lsnr_m_cols)]:
+                    st.metric(label, int(val))
+
+            acl_denied_count = lsnr_type_counts.get("Access Denied (ACL)", 0)
+
+            _lsnr_m(0, "✅ Established", lsnr_type_counts.get("Connection Established", 0))
+            _lsnr_m(1, "🚫 Refused/Error", lsnr_type_counts.get("Connection Refused/Error", 0))
+            _lsnr_m(2, "🔎 Unknown Service/SID", lsnr_type_counts.get("Unknown Service/SID Requested", 0))
+            _lsnr_m(3, "🔐 Auth Failures", auth_fail_count)
+            _lsnr_m(4, "⛔ ACL Denied", acl_denied_count)
+
+            lsnr_m_cols2 = st.columns(3) if mobile_view else st.columns(4)
+
+            def _lsnr_m2(idx, label, val):
+                with lsnr_m_cols2[idx % len(lsnr_m_cols2)]:
+                    st.metric(label, int(val))
+
+            _lsnr_m2(0, "🔄 Service Updates", lsnr_type_counts.get("Service Update", 0))
+            _lsnr_m2(1, "📝 Service Registered", lsnr_type_counts.get("Service Registered", 0))
+            _lsnr_m2(2, "💀 Service Died", svc_died_count)
+            _lsnr_m2(3, "📶 Status Checks", lsnr_type_counts.get("Status Check", 0))
+
+            admin_count = lsnr_type_counts.get("Listener Stop Command", 0) + lsnr_type_counts.get("Listener Reload Command", 0) + lsnr_type_counts.get("Admin Command", 0)
+            if admin_count > 0 or repeat_fail_count > 0:
+                lsnr_m_cols3 = st.columns(2)
+                with lsnr_m_cols3[0]:
+                    st.metric("🛠️ Admin Commands (stop/reload/etc)", int(admin_count))
+                with lsnr_m_cols3[1]:
+                    st.metric("🛡️ Security Alerts", int(len(df_listener_security_display)))
+
+            listener_tab_labels = [
+                "🚫 Connection Errors", "✅ Established Connections", "💀 Service Health",
+                "📶 Status / Registration", "🛠️ Admin Commands", "🛡️ Security Alerts",
+                "🆕 Other / New Commands", "📋 All Listener Events"
+            ]
+            listener_tabs = st.tabs(listener_tab_labels)
+
+            def _show_listener_subset(event_types, empty_msg, df_source=None):
+                src = df_source if df_source is not None else df_listener_display
+                sub = src[src["Event Type"].isin(event_types)]
+                if sub.empty:
+                    st.info(empty_msg)
+                else:
+                    st.dataframe(
+                        sub.drop(columns=["ParsedTimestamp"], errors="ignore"),
+                        use_container_width=True
+                    )
+
+            with listener_tabs[0]:
+                st.caption(
+                    "Every refused/failed connection attempt, with the TNS-nnnnn error code and description "
+                    "attached. Includes 'unknown service/SID' probing, ACL/firewall-level rejections, and "
+                    "malformed/unauthenticated connect attempts."
+                )
+                _show_listener_subset(
+                    ["Connection Refused/Error", "Unknown Service/SID Requested", "Authentication Failure", "Access Denied (ACL)"],
+                    "✅ No connection errors found"
+                )
+                if not df_listener_display.empty:
+                    err_sub = df_listener_display[df_listener_display["Event Type"].isin(
+                        ["Connection Refused/Error", "Unknown Service/SID Requested", "Authentication Failure", "Access Denied (ACL)"])]
+                    if not err_sub.empty and "Error Code" in err_sub.columns:
+                        code_dist = err_sub[err_sub["Error Code"].notna()]["Error Code"].value_counts().reset_index()
+                        if not code_dist.empty:
+                            code_dist.columns = ["Error Code", "Count"]
+                            st.markdown("#### 🔢 Errors by TNS Code")
+                            st.dataframe(code_dist, use_container_width=True)
+                        ip_dist = err_sub[err_sub["Client IP"] != "-"]["Client IP"].value_counts().reset_index()
+                        if not ip_dist.empty:
+                            ip_dist.columns = ["Client IP", "Failed Attempts"]
+                            st.markdown("#### 🌐 Errors by Source IP")
+                            st.dataframe(ip_dist.head(30), use_container_width=True)
+
+            with listener_tabs[1]:
+                _show_listener_subset(["Connection Established"], "✅ No established connections in this range")
+                if not df_listener_display.empty:
+                    est_sub = df_listener_display[df_listener_display["Event Type"] == "Connection Established"]
+                    if not est_sub.empty:
+                        svc_dist = est_sub[est_sub["Service"] != "-"]["Service"].value_counts().reset_index()
+                        if not svc_dist.empty:
+                            svc_dist.columns = ["Service", "Connections"]
+                            st.markdown("#### 🧩 Connections by Service")
+                            st.dataframe(svc_dist, use_container_width=True)
+
+            with listener_tabs[2]:
+                st.caption(
+                    "service_update (routine PMON heartbeat), service_register (new service handler registered), "
+                    "and service_died (a service LOST its registration — worth investigating if unexpected)."
+                )
+                _show_listener_subset(
+                    ["Service Update", "Service Registered", "Service Died"],
+                    "✅ No service health events found"
+                )
+
+            with listener_tabs[3]:
+                _show_listener_subset(
+                    ["Status Check", "Listener Startup"],
+                    "✅ No status-check/startup events found"
+                )
+
+            with listener_tabs[4]:
+                st.caption(
+                    "lsnrctl administrative/control commands — STOP and RELOAD get their own event types since "
+                    "they change listener availability; verify these were planned maintenance."
+                )
+                _show_listener_subset(
+                    ["Listener Stop Command", "Listener Reload Command", "Admin Command"],
+                    "✅ No admin/control commands found"
+                )
+
+            with listener_tabs[5]:
+                st.caption(
+                    "Higher-signal alerts built on top of the raw events: repeated failures from one source "
+                    "(possible scanning/unauthorized probing), authentication failures, unknown service/SID "
+                    "requests, service_died events, and listener STOP/RELOAD commands."
+                )
+                if df_listener_security_display.empty:
+                    st.success("✅ No security-relevant alerts found in selected range/search")
+                else:
+                    st.dataframe(
+                        df_listener_security_display.drop(columns=["ParsedTimestamp"], errors="ignore")
+                        .sort_values("Occurrences", ascending=False, kind="stable"),
+                        use_container_width=True
+                    )
+                    alert_dist = df_listener_security_display["Alert Type"].value_counts().reset_index()
+                    alert_dist.columns = ["Alert Type", "Count"]
+                    st.markdown("#### 📊 Security Alerts by Type")
+                    st.dataframe(alert_dist, use_container_width=True)
+
+            with listener_tabs[6]:
+                st.caption(
+                    "Lines that matched the listener line shape but used a command word this analyzer has "
+                    "no specific rule for yet (e.g. a new lsnrctl sub-command in a future Oracle version), "
+                    "PLUS any TNS/NL/NZ error code not in the built-in description dictionary. Nothing here "
+                    "is dropped — every field (timestamp, client host/IP, program, service, raw line) is "
+                    "still fully captured; it just doesn't have a friendly category/description yet. Use "
+                    "this tab to spot genuinely new patterns first."
+                )
+                other_cmd_sub = df_listener_display[df_listener_display["Event Type"] == "Other Command"]
+                unknown_tns_sub = df_listener_display[
+                    df_listener_display["Error Code"].notna()
+                    & ~df_listener_display["Error Code"].apply(lambda c: str(c).replace("TNS-", "").zfill(5) in TNS_ERROR_INFO)
+                ] if "Error Code" in df_listener_display.columns else df_listener_display.iloc[0:0]
+                new_sub = pd.concat([other_cmd_sub, unknown_tns_sub]).drop_duplicates()
+                if new_sub.empty:
+                    st.success("✅ Nothing new — every event matched a known command and every error matched a known TNS/NL/NZ code")
+                else:
+                    st.dataframe(new_sub.drop(columns=["ParsedTimestamp"], errors="ignore"), use_container_width=True)
+                    if not other_cmd_sub.empty:
+                        st.markdown("#### 🆕 Unrecognized Commands")
+                        _oc = other_cmd_sub["Command"].value_counts().reset_index()
+                        _oc.columns = ["Command", "Count"]
+                        st.dataframe(_oc, use_container_width=True)
+                    if not unknown_tns_sub.empty:
+                        st.markdown("#### 🆕 Unrecognized TNS/NL/NZ Codes")
+                        _ut = unknown_tns_sub["Error Code"].value_counts().reset_index()
+                        _ut.columns = ["Error Code", "Count"]
+                        st.dataframe(_ut, use_container_width=True)
+
+            with listener_tabs[7]:
+                st.dataframe(
+                    df_listener_display.drop(columns=["ParsedTimestamp"], errors="ignore"),
+                    use_container_width=True
+                )
+
+                st.markdown("#### 📊 Listener Event Distribution")
+                lsnr_dist = df_listener_display["Event Type"].value_counts().reset_index()
+                lsnr_dist.columns = ["Event Type", "Count"]
+                st.dataframe(lsnr_dist, use_container_width=True)
+
+                prog_dist = df_listener_display[df_listener_display["Program"] != "-"]["Program"].value_counts().reset_index()
+                if not prog_dist.empty:
+                    prog_dist.columns = ["Client Program", "Event Count"]
+                    st.markdown("#### 💻 Events by Client Program")
+                    st.dataframe(prog_dist.head(30), use_container_width=True)
 
 # ---------------- ORA Errors & Warnings Tabs ----------------
 expand_errors_tab = st.session_state.get("voice_action") == "show_errors"
@@ -2150,8 +3944,10 @@ with st.expander("🔄 Compare Two Uploaded Logs", expanded=False):
 
         if st.button("🔍 Run Compare", use_container_width=True):
             with st.spinner("Comparing logs..."):
-                ora_a, warn_a, kill_a, trace_a, _u_a = analyze_alert_log_lines(per_file_lines[file_a], source_name=file_a)
-                ora_b, warn_b, kill_b, trace_b, _u_b = analyze_alert_log_lines(per_file_lines[file_b], source_name=file_b)
+                # Reuse the ORA rows already parsed once in build_dashboard_data()
+                # above instead of re-running the parser on these files again.
+                ora_a = [e for e in combined_ora if e.get("Source") == file_a]
+                ora_b = [e for e in combined_ora if e.get("Source") == file_b]
                 comp = compare_two_parsed_lists(ora_a, ora_b)
             
             st.markdown("#### 📊 Counts by ORA Error (A vs B)")
@@ -2268,9 +4064,48 @@ Alert Log Extract:
                     st.markdown("</div>", unsafe_allow_html=True)
 
 # ---------------- Download Section ----------------
+@st.cache_data(show_spinner=False, max_entries=4)
+def _build_excel_report(df_ora, df_warn, df_kill, df_asm, df_crs, df_listener, df_listener_sec, df_unclassified, df_trace):
+    """Builds the full multi-sheet Excel workbook. Cached on the content of
+    the underlying DataFrames, so it's only rebuilt when the parsed data
+    actually changes — not on every rerun caused by an unrelated widget
+    (search box, date filter, tab click, etc.), which is what made opening
+    this section (and just using the app in general) slow before."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        if not df_ora.empty:
+            strip_tz_for_excel(df_ora).to_excel(writer, index=False, sheet_name="ORA_Errors")
+
+        if not df_warn.empty:
+            strip_tz_for_excel(df_warn).to_excel(writer, index=False, sheet_name="Warnings")
+
+        if not df_kill.empty:
+            strip_tz_for_excel(df_kill).to_excel(writer, index=False, sheet_name="Kill_Sessions")
+
+        if not df_asm.empty:
+            strip_tz_for_excel(df_asm).to_excel(writer, index=False, sheet_name="ASM_Events")
+
+        if not df_crs.empty:
+            strip_tz_for_excel(df_crs).to_excel(writer, index=False, sheet_name="CRS_Events")
+
+        if not df_listener.empty:
+            strip_tz_for_excel(df_listener).to_excel(writer, index=False, sheet_name="Listener_Events")
+
+        if not df_listener_sec.empty:
+            strip_tz_for_excel(df_listener_sec).to_excel(writer, index=False, sheet_name="Listener_Security_Alerts")
+
+        if not df_unclassified.empty:
+            strip_tz_for_excel(df_unclassified).to_excel(writer, index=False, sheet_name="Unclassified_New")
+
+        if not df_trace.empty:
+            strip_tz_for_excel(df_trace).to_excel(writer, index=False, sheet_name="Trace_Files")
+
+    return buf.getvalue()
+
+
 expand_download = st.session_state.get("voice_action") == "export"
 with st.expander("💾 Download Parsed Results", expanded=expand_download):
-    if (not combined_ora) and (not combined_warnings) and (not combined_kill_sessions) and (not combined_asm_events) and (not combined_trace_files):
+    if (not combined_ora) and (not combined_warnings) and (not combined_kill_sessions) and (not combined_asm_events) and (not combined_crs_events) and (not combined_listener_events) and (not combined_trace_files):
         st.info("🔭 No parsed data to download")
     else:
         st.markdown("""
@@ -2280,75 +4115,16 @@ with st.expander("💾 Download Parsed Results", expanded=expand_download):
             <p style='margin: 0; opacity: 0.9;'>Download complete parsed results in Excel format</p>
         </div>
         """, unsafe_allow_html=True)
-        
-        # Create separate sheets for better organization
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-            if not df_ora_all.empty:
-                df_ora_export = df_ora_all.copy()
-                # Convert timestamps for Excel compatibility
-                for col in df_ora_export.columns:
-                    if ptypes.is_datetime64_any_dtype(df_ora_export[col]):
-                        try:
-                            df_ora_export[col] = df_ora_export[col].dt.tz_localize(None)
-                        except:
-                            pass
-                df_ora_export.to_excel(writer, index=False, sheet_name="ORA_Errors")
-            
-            if not df_warn_all.empty:
-                df_warn_export = df_warn_all.copy()
-                for col in df_warn_export.columns:
-                    if ptypes.is_datetime64_any_dtype(df_warn_export[col]):
-                        try:
-                            df_warn_export[col] = df_warn_export[col].dt.tz_localize(None)
-                        except:
-                            pass
-                df_warn_export.to_excel(writer, index=False, sheet_name="Warnings")
-            
-            if not df_kill_all.empty:
-                df_kill_export = df_kill_all.copy()
-                for col in df_kill_export.columns:
-                    if ptypes.is_datetime64_any_dtype(df_kill_export[col]):
-                        try:
-                            df_kill_export[col] = df_kill_export[col].dt.tz_localize(None)
-                        except:
-                            pass
-                df_kill_export.to_excel(writer, index=False, sheet_name="Kill_Sessions")
 
-            if not df_asm_all.empty:
-                df_asm_export = df_asm_all.copy()
-                for col in df_asm_export.columns:
-                    if ptypes.is_datetime64_any_dtype(df_asm_export[col]):
-                        try:
-                            df_asm_export[col] = df_asm_export[col].dt.tz_localize(None)
-                        except:
-                            pass
-                df_asm_export.to_excel(writer, index=False, sheet_name="ASM_Events")
-
-            if not df_unclassified_all.empty:
-                df_unclassified_export = df_unclassified_all.copy()
-                for col in df_unclassified_export.columns:
-                    if ptypes.is_datetime64_any_dtype(df_unclassified_export[col]):
-                        try:
-                            df_unclassified_export[col] = df_unclassified_export[col].dt.tz_localize(None)
-                        except:
-                            pass
-                df_unclassified_export.to_excel(writer, index=False, sheet_name="Unclassified_New")
-
-            if not df_trace_all.empty:
-                df_trace_export = df_trace_all.copy()
-                for col in df_trace_export.columns:
-                    if ptypes.is_datetime64_any_dtype(df_trace_export[col]):
-                        try:
-                            df_trace_export[col] = df_trace_export[col].dt.tz_localize(None)
-                        except:
-                            pass
-                df_trace_export.to_excel(writer, index=False, sheet_name="Trace_Files")
+        excel_bytes = _build_excel_report(
+            df_ora_all, df_warn_all, df_kill_all, df_asm_all, df_crs_all,
+            df_listener_all, df_listener_security_all, df_unclassified_all, df_trace_all,
+        )
 
         filename = f"parsed_alert_log_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
         st.download_button(
             "📥 Download Excel Report", 
-            data=buf.getvalue(), 
+            data=excel_bytes, 
             file_name=filename, 
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
