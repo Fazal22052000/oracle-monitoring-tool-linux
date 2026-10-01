@@ -4996,6 +4996,54 @@ app.get('/api/oracle/rac', async (req, res) => {
       ).catch(() => []);
     } catch(_) { waitSummary = []; }
 
+    // ── ASM Disk Group Capacity ──────────────────────────────────────
+    // Errors are surfaced (asmError) instead of swallowed so the panel can tell
+    // "database does not use ASM" apart from "missing privilege / view error".
+    let asmDiskgroups = [], asmError = null;
+    {
+      const asmSql = (view) =>
+        `SELECT GROUP_NUMBER, NAME, TYPE, STATE, OFFLINE_DISKS,
+                TOTAL_MB, FREE_MB, USABLE_FILE_MB,
+                ROUND(((TOTAL_MB - FREE_MB) / NULLIF(TOTAL_MB, 0)) * 100, 2) AS PERCENT_USED
+         FROM ${view}
+         ORDER BY NAME`;
+      try {
+        asmDiskgroups = await query(asmSql('V$ASM_DISKGROUP'));
+      } catch (e1) {
+        try { asmDiskgroups = await query(asmSql('V$ASM_DISKGROUP_STAT')); }
+        catch (e2) { asmError = e2.message || e1.message; }
+      }
+    }
+
+    // ── Active Services (GV$ACTIVE_SERVICES) ─────────────────────────
+    // NOTE: GV$ACTIVE_SERVICES has no SERVICE_ID column (that lives in
+    // GV$SERVICES), so NAME_HASH is used as the numeric identifier instead.
+    let services = [], servicesError = null;
+    {
+      const svcBase = (extraCols) =>
+        `SELECT INST_ID, NAME_HASH, NAME AS SERVICE_NAME, NETWORK_NAME,
+                TO_CHAR(CREATION_DATE, 'YYYY-MM-DD HH24:MI:SS') AS CREATION_DATE${extraCols}
+         FROM GV$ACTIVE_SERVICES
+         WHERE NAME NOT LIKE 'SYS%'
+         ORDER BY NAME, INST_ID`;
+      try {
+        services = await query(svcBase(', GOAL, CLB_GOAL'));
+      } catch (e1) {
+        try { services = await query(svcBase('')); }
+        catch (e2) { servicesError = e2.message; }
+      }
+    }
+
+    // ── Cluster interconnect (used to pre-fill the traceroute check) ──
+    let interconnects = [];
+    if (isRAC) {
+      interconnects = await query(
+        `SELECT INST_ID, NAME, IP_ADDRESS, IS_PUBLIC, SOURCE
+         FROM GV$CLUSTER_INTERCONNECTS
+         ORDER BY INST_ID, NAME`
+      ).catch(() => []);
+    }
+
     res.json({
       isRAC,
       clusterName,
@@ -5008,6 +5056,11 @@ app.get('/api/oracle/rac', async (req, res) => {
       dlmLocks,
       throughput,
       waitSummary,
+      asmDiskgroups,
+      asmError,
+      services,
+      servicesError,
+      interconnects,
       nodeCount: instances.length,
     });
 
@@ -7108,6 +7161,364 @@ app.post('/api/os/ssh-exec', (req, res) => {
       console.warn(`[os/ssh-exec] connection error: ${err.message}`);
       reply(502, { error: 'SSH connection failed: ' + err.message });
     });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  RAC CLUSTERWARE / NETWORK CHECKS (over SSH)
+//
+//  POST /api/oracle/rac/cluster-check
+//  Body: { check, host, port?, user, password? | privateKey?, params? }
+//        params: { dbName?, nodeName?, iface?, targetIp?, gridHome? }
+//
+//  SECURITY: this endpoint does NOT execute caller-supplied commands.  The
+//  caller picks a check ID from the fixed whitelist below; every parameter is
+//  validated against a strict pattern and single-quoted before being placed in
+//  the command line.  All whitelisted commands are read-only.
+// ═══════════════════════════════════════════════════════════════════════════════
+const _RAC_RX = {
+  host : /^[A-Za-z0-9_.:-]{1,253}$/,
+  user : /^[A-Za-z0-9_.-]{1,64}$/,
+  name : /^[A-Za-z0-9_.$-]{1,128}$/,
+  iface: /^[A-Za-z0-9_.-]{1,32}$/,
+  ipv4 : /^(25[0-5]|2[0-4]\d|1?\d?\d)(\.(25[0-5]|2[0-4]\d|1?\d?\d)){3}$/,
+  ipv6 : /^(?=.*:)[0-9A-Fa-f:]{2,45}$/,
+  path : /^\/[A-Za-z0-9_\/.+-]{1,200}$/,
+};
+const _racQ = v => "'" + String(v).replace(/'/g, "'\\''") + "'";
+
+const _RAC_CHECKS = {
+  crs_check:     { secs: 30,  need: [],                    build: ()  => 'crsctl check crs' },
+  cluster_all:   { secs: 60,  need: [],                    build: ()  => 'crsctl check cluster -all' },
+  crs_res:       { secs: 60,  need: [],                    build: ()  => 'crsctl stat res -t' },
+  init_res:      { secs: 60,  need: [],                    build: ()  => 'crsctl stat res -init -t' },
+  votedisk:      { secs: 30,  need: [],                    build: ()  => 'crsctl query css votedisk' },
+  // Chain: (1) crsctl check ctss  ->  (2) ora.ctssd init resource  ->  (3) cluvfy comp clocksync.
+  // Grid 23ai rejects (1) ("'ctss' is an invalid argument") and has no ora.ctssd resource (CRS-2613), so (3) answers it.
+  ctss:          { secs: 120, need: [],                    build: ()  => 'crsctl check ctss',
+                   buildFull: () =>
+                     'OUT=$($T crsctl check ctss 2>&1); RC=$?\n' +
+                     'if [ $RC -ne 0 ] && echo "$OUT" | grep -qi "invalid argument"; then\n' +
+                     '  echo "# \'crsctl check ctss\' is not supported by this Grid version - using: crsctl stat res ora.ctssd -init -t"\n' +
+                     '  OUT2=$($T crsctl stat res ora.ctssd -init -t 2>&1); RC2=$?\n' +
+                     '  if echo "$OUT2" | grep -q "CRS-2613"; then\n' +
+                     '    echo "$OUT2"\n' +
+                     '    echo "# ora.ctssd does not exist in this Grid version - using: cluvfy comp clocksync -n all -verbose"\n' +
+                     '    $T cluvfy comp clocksync -n all -verbose; exit $?\n' +
+                     '  fi\n' +
+                     '  echo "$OUT2"; exit $RC2\n' +
+                     'else\n' +
+                     '  echo "$OUT"; exit $RC\n' +
+                     'fi' },
+  db_status:     { secs: 30,  need: ['dbName'],            build: p   => `srvctl status database -d ${_racQ(p.dbName)}` },
+  scan:          { secs: 30,  need: [],                    build: ()  => 'srvctl status scan' },
+  scan_listener: { secs: 30,  need: [],                    build: ()  => 'srvctl status scan_listener' },
+  vip:           { secs: 30,  need: ['nodeName'],          build: p   => `srvctl status vip -node ${_racQ(p.nodeName)}` },
+  svc_status:    { secs: 30,  need: ['dbName'],            build: p   => `srvctl status service -d ${_racQ(p.dbName)}` },
+  db_config:     { secs: 30,  need: ['dbName'],            build: p   => `srvctl config database -d ${_racQ(p.dbName)}` },
+  // -n numeric, -m 5 max hops, -w 2 s per probe: bounded so an unreachable peer cannot hang for minutes.
+  traceroute:    { secs: 45,  need: ['iface', 'targetIp'], build: p   => `traceroute -n -m 5 -w 2 -i ${_racQ(p.iface)} ${_racQ(p.targetIp)}`,
+                   // Binding to a device (-i / ping -I <iface>) needs root or CAP_NET_RAW on many kernels. When the OS says
+                   // "Operation not permitted" we retry with the interface's own IPv4 address as the SOURCE address
+                   // (no privilege needed). The tool falls back to ping when traceroute is not installed.
+                   buildFull: p =>
+                     `IFACE=${_racQ(p.iface)}; TGT=${_racQ(p.targetIp)}\n` +
+                     'PFX=$(echo "$TGT" | cut -d. -f1-2)\n' +
+                     'if command -v traceroute >/dev/null 2>&1; then\n' +
+                     '  TOOL="traceroute -n -m 5 -w 2"; BIND="-i"; SRCOPT="-s"\n' +
+                     'else\n' +
+                     '  echo "# traceroute is not installed on this host - using ping over the same interface instead"\n' +
+                     '  TOOL="ping -n -c 3 -W 2"; BIND="-I"; SRCOPT="-I"\n' +
+                     'fi\n' +
+                     'OUT=$($T $TOOL $BIND "$IFACE" "$TGT" 2>&1); RC=$?\n' +
+                     'if [ $RC -ne 0 ] && echo "$OUT" | grep -qi "not permitted"; then\n' +
+                     '  CAND=$(ip -o -4 addr show dev "$IFACE" 2>/dev/null | awk \'{print $4}\' | cut -d/ -f1)\n' +
+                     '  SRC=$(echo "$CAND" | grep "^$PFX[.]" | head -1); [ -z "$SRC" ] && SRC=$(echo "$CAND" | head -1)\n' +
+                     '  if [ -n "$SRC" ]; then\n' +
+                     '    echo "# binding to interface $IFACE needs extra privileges - using its source address $SRC instead"\n' +
+                     '    $T $TOOL $SRCOPT "$SRC" "$TGT"; exit $?\n' +
+                     '  fi\n' +
+                     'fi\n' +
+                     'echo "$OUT"; exit $RC' },
+  // Heavy: probes every node. Needs passwordless SSH equivalence between nodes for the grid owner.
+  nodecon:       { secs: 300, need: [],                    build: ()  => 'cluvfy comp nodecon -n all -verbose' },
+};
+
+function _racValidateParams(def, raw) {
+  const p = {};
+  // Only look at the parameters this check actually uses (+ the optional Grid Home), so a value that is
+  // irrelevant to it (e.g. the VIP node list on 'crsctl check crs') can never make it fail.
+  const src = raw || {};
+  const r = { gridHome: src.gridHome };
+  for (const k of def.need) r[k] = src[k];
+  if (r.dbName   != null && r.dbName   !== '') { if (!_RAC_RX.name.test(r.dbName))     throw new Error('dbName has invalid characters');   p.dbName   = String(r.dbName); }
+  if (r.nodeName != null && r.nodeName !== '') { if (!_RAC_RX.name.test(r.nodeName))   throw new Error('nodeName has invalid characters'); p.nodeName = String(r.nodeName); }
+  if (r.iface    != null && r.iface    !== '') { if (!_RAC_RX.iface.test(r.iface))     throw new Error('iface has invalid characters');    p.iface    = String(r.iface); }
+  if (r.targetIp != null && r.targetIp !== '') {
+    if (!_RAC_RX.ipv4.test(r.targetIp) && !_RAC_RX.ipv6.test(r.targetIp)) throw new Error('targetIp is not a valid IP address');
+    p.targetIp = String(r.targetIp);
+  }
+  if (r.gridHome != null && r.gridHome !== '') { if (!_RAC_RX.path.test(r.gridHome) || r.gridHome.includes('..')) throw new Error('gridHome must be an absolute path'); p.gridHome = String(r.gridHome); }
+  for (const k of def.need) if (!p[k]) throw new Error(`Missing required parameter: ${k}`);
+  return p;
+}
+
+// Locates the Grid Infrastructure home (crsctl / srvctl / cluvfy live there, NOT in the DB home),
+// in order: explicit override → /etc/oracle/olr.loc → +ASM entry in /etc/oratab → running ocssd.bin.
+function _racPreamble(gridHome) {
+  return [
+    '{ [ -f "$HOME/.bash_profile" ] && . "$HOME/.bash_profile"; } >/dev/null 2>&1',
+    '{ [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"; } >/dev/null 2>&1',
+    'GRID_HOME=' + (gridHome ? _racQ(gridHome) : '""'),
+    '[ -z "$GRID_HOME" ] && [ -r /etc/oracle/olr.loc ] && GRID_HOME=$(sed -n "s/^crs_home=//p" /etc/oracle/olr.loc | head -1)',
+    '[ -z "$GRID_HOME" ] && [ -r /etc/oratab ] && GRID_HOME=$(awk -F: \'/^[+]ASM/ {print $2; exit}\' /etc/oratab)',
+    '[ -z "$GRID_HOME" ] && GRID_HOME=$(ps -eo args 2>/dev/null | awk \'/[o]cssd[.]bin/ {p=$1; sub("/bin/ocssd[.]bin$","",p); print p; exit}\')',
+    'if [ -n "$GRID_HOME" ] && [ -d "$GRID_HOME/bin" ]; then export ORACLE_HOME="$GRID_HOME"; export PATH="$GRID_HOME/bin:$PATH"; fi',
+    'export PATH="$PATH:/usr/sbin:/sbin"',
+    'echo "@@GRID_HOME=${GRID_HOME}@@"',
+  ].join('\n');
+}
+
+// One command over a pooled SSH connection, with a hard timeout and one retry on a stale pooled channel.
+async function _sshRunPooled({ user, host, port, password, privateKey, cmd, timeoutMs }) {
+  const key = _sshPoolKey(user, host, port);
+  const MAX_OUT = 512 * 1024;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const conn = await _sshPoolGet(user, host, port, password, privateKey);
+    try {
+      return await new Promise((resolve, reject) => {
+        let out = '', errb = '', settled = false, stream = null;
+        const timer = setTimeout(() => {
+          if (settled) return; settled = true;
+          try { if (stream) stream.close(); } catch (_) {}
+          reject(Object.assign(new Error(`timed out after ${Math.round(timeoutMs / 1000)}s`), { isTimeout: true }));
+        }, timeoutMs);
+        conn.exec(cmd, (err, s) => {
+          if (settled) { if (s) try { s.close(); } catch (_) {} return; }
+          if (err) { settled = true; clearTimeout(timer); return reject(err); }
+          stream = s;
+          s.on('data', d => { if (out.length < MAX_OUT) out += d.toString('utf8'); });
+          s.stderr.on('data', d => { if (errb.length < MAX_OUT) errb += d.toString('utf8'); });
+          s.on('close', code => { if (settled) return; settled = true; clearTimeout(timer); resolve({ stdout: out, stderr: errb, code: code ?? -1 }); });
+        });
+      });
+    } catch (e) {
+      if (attempt === 0 && /channel open failure|open failed/i.test(e.message)) {
+        try { conn.end(); } catch (_) {}
+        _sshPool.delete(key);
+        continue;
+      }
+      throw e;
+    } finally {
+      _sshPoolRelease(key);
+    }
+  }
+}
+
+// Heuristic classification of raw output → ok | warn | fail | info.  The raw output is always returned
+// as well, so the UI never hides anything; this only drives the coloured badge.
+function _racClassify(id, stdout, stderr, code, params) {
+  const out = stdout || '', err = stderr || '', all = out + '\n' + err;
+  const count = (re, src) => (((src ?? out).match(re)) || []).length;
+
+  if (code === 124 || code === 137) return { status: 'fail', summary: 'Command timed out on the remote host' };
+  if (code === 127 || /command not found|: not found|No such file or directory/i.test(err) && code !== 0) {
+    const tool = id === 'traceroute' ? 'traceroute (install the "traceroute" package)' : 'the Grid Infrastructure tools (set Grid Home)';
+    return { status: 'fail', summary: `Command not found — ${tool}` };
+  }
+  if (id === 'ctss' && code !== 0 && /using: cluvfy comp clocksync/.test(out)) {
+    const body = out.split('\n').filter(l => !l.trim().startsWith('#')).join('\n');
+    if (/PRVG-1024|PRVF-7590/.test(body))
+      return { status: 'fail', summary: 'cluvfy: no time-sync daemon (chronyd / ntpd) is running on the cluster nodes (PRVG-1024, PRVF-7590)' };
+    const l = body.split('\n').find(x => /PRV[A-Z]-\d+/.test(x));
+    return { status: 'fail', summary: 'Clock synchronization check failed' + (l ? ' — ' + l.trim().slice(0, 140) : '') };
+  }
+  if (id === 'nodecon' && code !== 0) {
+    const body = out.split('\n').filter(l => !l.trim().startsWith('#')).join('\n');
+    const fails = body.split('\n').filter(l => /\.\.\.\s*FAILED/.test(l));
+    if (fails.length && fails.every(l => /GIPCHA/i.test(l)) && /Node Connectivity \.\.\.PASSED/.test(body) && /CLSD00778/.test(body))
+      return { status: 'warn', summary: 'Node connectivity PASSED. The GIPCHA sub-check could not run: "crsctl check gipc" itself errors (CLSD00778 message-file error, CRS-50310) — not a network result' };
+  }
+  if (code !== 0) {
+    let hint = '';
+    if (id === 'traceroute' && /not permitted|permission denied/i.test(all)) hint = ' — binding to an interface (-i) needs root/CAP_NET_RAW on this kernel';
+    if (id === 'nodecon' && /PRKC-1044|PRKN-1035|SSH|equivalence/i.test(all)) hint = ' — check passwordless SSH between nodes for this user';
+    const firstErr = (err.split('\n').find(l => l.trim())
+      || out.split('\n').find(l => !l.trim().startsWith('#') && /\.\.\.\s*FAILED|PRV[A-Z]-\d+/.test(l))
+      || out.split('\n').find(l => !l.trim().startsWith('#') && /CRS-\d+|PRC[A-Z]-\d+/.test(l))
+      || out.split('\n').find(l => /unsuccessful|failed/i.test(l)) || '').trim();
+    return { status: 'fail', summary: `Exit code ${code}${firstErr ? ' — ' + firstErr.slice(0, 160) : ''}${hint}` };
+  }
+
+  switch (id) {
+    case 'crs_check': {
+      const on = count(/is online/gi);
+      if (/cannot communicate|could not contact|is not online|is offline/i.test(out)) return { status: 'fail', summary: 'One or more CRS daemons are not online' };
+      if (on >= 4) return { status: 'ok', summary: 'HAS, CRS, CSS and EVM are online' };
+      if (on > 0)  return { status: 'warn', summary: `Only ${on}/4 CRS daemons report online` };
+      return { status: 'fail', summary: 'No CRS daemon reported online' };
+    }
+    case 'cluster_all': {
+      if (/cannot communicate|could not contact|is not online|is offline/i.test(out)) return { status: 'fail', summary: 'A cluster daemon is not online on at least one node' };
+      const nodes = out.split('\n').filter(l => /^[A-Za-z0-9_.-]+:\s*$/.test(l)).length;
+      const on = count(/is online/gi);
+      if (!on) return { status: 'fail', summary: 'No cluster daemon reported online' };
+      if (!nodes) return { status: on >= 3 ? 'ok' : 'warn', summary: `${on} daemon(s) online` };
+      return on >= nodes * 3
+        ? { status: 'ok',   summary: `${nodes} node(s): CRS, CSS and EVM online on every node` }
+        : { status: 'warn', summary: `${on}/${nodes * 3} daemons online across ${nodes} node(s)` };
+    }
+    case 'crs_res':
+    case 'init_res': {
+      const bad = out.split('\n').filter(l => /\bONLINE\s+(OFFLINE|INTERMEDIATE|UNKNOWN)\b/.test(l));
+      const down = bad.filter(l => /\bONLINE\s+OFFLINE\b/.test(l)).length;
+      if (!/ONLINE|OFFLINE/.test(out)) return { status: 'warn', summary: 'No resources returned' };
+      if (down)       return { status: 'fail', summary: `${down} resource(s) have Target=ONLINE but State=OFFLINE` };
+      if (bad.length) return { status: 'warn', summary: `${bad.length} resource(s) INTERMEDIATE/UNKNOWN` };
+      return { status: 'ok', summary: id === 'init_res' ? 'All clusterware daemons (init resources) with Target=ONLINE are ONLINE' : 'All resources with Target=ONLINE are ONLINE' };
+    }
+    case 'votedisk': {
+      const m = out.match(/Located\s+(\d+)\s+voting disk/i);
+      if (!m) return { status: 'fail', summary: 'No voting disk information returned' };
+      if (/\bOFFLINE\b/.test(out)) return { status: 'fail', summary: `${m[1]} voting disk(s), at least one OFFLINE` };
+      return { status: 'ok', summary: `${m[1]} voting disk(s), all ONLINE` };
+    }
+    case 'ctss': {
+      if (/using: cluvfy comp clocksync/.test(out)) {                // fallback 2: cluvfy comp clocksync
+        const body = out.split('\n').filter(l => !l.trim().startsWith('#')).join('\n');
+        if (/\.\.\.\s*FAILED|unsuccessful/i.test(body)) return { status: 'fail', summary: 'Clock synchronization check FAILED (cluvfy)' };
+        if (/Clock Synchronization[^\n]*(was successful|\.\.\.PASSED)/i.test(body)) {
+          const md = body.match(/CTSS is in (Observer|Active) state/i);
+          return { status: 'ok', summary: `Clock synchronization verified by cluvfy${md ? ' (CTSS ' + md[1].toLowerCase() + ')' : ''}` };
+        }
+        return { status: 'warn', summary: 'cluvfy clocksync finished but the result could not be interpreted — see output' };
+      }
+      if (/not supported by this Grid version/.test(out)) {          // fallback 1: crsctl stat res ora.ctssd -init -t
+        const lines = out.split('\n').filter(l => !l.trim().startsWith('#'));
+        const idx = lines.findIndex(l => /^ora\.ctssd\b/.test(l.trim()));
+        if (idx < 0) {
+          const first = (lines.find(l => l.trim()) || 'no output').trim().slice(0, 140);
+          return { status: 'warn', summary: `ora.ctssd not reported by this Grid version — ${first}` };
+        }
+        const m = lines.slice(idx, idx + 4).join('\n').match(/\b(ONLINE|OFFLINE)\s+(ONLINE|OFFLINE|INTERMEDIATE|UNKNOWN)\b\s+\S+\s*([^\n]*)/);
+        if (!m) return { status: 'warn', summary: 'ora.ctssd row could not be parsed — see output' };
+        if (m[2] !== 'ONLINE') return { status: 'fail', summary: `ora.ctssd Target=${m[1]} State=${m[2]}` };
+        const md = m[3].match(/\b(ACTIVE|OBSERVER)\b/i);
+        return { status: 'ok', summary: `CTSS ONLINE${md ? ' in ' + md[1].toUpperCase() + ' mode' : ''} (via ora.ctssd)` };
+      }
+      const m = out.match(/Time Synchronization Service is in (\w+) mode/i);
+      if (!m) return { status: 'fail', summary: 'CTSS state not reported' };
+      return { status: 'ok', summary: `CTSS in ${m[1]} mode` };
+    }
+    case 'db_status': {
+      const run = count(/is running on node/gi), down = count(/is not running/gi);
+      if (down || !run) return { status: 'fail', summary: `${run} instance(s) running, ${down} not running` };
+      return { status: 'ok', summary: `${run} instance(s) running` };
+    }
+    case 'scan':
+    case 'scan_listener': {
+      const run = count(/is running on node/gi), off = count(/is not running/gi), dis = count(/is disabled/gi);
+      if (off || !run) return { status: 'fail', summary: `${run} running, ${off} not running` };
+      if (dis)         return { status: 'warn', summary: `${run} running, ${dis} disabled` };
+      return { status: 'ok', summary: `${run} running` };
+    }
+    case 'vip': {
+      if (/is not running/i.test(out)) return { status: 'fail', summary: 'VIP is not running' };
+      const m = out.match(/is running on node:?\s*(\S+)/i);
+      if (!m) return { status: 'warn', summary: 'VIP state not reported' };
+      const on = m[1].toLowerCase().split('.')[0], want = String(params.nodeName || '').toLowerCase().split('.')[0];
+      if (want && on !== want) return { status: 'warn', summary: `VIP is running on ${m[1]} (failed over from ${params.nodeName})` };
+      return { status: 'ok', summary: `VIP running on ${m[1]}` };
+    }
+    case 'svc_status': {
+      const run = count(/is running on instance/gi), off = count(/is not running/gi);
+      if (!run && !off) return { status: 'info', summary: 'No services registered' };
+      if (off) return { status: 'warn', summary: `${run} service(s) running, ${off} not running` };
+      return { status: 'ok', summary: `${run} service(s) running` };
+    }
+    case 'db_config':
+      return { status: 'info', summary: 'Configuration retrieved' };
+    case 'traceroute': {
+      if (/packets transmitted/.test(out)) {            // ping fallback (traceroute not installed)
+        const m = out.match(/(\d+) packets transmitted, (\d+) (?:packets )?received[^%]*?(\d+(?:\.\d+)?)% packet loss/);
+        const rtt = out.match(/=\s*[\d.]+\/([\d.]+)\//);
+        if (!m) return { status: 'warn', summary: 'Ping output could not be parsed' };
+        const viaSrc = out.match(/using its source address (\S+)/);
+        const txt = `Ping ${viaSrc ? 'from ' + viaSrc[1] + ' (' + params.iface + ')' : 'via ' + params.iface}: ${m[2]}/${m[1]} replies${rtt ? ', avg ' + rtt[1] + ' ms' : ''} (traceroute not installed)`;
+        return { status: Number(m[3]) === 0 ? 'ok' : 'warn', summary: txt };
+      }
+      const hops = out.split('\n').filter(l => /^\s*\d+\s+/.test(l));
+      const last = hops[hops.length - 1] || '';
+      if (!hops.length) return { status: 'warn', summary: 'No hop output' };
+      if (/^\s*\d+\s+(\*\s*)+$/.test(last) || !last.includes(params.targetIp)) return { status: 'warn', summary: `Destination not reached within ${hops.length} hop(s)` };
+      const viaSrc2 = out.match(/using its source address (\S+)/);
+      return { status: 'ok', summary: `Reached ${params.targetIp} in ${hops.length} hop(s)${viaSrc2 ? ' (from ' + viaSrc2[1] + ')' : ''}` };
+    }
+    case 'nodecon': {
+      const success = /Verification of node connectivity was successful/i.test(out);
+      if (!success) return { status: 'fail', summary: 'Node connectivity verification did not succeed' };
+      if (/\bWARNING\b/.test(out)) return { status: 'warn', summary: 'Verification succeeded with warnings' };
+      return { status: 'ok', summary: 'Node connectivity verification successful' };
+    }
+  }
+  return { status: 'info', summary: '' };
+}
+
+// Pulls the error-code lines (PRVG-/PRVH-/PRCx-… and "...FAILED") plus a little context out of long cluvfy output,
+// so the real cause is visible without scrolling through hundreds of lines.
+function _racHighlights(text) {
+  const lines = String(text || '').split('\n'), keep = new Set();
+  lines.forEach((l, i) => {
+    if (/PRV[A-Z]-\d+|PRC[A-Z]-\d+|\.\.\.\s*FAILED/.test(l))
+      for (let j = Math.max(0, i - 1); j <= Math.min(lines.length - 1, i + (/PRVG-2043/.test(l) ? 10 : 3)); j++) keep.add(j);
+  });
+  const out = []; let prev = -2;
+  for (const i of [...keep].sort((a, b) => a - b).slice(0, 80)) {
+    if (prev >= 0 && i !== prev + 1) out.push('   …');
+    out.push(lines[i].slice(0, 300)); prev = i;
+  }
+  return out;
+}
+
+app.post('/api/oracle/rac/cluster-check', async (req, res) => {
+  const b = req.body || {};
+  const def = Object.prototype.hasOwnProperty.call(_RAC_CHECKS, b.check) ? _RAC_CHECKS[b.check] : null;
+  if (!def) return res.status(400).json({ error: 'Unknown check: ' + String(b.check).slice(0, 40) });
+
+  if (typeof b.host !== 'string' || !_RAC_RX.host.test(b.host.trim())) return res.status(400).json({ error: 'A valid SSH host is required' });
+  if (typeof b.user !== 'string' || !_RAC_RX.user.test(b.user.trim())) return res.status(400).json({ error: 'A valid SSH user is required' });
+  if (!b.password && !b.privateKey)                                    return res.status(400).json({ error: 'password or privateKey is required' });
+  if (!_getSsh2())                                                     return res.status(500).json({ error: 'ssh2 package not installed. Run: npm install ssh2  then restart server.js' });
+
+  let params;
+  try { params = _racValidateParams(def, b.params); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+
+  const host = b.host.trim(), user = b.user.trim(), port = parseInt(b.port, 10) || 22;
+  const core = def.build(params);
+  // `timeout -k 5 N` makes the REMOTE process die on timeout, not just our channel.
+  const fullCmd = _racPreamble(params.gridHome) + '\n' +
+    `T=""; command -v timeout >/dev/null 2>&1 && T="timeout -k 5 ${def.secs}"\n` +
+    (def.buildFull ? def.buildFull(params) : `$T ${core}`);
+
+  const t0 = Date.now();
+  console.log(`[rac/cluster-check] ${user}@${host}:${port} check=${b.check}`);
+  try {
+    const r = await _sshRunPooled({ user, host, port, password: b.password, privateKey: b.privateKey, cmd: fullCmd, timeoutMs: (def.secs + 15) * 1000 });
+    const gm = r.stdout.match(/@@GRID_HOME=(.*?)@@\n?/);
+    const gridHome = gm ? gm[1] : '';
+    const stdout = r.stdout.replace(/@@GRID_HOME=.*?@@\n?/, '').replace(/\s+$/, '');
+    const verdict = _racClassify(b.check, stdout, r.stderr, r.code, params);
+    res.json({
+      check: b.check, command: core, host, gridHome,
+      status: verdict.status, summary: verdict.summary,
+      highlights: ((b.check === 'nodecon' || b.check === 'ctss') && (verdict.status === 'fail' || verdict.status === 'warn')) ? _racHighlights(stdout) : undefined,
+      stdout, stderr: r.stderr.replace(/\s+$/, ''), exitCode: r.code,
+      elapsedMs: Date.now() - t0,
+    });
+  } catch (e) {
+    const status = e.isTimeout ? 504 : 502;
+    res.status(status).json({ error: (e.isTimeout ? 'SSH command ' : 'SSH connection failed: ') + e.message, command: core });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
