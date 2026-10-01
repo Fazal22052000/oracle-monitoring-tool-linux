@@ -3370,12 +3370,12 @@ where obj#=:1 and part=:2 and version=:3 order by piece#</textarea>
 <!-- ═══════ RAC MONITOR PANEL ═══════ -->
 <div class="panel" id="panel-rac">
   <div class="section-hdr">
-    <div><div class="section-title">🖧 RAC Node Monitor</div><div class="section-sub">Real Application Clusters — node status, interconnect, cache fusion, SCN health · auto-refreshes every 30s</div></div>
+    <div><div class="section-title">🖧 RAC Node Monitor</div><div class="section-sub">Real Application Clusters — node status, ASM capacity, services, interconnect, cache fusion, SCN health · database data auto-refreshes every 30s · clusterware (SSH) checks run on demand</div></div>
     <div style="display:flex;gap:8px;align-items:center">
       <span id="rac-live-badge" style="display:none;font-size:9px;padding:2px 8px;border-radius:10px;background:rgba(26,184,160,.15);color:var(--c-tealL)">● LIVE</span>
       <span id="rac-last-refresh" style="font-size:10px;color:var(--c-dim)">—</span>
       <button class="qb-btn" onclick="refreshRAC()">↻ Refresh</button>
-      <button class="qb-btn orange" onclick="askAIAbout('Analyze my Oracle RAC cluster health. Here is the data: Instances=' + (document.getElementById(\'rac-instances-tbody\')?.innerText||\'N/A\') + ' CacheFusion=' + (document.getElementById(\'rac-fusion-tbody\')?.innerText||\'N/A\') + '. Give me health assessment and any issues to investigate.')">🤖 AI Analyze</button>
+      <button class="qb-btn orange" onclick="racAIAnalyze()">🤖 AI Analyze</button>
     </div>
   </div>
 
@@ -3396,6 +3396,30 @@ where obj#=:1 and part=:2 and version=:3 order by piece#</textarea>
     <div style="overflow-x:auto"><table class="result-table">
       <thead><tr><th style="min-width:50px">Inst#</th><th style="min-width:120px">Instance Name</th><th style="min-width:130px">Host</th><th style="min-width:80px">Status</th><th style="min-width:150px">Startup Time</th><th style="min-width:100px;text-align:right">Active Sessions</th><th style="min-width:100px;text-align:right">Total Sessions</th><th style="min-width:100px;text-align:right">DB Time (min)</th><th style="min-width:80px">Version</th></tr></thead>
       <tbody id="rac-instances-tbody"><tr><td colspan="9" style="text-align:center;padding:20px;color:var(--c-dim)">Click Refresh</td></tr></tbody>
+    </table></div>
+  </div>
+
+  <!-- ASM Disk Group Capacity -->
+  <div class="card" style="padding:0;margin-bottom:12px">
+    <div style="padding:8px 14px;border-bottom:1px solid var(--c-border);display:flex;align-items:center;justify-content:space-between">
+      <span style="font-size:11px;font-weight:600;color:var(--c-tealL)">ASM Disk Group Capacity (V$ASM_DISKGROUP)</span>
+      <span id="rac-asm-summary" style="font-size:10px;color:var(--c-dim)"></span>
+    </div>
+    <div style="overflow-x:auto"><table class="result-table">
+      <thead><tr><th style="min-width:50px">Grp#</th><th style="min-width:110px">Name</th><th style="min-width:80px">Redundancy</th><th style="min-width:90px">State</th><th style="min-width:70px;text-align:right">Offline Disks</th><th style="min-width:100px;text-align:right">Total (GB)</th><th style="min-width:100px;text-align:right">Free (GB)</th><th style="min-width:110px;text-align:right">Usable File (GB)</th><th style="min-width:190px">Used %</th></tr></thead>
+      <tbody id="rac-asm-tbody"><tr><td colspan="9" style="text-align:center;padding:16px;color:var(--c-dim)">Click Refresh</td></tr></tbody>
+    </table></div>
+  </div>
+
+  <!-- Active RAC Services -->
+  <div class="card" style="padding:0;margin-bottom:12px">
+    <div style="padding:8px 14px;border-bottom:1px solid var(--c-border);display:flex;align-items:center;justify-content:space-between">
+      <span style="font-size:11px;font-weight:600;color:var(--c-blueL)">Active RAC Services (GV$ACTIVE_SERVICES)</span>
+      <span id="rac-svc-summary" style="font-size:10px;color:var(--c-dim)"></span>
+    </div>
+    <div style="overflow-x:auto"><table class="result-table">
+      <thead><tr><th style="min-width:50px">Inst#</th><th style="min-width:200px">Service Name</th><th style="min-width:200px">Network Name</th><th style="min-width:90px">Goal</th><th style="min-width:90px">CLB Goal</th><th style="min-width:80px;text-align:right">Name Hash</th><th style="min-width:150px">Created</th></tr></thead>
+      <tbody id="rac-svc-tbody"><tr><td colspan="7" style="text-align:center;padding:16px;color:var(--c-dim)">Click Refresh</td></tr></tbody>
     </table></div>
   </div>
 
@@ -3474,6 +3498,38 @@ where obj#=:1 and part=:2 and version=:3 order by piece#</textarea>
         <tbody id="rac-throughput-tbody"><tr><td colspan="4" style="text-align:center;padding:16px;color:var(--c-dim)">Click Refresh</td></tr></tbody>
       </table></div>
     </div>
+  </div>
+
+  <!-- Clusterware / Network checks (SSH, read-only, on demand) -->
+  <div class="card" style="padding:0;margin-bottom:12px">
+    <div style="padding:8px 14px;border-bottom:1px solid var(--c-border);display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+      <span style="font-size:11px;font-weight:600;color:var(--c-orange2)">Clusterware &amp; Network Checks (crsctl · srvctl · traceroute · cluvfy over SSH)</span>
+      <div style="display:flex;gap:6px;align-items:center">
+        <span id="rac-chk-progress" style="font-size:10px;color:var(--c-dim)"></span>
+        <button class="qb-btn" id="rac-chk-runall" onclick="racRunAllChecks()">▶ Run all checks</button>
+        <button class="qb-btn" style="background:var(--c-card2);color:var(--c-muted)" onclick="racResetChecks()">Clear</button>
+      </div>
+    </div>
+    <div style="padding:10px 14px;border-bottom:1px solid var(--c-border)">
+      <div style="font-size:10px;color:var(--c-dim);margin-bottom:6px">SSH target — one cluster node, as the Grid/Oracle OS user. Leave blank to reuse an SSH session already open in the OS Terminal. Password is sent only to your local proxy and is never stored.</div>
+      <datalist id="rac-ssh-hosts"></datalist>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-bottom:8px">
+        <div><label style="display:block;font-size:9px;color:var(--c-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.4px">SSH host</label><input class="form-input" id="rac-ssh-host" placeholder="node hostname or IP" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" list="rac-ssh-hosts"></div>
+        <div><label style="display:block;font-size:9px;color:var(--c-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.4px">SSH port</label><input class="form-input" id="rac-ssh-port" placeholder="22" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" ></div>
+        <div><label style="display:block;font-size:9px;color:var(--c-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.4px">SSH user</label><input class="form-input" id="rac-ssh-user" placeholder="grid / oracle" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" ></div>
+        <div><label style="display:block;font-size:9px;color:var(--c-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.4px">SSH password</label><input class="form-input" id="rac-ssh-pass" type="password" placeholder="••••••••" autocomplete="new-password"></div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px">
+        <div><label style="display:block;font-size:9px;color:var(--c-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.4px">DB unique name  (-d)</label><input class="form-input" id="rac-p-db" placeholder="auto-filled" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" ></div>
+        <div><label style="display:block;font-size:9px;color:var(--c-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.4px">VIP node name(s)  (-node)</label><input class="form-input" id="rac-p-node" placeholder="auto-filled; comma-separated" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" ></div>
+        <div><label style="display:block;font-size:9px;color:var(--c-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.4px">Interconnect interface  (-i)</label><input class="form-input" id="rac-p-iface" placeholder="auto-filled, e.g. eth1" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" ></div>
+        <div><label style="display:block;font-size:9px;color:var(--c-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.4px">Peer node IP</label><input class="form-input" id="rac-p-ip" placeholder="auto-filled" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" ></div>
+        <div><label style="display:block;font-size:9px;color:var(--c-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.4px">Grid Home (optional)</label><input class="form-input" id="rac-p-grid" placeholder="auto-detected" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" ></div>
+      </div>
+      <div id="rac-ic-hint" style="font-size:10px;color:var(--c-dim);margin-top:6px"></div>
+      <div id="rac-chk-target" style="font-size:10px;color:var(--c-muted);margin-top:2px"></div>
+    </div>
+    <div id="rac-oscheck-list"></div>
   </div>
 
   <div id="rac-not-configured" style="display:none" class="card" style="border-color:rgba(245,200,66,.3)"></div>
@@ -26080,6 +26136,86 @@ async function refreshRAC() {
       }
     }
 
+    // ── ASM Disk Group Capacity ──────────────────────────────────────
+    const asmTbody = document.getElementById('rac-asm-tbody');
+    const asmSum   = document.getElementById('rac-asm-summary');
+    if (asmTbody) {
+      const rows = d.asmDiskgroups || [];
+      const gb  = mb => (Number(mb) / 1024).toLocaleString(undefined, { maximumFractionDigits: 2 });
+      if (!rows.length) {
+        asmTbody.innerHTML = d.asmError
+          ? `<tr><td colspan="9" style="text-align:center;padding:16px;color:var(--c-yellow)">ASM views unavailable: ${escHtml(d.asmError)}</td></tr>`
+          : '<tr><td colspan="9" style="text-align:center;padding:16px;color:var(--c-dim)">No ASM disk groups — this database does not appear to use ASM</td></tr>';
+        if (asmSum) asmSum.textContent = '';
+      } else {
+        let worst = 0, negUsable = 0, badState = 0, offline = 0;
+        asmTbody.innerHTML = rows.map(row => {
+          const total = Number(row.TOTAL_MB) || 0;
+          const pct   = row.PERCENT_USED === null || row.PERCENT_USED === undefined ? null : Number(row.PERCENT_USED);
+          const st    = (row.STATE || '').toUpperCase();
+          const stCol = (st === 'MOUNTED' || st === 'CONNECTED') ? 'var(--c-green)' : st === 'QUIESCING' ? 'var(--c-yellow)' : 'var(--c-red)';
+          const usable = Number(row.USABLE_FILE_MB);
+          const off    = Number(row.OFFLINE_DISKS) || 0;
+          const pCol   = pct === null ? 'var(--c-dim)' : pct >= 90 ? 'var(--c-red)' : pct >= 80 ? 'var(--c-yellow)' : 'var(--c-green)';
+          if (pct !== null) worst = Math.max(worst, pct);
+          if (usable < 0) negUsable++;
+          if (stCol === 'var(--c-red)') badState++;
+          if (off > 0) offline++;
+          const usableCell = usable < 0
+            ? `<span style="color:var(--c-red);font-weight:700" title="Negative USABLE_FILE_MB (${usable} MB): not enough free space to restore redundancy after a disk failure">⚠ ${gb(usable)}</span>`
+            : `<span title="${usable} MB">${gb(usable)}</span>`;
+          return `<tr>
+            <td style="font-weight:700;color:var(--c-blueL)">${row.GROUP_NUMBER ?? '—'}</td>
+            <td style="font-weight:600;font-family:var(--font-mono)">${escHtml(row.NAME || '—')}</td>
+            <td style="color:var(--c-muted)">${escHtml(row.TYPE || '—')}</td>
+            <td><span style="color:${stCol};font-weight:700;padding:2px 7px;border-radius:4px;background:color-mix(in srgb, ${stCol} 15%, transparent)">${escHtml(st || '—')}</span></td>
+            <td style="text-align:right;font-weight:600;color:${off > 0 ? 'var(--c-red)' : 'var(--c-muted)'}">${off}</td>
+            <td style="text-align:right;font-family:var(--font-mono)" title="${total} MB">${gb(total)}</td>
+            <td style="text-align:right;font-family:var(--font-mono)" title="${Number(row.FREE_MB) || 0} MB">${gb(row.FREE_MB)}</td>
+            <td style="text-align:right;font-family:var(--font-mono)">${usableCell}</td>
+            <td>${pct === null ? '<span style="color:var(--c-dim)">n/a (0 MB)</span>' : `<div style="display:flex;align-items:center;gap:8px"><div style="flex:1;height:8px;background:var(--c-card2);border-radius:4px;overflow:hidden;min-width:90px"><div style="width:${Math.min(100, pct)}%;height:100%;background:${pCol}"></div></div><span style="font-family:var(--font-mono);font-weight:700;color:${pCol};min-width:52px;text-align:right">${pct.toFixed(2)}%</span></div>`}</td>
+          </tr>`;
+        }).join('');
+        if (asmSum) {
+          const issues = [];
+          if (negUsable) issues.push(negUsable + ' with negative usable space');
+          if (badState)  issues.push(badState + ' not mounted');
+          if (offline)   issues.push(offline + ' with offline disks');
+          asmSum.innerHTML = `${rows.length} disk group(s) · max used ${worst.toFixed(1)}%` + (issues.length ? ` · <span style="color:var(--c-red);font-weight:700">⚠ ${escHtml(issues.join(', '))}</span>` : '');
+          asmSum.style.color = (issues.length || worst >= 90) ? 'var(--c-red)' : worst >= 80 ? 'var(--c-yellow)' : 'var(--c-green)';
+        }
+      }
+    }
+
+    // ── Active Services ──────────────────────────────────────────────
+    const svcTbody = document.getElementById('rac-svc-tbody');
+    const svcSum   = document.getElementById('rac-svc-summary');
+    if (svcTbody) {
+      const rows = d.services || [];
+      if (!rows.length) {
+        svcTbody.innerHTML = d.servicesError
+          ? `<tr><td colspan="7" style="text-align:center;padding:16px;color:var(--c-yellow)">GV$ACTIVE_SERVICES unavailable: ${escHtml(d.servicesError)}</td></tr>`
+          : '<tr><td colspan="7" style="text-align:center;padding:16px;color:var(--c-dim)">No user-defined services are active</td></tr>';
+        if (svcSum) svcSum.textContent = '';
+      } else {
+        svcTbody.innerHTML = rows.map(row => `<tr>
+          <td style="font-weight:700;color:var(--c-blueL)">${row.INST_ID ?? '—'}</td>
+          <td style="font-weight:600;font-family:var(--font-mono);color:var(--c-tealL)">${escHtml(row.SERVICE_NAME || '—')}</td>
+          <td style="font-family:var(--font-mono);font-size:10px;color:var(--c-muted)">${escHtml(row.NETWORK_NAME || '—')}</td>
+          <td style="color:var(--c-muted)">${escHtml(row.GOAL || '—')}</td>
+          <td style="color:var(--c-muted)">${escHtml(row.CLB_GOAL || '—')}</td>
+          <td style="text-align:right;font-family:var(--font-mono);font-size:10px;color:var(--c-dim)">${row.NAME_HASH ?? '—'}</td>
+          <td style="font-family:var(--font-mono);font-size:10px;color:var(--c-muted)">${escHtml(row.CREATION_DATE || '—')}</td>
+        </tr>`).join('');
+        if (svcSum) {
+          const names = new Set(rows.map(r => r.SERVICE_NAME)), insts = new Set(rows.map(r => r.INST_ID));
+          svcSum.textContent = `${names.size} service(s) active on ${insts.size} instance(s)`;
+        }
+      }
+    }
+
+    window._racLast = d;
+
     // ── Cache Fusion Waits ───────────────────────────────────────────
     const fusionTbody = document.getElementById('rac-fusion-tbody');
     if (fusionTbody) {
@@ -26245,6 +26381,7 @@ async function refreshRAC() {
       }
     }
 
+    try { racPrefillChecks(d); } catch (pe) { console.warn('[RAC] prefill', pe); }
     if (badgeEl) badgeEl.style.display='inline-block';
     if (refreshEl) {
       const now = new Date();
@@ -26277,6 +26414,262 @@ function _startRACAutoRefresh() {
   _scheduleRAC();
 }
 _startRACAutoRefresh();
+
+// ── RAC clusterware / network checks (SSH, read-only, whitelisted server-side) ──
+const RAC_CHECKS = [
+  { id:'crs_check',     group:'crs', label:'CRS stack health',              cmd:'crsctl check crs' },
+  { id:'cluster_all',   group:'crs', label:'Cluster stack on all nodes',    cmd:'crsctl check cluster -all' },
+  { id:'crs_res',       group:'crs', label:'Cluster resources',             cmd:'crsctl stat res -t' },
+  { id:'init_res',      group:'crs', label:'Clusterware daemons (gipcd, HAIP, cssd…)', cmd:'crsctl stat res -init -t' },
+  { id:'votedisk',      group:'crs', label:'Voting disks',                  cmd:'crsctl query css votedisk' },
+  { id:'ctss',          group:'crs', label:'Cluster time synchronization',  cmd:'crsctl check ctss' },
+  { id:'db_status',     group:'srv', label:'Database status',               cmd:'srvctl status database -d <db_unique_name>', needs:['dbName'] },
+  { id:'scan',          group:'srv', label:'SCAN VIPs',                     cmd:'srvctl status scan' },
+  { id:'scan_listener', group:'srv', label:'SCAN listeners',                cmd:'srvctl status scan_listener' },
+  { id:'vip',           group:'srv', label:'Node VIP(s)',                   cmd:'srvctl status vip -node <node_name>', needs:['nodeName'] },
+  { id:'svc_status',    group:'srv', label:'Service status',                cmd:'srvctl status service -d <db_unique_name>', needs:['dbName'] },
+  { id:'db_config',     group:'srv', label:'Database configuration',        cmd:'srvctl config database -d <db_unique_name>', needs:['dbName'] },
+  { id:'traceroute',    group:'net', label:'Interconnect route to peer',    cmd:'traceroute -n -m 5 -w 2 -i <interconnect_interface> <other_node_ip>', needs:['iface','targetIp'] },
+  { id:'nodecon',       group:'net', label:'Node connectivity (cluvfy)',    cmd:'cluvfy comp nodecon -n all -verbose', heavy:true },
+];
+const RAC_STATE = {};   // id → { status, summary }
+const RAC_NEED_LABEL = { dbName:'DB unique name', nodeName:'VIP node name', iface:'Interconnect interface', targetIp:'Peer node IP' };
+const RAC_BADGE = {
+  idle:    ['NOT RUN',  'var(--c-dim)'],
+  running: ['RUNNING…', 'var(--c-orange2)'],
+  ok:      ['OK',       'var(--c-green)'],
+  warn:    ['WARN',     'var(--c-yellow)'],
+  fail:    ['FAIL',     'var(--c-red)'],
+  info:    ['INFO',     'var(--c-blueL)'],
+};
+
+function racRenderCheckList() {
+  const host = document.getElementById('rac-oscheck-list');
+  if (!host) return;
+  const groups = [['Clusterware — crsctl', 'crs'], ['Resources — srvctl', 'srv'], ['Network', 'net']];
+  host.innerHTML = groups.map(([title, g]) =>
+    `<div style="padding:5px 14px;font-size:9px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--c-dim);background:var(--c-card2);border-bottom:1px solid var(--c-border)">${title}</div>` +
+    RAC_CHECKS.filter(c => c.group === g).map(c => `
+    <div id="rac-chk-${c.id}" style="border-bottom:1px solid var(--c-border)">
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 14px">
+        <span id="rac-chk-${c.id}-badge" style="min-width:74px;text-align:center;font-size:9px;font-weight:700;padding:3px 6px;border-radius:4px"></span>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:11px;font-weight:600;color:var(--c-text)">${escHtml(c.label)}${c.heavy ? ' <span style="font-size:9px;font-weight:600;color:var(--c-yellow)">· slow (up to 5 min) · manual only</span>' : ''}</div>
+          <div id="rac-chk-${c.id}-cmd" style="font-family:var(--font-mono);font-size:10px;color:var(--c-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(c.cmd)}</div>
+          <div id="rac-chk-${c.id}-sum" style="font-size:10px;color:var(--c-muted)"></div>
+        </div>
+        <button id="rac-chk-${c.id}-tog" class="qb-btn" style="display:none;background:var(--c-card2);color:var(--c-muted);padding:4px 8px" onclick="racToggleOut('${c.id}')">Output</button>
+        <button id="rac-chk-${c.id}-run" class="qb-btn" style="padding:4px 10px" onclick="racRunCheck('${c.id}')">▶ Run</button>
+      </div>
+      <pre id="rac-chk-${c.id}-out" style="display:none;margin:0;padding:8px 14px;background:var(--c-card2);color:var(--c-text);font-family:var(--font-mono);font-size:10px;line-height:1.5;max-height:320px;overflow:auto;white-space:pre-wrap;word-break:break-all"></pre>
+    </div>`).join('')).join('');
+  RAC_CHECKS.forEach(c => racSetRow(c.id, RAC_STATE[c.id]?.status || 'idle', RAC_STATE[c.id]?.summary || ''));
+}
+
+function racSetRow(id, status, summary, outText, cmdText) {
+  if (status === 'idle') delete RAC_STATE[id]; else RAC_STATE[id] = { status, summary: summary || '' };
+  const [txt, col] = RAC_BADGE[status] || RAC_BADGE.idle;
+  const badge = document.getElementById(`rac-chk-${id}-badge`);
+  if (badge) { badge.textContent = txt; badge.style.color = col; badge.style.background = `color-mix(in srgb, ${col} 15%, transparent)`; }
+  const sum = document.getElementById(`rac-chk-${id}-sum`);
+  if (sum) { sum.textContent = summary || ''; sum.style.color = (status === 'fail') ? 'var(--c-red)' : (status === 'warn') ? 'var(--c-yellow)' : 'var(--c-muted)'; }
+  if (cmdText) { const c = document.getElementById(`rac-chk-${id}-cmd`); if (c) { c.textContent = cmdText; c.title = cmdText; } }
+  const out = document.getElementById(`rac-chk-${id}-out`), tog = document.getElementById(`rac-chk-${id}-tog`);
+  if (out && outText !== undefined) {
+    out.textContent = outText;
+    if (tog) tog.style.display = outText ? 'inline-block' : 'none';
+    out.style.display = (outText && (status === 'fail' || status === 'warn')) ? 'block' : 'none';
+  }
+  const btn = document.getElementById(`rac-chk-${id}-run`);
+  if (btn) { btn.disabled = (status === 'running'); btn.style.opacity = status === 'running' ? '.5' : '1'; }
+}
+
+function racToggleOut(id) {
+  const out = document.getElementById(`rac-chk-${id}-out`);
+  if (out) out.style.display = out.style.display === 'none' ? 'block' : 'none';
+}
+
+function racResetChecks() {
+  RAC_CHECKS.forEach(c => {
+    delete RAC_STATE[c.id];
+    racSetRow(c.id, 'idle', '', '', c.cmd);
+  });
+  const pr = document.getElementById('rac-chk-progress'); if (pr) pr.textContent = '';
+}
+
+// Fills a field from the live cluster data, but never overwrites something the user typed:
+// a field is refreshed only while it is empty or still holds the value we auto-filled earlier
+// (so switching databases replaces stale values instead of leaving the old DB's names behind).
+function racPrefillChecks(d) {
+  const auto = (id, v) => {
+    const el = document.getElementById(id); if (!el) return;
+    if (el.value === '' || el.value === el.dataset.auto) { el.value = v || ''; el.dataset.auto = v || ''; }
+  };
+  const short = h => String(h || '').split('.')[0];
+  const insts = d.instances || [];
+  const hosts = [...new Set(insts.map(i => i.HOST_NAME).filter(Boolean))];
+
+  // A different database → drop old results and the previous cluster's SSH host/password.
+  const key = d.clusterName || '';
+  if (window._racChecksDb !== undefined && window._racChecksDb !== key) {
+    racResetChecks();
+    ['rac-ssh-host', 'rac-ssh-pass'].forEach(i => { const e = document.getElementById(i); if (e) e.value = ''; });
+  }
+  window._racChecksDb = key;
+
+  const dl = document.getElementById('rac-ssh-hosts');
+  if (dl) dl.innerHTML = hosts.map(h => `<option value="${escHtml(h)}"></option>`).join('');
+
+  auto('rac-p-db', d.clusterName);
+  auto('rac-p-node', [...new Set(hosts.map(short))].join(', '));
+
+  const ic = d.interconnects || [];
+  const hintEl = document.getElementById('rac-ic-hint');
+  if (ic.length) {
+    const ost = window.OST || {};
+    const sshHost = (document.getElementById('rac-ssh-host')?.value || (ost.sshMode ? ost.sshHost : '') || '').trim();
+    const me   = insts.find(i => sshHost && (i.HOST_NAME === sshHost || short(i.HOST_NAME) === short(sshHost))) || insts[0];
+    const mine = ic.find(r => me && r.INST_ID == me.INST_ID) || ic[0];
+    const peer = ic.find(r => r.INST_ID != mine.INST_ID);
+    auto('rac-p-iface', String(mine.NAME || '').split(':')[0]);   // eth1:1 (HAIP alias) → eth1
+    auto('rac-p-ip', peer ? peer.IP_ADDRESS : '');
+    if (hintEl) hintEl.textContent = 'Interconnect (GV$CLUSTER_INTERCONNECTS): ' + ic.map(r => `inst ${r.INST_ID} ${r.NAME} ${r.IP_ADDRESS}`).join(' · ');
+  } else if (hintEl) {
+    hintEl.textContent = d.isRAC ? 'GV$CLUSTER_INTERCONNECTS returned no rows — enter interface and peer IP manually.' : 'Single-instance database — interconnect fields not applicable.';
+  }
+  racUpdateTarget();
+}
+
+function racGetParams() {
+  const v = id => (document.getElementById(id)?.value || '').trim();
+  return { dbName: v('rac-p-db'), nodeName: v('rac-p-node'), iface: v('rac-p-iface'), targetIp: v('rac-p-ip'), gridHome: v('rac-p-grid') };
+}
+
+// Field values win; anything blank falls back to an open OS Terminal SSH session — but that
+// session's password/key is only reused when it belongs to the SAME host (never sent elsewhere).
+function racGetSsh() {
+  const v = id => (document.getElementById(id)?.value || '').trim();
+  const ost = window.OST || {};
+  const ostOk = !!(ost.sshMode && ost.sshHost && ost.sshUser && (ost.sshPass || ost.sshPrivateKey));
+  const fHost = v('rac-ssh-host');
+  const same  = ostOk && (!fHost || fHost === ost.sshHost);
+  const pass  = document.getElementById('rac-ssh-pass')?.value || '';
+  return {
+    host: fHost || (ostOk ? ost.sshHost : ''),
+    port: parseInt(v('rac-ssh-port'), 10) || (same ? parseInt(ost.sshPort, 10) : 0) || 22,
+    user: v('rac-ssh-user') || (same ? ost.sshUser : ''),
+    password:   pass || (same ? ost.sshPass : ''),
+    privateKey: (!pass && same && ost.sshPrivateKey) ? ost.sshPrivateKey : undefined,
+    fromOst: same,
+  };
+}
+
+function racUpdateTarget() {
+  const el = document.getElementById('rac-chk-target'); if (!el) return;
+  const s = racGetSsh();
+  el.textContent = s.host ? `Checks will run on: ${s.user || '?'}@${s.host}:${s.port}${s.fromOst ? '  (using the OS Terminal SSH session)' : ''}` : 'No SSH target yet — enter a host above or open an SSH session in the OS Terminal.';
+}
+
+async function racCall(check, ssh, params, timeoutMs) {
+  const r = await fetchWithTimeout(_apiBase() + '/api/oracle/rac/cluster-check', {
+    method : 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body   : JSON.stringify({ check, host: ssh.host, port: ssh.port, user: ssh.user, password: ssh.password || undefined, privateKey: ssh.privateKey || undefined, params }),
+  }, timeoutMs);
+  const j = await r.json().catch(() => ({ error: 'Invalid response from proxy (HTTP ' + r.status + ')' }));
+  if (!r.ok || j.error) { const e = new Error(j.error || ('HTTP ' + r.status)); e.command = j.command; throw e; }
+  return j;
+}
+
+const _RAC_RANK = { info: 0, ok: 1, warn: 2, fail: 3 };
+
+// Returns { ok:boolean, connError:boolean } so "Run all" can stop on a bad login instead of retrying it.
+async function racRunCheck(id) {
+  const def = RAC_CHECKS.find(c => c.id === id);
+  if (!def) return { ok: false };
+  if (!state.proxyUrl) { addToast('Connect to a database first', 'yellow'); return { ok: false }; }
+  if (RAC_STATE[id]?.status === 'running') return { ok: false };
+
+  const ssh = racGetSsh(), params = racGetParams();
+  racUpdateTarget();
+  const miss = [];
+  if (!ssh.host) miss.push('SSH host');
+  if (!ssh.user) miss.push('SSH user');
+  if (!ssh.password && !ssh.privateKey) miss.push('SSH password');
+  (def.needs || []).forEach(k => { if (!params[k]) miss.push(RAC_NEED_LABEL[k]); });
+  if (miss.length) { racSetRow(id, 'fail', 'Missing: ' + miss.join(', '), ''); return { ok: false, connError: /SSH/.test(miss.join()) }; }
+
+  racSetRow(id, 'running', 'Running on ' + ssh.host + '…');
+  const timeoutMs = def.heavy ? 330000 : 90000;
+  try {
+    // Node VIP: one srvctl call per node name (comma/space separated) and a combined verdict.
+    const targets = id === 'vip' ? params.nodeName.split(/[\s,]+/).filter(Boolean) : [null];
+    const results = [];
+    for (const t of targets) {
+      const send = { gridHome: params.gridHome };
+      (def.needs || []).forEach(k => { send[k] = params[k]; });
+      if (t) send.nodeName = t;
+      const r = await racCall(id, ssh, send, timeoutMs);
+      results.push({ node: t, r });
+    }
+    const worst = results.reduce((w, x) => _RAC_RANK[x.r.status] > _RAC_RANK[w] ? x.r.status : w, 'info');
+    const summary = results.length === 1 ? results[0].r.summary : results.map(x => `${x.node}: ${x.r.summary}`).join(' · ');
+    const text = results.map(x => {
+      const r = x.r;
+      const hl = (r.highlights && r.highlights.length) ? '--- KEY ERRORS (extracted from the full output below) ---\n' + r.highlights.join('\n') + '\n\n--- FULL OUTPUT ---\n' : '';
+      return `${hl}${results.length > 1 ? '### node ' + x.node + '\n' : ''}$ ${r.command}\n# ${r.host} · exit ${r.exitCode} · ${(r.elapsedMs / 1000).toFixed(1)}s · GRID_HOME=${r.gridHome || '(not found)'}\n\n${r.stdout || '(no output)'}${r.stderr ? '\n\n--- stderr ---\n' + r.stderr : ''}`;
+    }).join('\n\n');
+    racSetRow(id, worst, summary + (results[0].r.gridHome ? '' : '  ⚠ Grid Home not detected'), text, results[0].r.command);
+    return { ok: worst !== 'fail' };
+  } catch (e) {
+    const msg = e.name === 'AbortError' ? 'Timed out waiting for the proxy' : e.message;
+    racSetRow(id, 'fail', msg, `${e.command ? '$ ' + e.command + '\n\n' : ''}${msg}`);
+    return { ok: false, connError: /SSH connection failed|authentication|ECONN|ENOTFOUND|EHOSTUNREACH|All configured authentication/i.test(msg) };
+  }
+}
+
+async function racRunAllChecks() {
+  const btn = document.getElementById('rac-chk-runall'), pr = document.getElementById('rac-chk-progress');
+  if (btn?.disabled) return;
+  const list = RAC_CHECKS.filter(c => !c.heavy);
+  if (btn) { btn.disabled = true; btn.style.opacity = '.5'; }
+  let done = 0;
+  const tick = () => { if (pr) pr.textContent = `${done}/${list.length} done`; };
+  try {
+    tick();
+    // First check runs alone so ONE SSH login is established and pooled. Running them all at once
+    // would open several logins in parallel — a wrong password would then count as several failures.
+    const first = await racRunCheck(list[0].id); done++; tick();
+    if (first.connError) { if (pr) pr.textContent = 'Stopped — SSH connection/login failed'; return; }
+    const queue = list.slice(1);
+    await Promise.all(Array.from({ length: 3 }, async () => {
+      while (queue.length) { const c = queue.shift(); await racRunCheck(c.id); done++; tick(); }
+    }));
+    const st = list.map(c => RAC_STATE[c.id]?.status);
+    const f = st.filter(x => x === 'fail').length, w = st.filter(x => x === 'warn').length;
+    if (pr) pr.textContent = `Finished: ${f} fail · ${w} warn · ${st.length - f - w} ok/info`;
+    addToast(f ? `⚠ Cluster checks: ${f} failed, ${w} warning(s)` : w ? `Cluster checks: ${w} warning(s)` : '✓ All cluster checks passed', f ? 'red' : w ? 'yellow' : 'green', 4000);
+  } finally {
+    if (btn) { btn.disabled = false; btn.style.opacity = '1'; }
+  }
+}
+
+function racAIAnalyze() {
+  const txt = id => (document.getElementById(id)?.innerText || 'N/A').trim().slice(0, 2000);
+  const checks = RAC_CHECKS.filter(c => RAC_STATE[c.id]).map(c => `- ${c.cmd}: ${RAC_STATE[c.id].status.toUpperCase()} — ${RAC_STATE[c.id].summary}`).join('\n') || 'not run';
+  askAIAbout('Analyze my Oracle RAC cluster health. Here is the data:\n' +
+    'Instances=' + txt('rac-instances-tbody') + '\n' +
+    'ASM disk groups=' + txt('rac-asm-tbody') + '\n' +
+    'Active services=' + txt('rac-svc-tbody') + '\n' +
+    'CacheFusion=' + txt('rac-fusion-tbody') + '\n' +
+    'Clusterware checks:\n' + checks + '\n' +
+    'Give me a health assessment and any issues to investigate.');
+}
+
+racRenderCheckList();
+['rac-ssh-host', 'rac-ssh-user'].forEach(i => document.getElementById(i)?.addEventListener('input', racUpdateTarget));
+racUpdateTarget();
+
 
 // ──────────────────────────────────────────────────────────────────────────
 // USERS & PRIVILEGES
