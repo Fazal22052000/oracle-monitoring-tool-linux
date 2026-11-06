@@ -4,6 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>OraDeck</title>
+<script>
+window._isoLocal = function(v, timeOnly){ // '2026-10-12T06:21:26.000Z' -> viewer-local text; anything else is returned unchanged
+  if(typeof v==='string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?Z$/.test(v)){ const d=new Date(v); return timeOnly?d.toLocaleTimeString():d.toLocaleString(); }
+  return v;
+};
+</script>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -828,6 +834,7 @@ body{background:var(--c-bg);color:var(--c-text);font-family:var(--font-main);fon
     <div class="sidebar-label">Overview</div>
     <div class="nav-item active" onclick="showPanel('dashboard')"><span class="nav-icon">⊞</span> Dashboard</div>
     <div class="nav-item" onclick="showPanel('alerts')"><span class="nav-icon">⚑</span> Alerts <span class="nav-badge" id="alert-badge" style="display:none">0</span></div>
+    <div class="nav-item" onclick="showPanel('history')"><span class="nav-icon">🕘</span> History Manager</div>
   </div>
   <div class="sidebar-section">
     <div class="sidebar-label">Performance</div>
@@ -3950,6 +3957,100 @@ where obj#=:1 and part=:2 and version=:3 order by piece#</textarea>
 </div>
 
 <!-- ═══════ ALERT THRESHOLD CONFIG PANEL ═══════ -->
+<!-- ═══ HISTORY MANAGER PANEL ═══ -->
+<div class="panel" id="panel-history">
+  <div class="section-hdr">
+    <div><div class="section-title">🕘 History Manager</div><div class="section-sub" id="hm-sub">Choose which panels save history (30 days) and delete saved history manually</div></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:flex-end">
+      <span id="hm-refresh-msg" style="font-size:10px;color:var(--c-muted);white-space:nowrap"></span>
+      <button class="qb-btn" id="hm-refresh-btn" style="white-space:nowrap" onclick="hmRefreshBtn(this)">↻ Refresh</button>
+      <button class="qb-btn" style="white-space:nowrap" onclick="hmAll(true)">☑ Record all</button>
+      <button class="qb-btn" style="white-space:nowrap" onclick="hmAll(false)">☐ Record none</button>
+      <button class="qb-btn" style="color:var(--c-red);white-space:nowrap" onclick="hmDelOpen(null)">🗑 Delete history…</button>
+    </div>
+  </div>
+  <div class="card" id="hm-ir-card" style="padding:10px 14px;margin-bottom:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px">
+    <b>📋 Incident report</b> <span style="color:var(--c-muted)">every panel as it was at one moment:</span>
+    <input type="datetime-local" id="hm-ir-t"> <button class="qb-btn" onclick="hmIncident()">Show all panels at this time</button>
+  </div>
+  <div class="card" style="padding:10px 14px;margin-bottom:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px;border-color:var(--c-orange)">
+    <b>⏪ Time travel</b> <span style="color:var(--c-muted)">see the real dashboard panels exactly as they were at a past time:</span>
+    <input type="datetime-local" id="hm-tt"> <button class="qb-btn" onclick="ttGoFromManager()">Open dashboard at this time</button>
+    <span style="color:var(--c-dim)">then click any panel in the sidebar — each one loads its saved data</span>
+  </div>
+  <div class="card" style="padding:10px 14px;margin-bottom:10px;display:flex;gap:14px;align-items:center;flex-wrap:wrap;font-size:12px">
+    <b>Background collection</b>
+    <label><input type="checkbox" id="hm-col-on" onchange="hmMaster()"> ON — server saves history by itself (browser can be closed)</label>
+    <label>every <select id="hm-col-int" onchange="hmMaster()"><option value="5">5</option><option value="15">15</option><option value="30">30</option><option value="60">60</option></select> min</label>
+    <label title="Off = only the container selected in the top bar is collected. On = CDB$ROOT and every OPEN PDB are collected (each on its own connection, in parallel). Database load grows with the number of containers."><input type="checkbox" id="hm-col-all" onchange="hmMaster()"> all containers (CDB + every open PDB)</label>
+    <button class="qb-btn" onclick="hmCollectNow()">▶ Collect now (all ticked)</button>
+    <button class="qb-btn" onclick="hmVerify()" title="Audits this container's history: storage, collector, every panel's newest snapshot, container identity">✔ Verify history</button>
+    <span id="hm-col-msg" style="color:var(--c-muted)"></span>
+    <div style="flex-basis:100%;display:flex;gap:8px;align-items:center;flex-wrap:wrap" title="Where the history is saved and read from. Switching moves nothing: the Oracle table and the PostgreSQL table each keep their own data.">
+      <b>Store history in</b>
+      <button class="qb-btn" id="hm-be-oracle" onclick="hmBackend('oracle')">🗄 Oracle table</button>
+      <button class="qb-btn" id="hm-be-pg" onclick="hmBackend('postgres')">🐘 PostgreSQL</button>
+      <span id="hm-be-msg" style="color:var(--c-muted)"></span>
+    </div>
+    <div id="hm-dbs" style="flex-basis:100%;display:flex;gap:10px;align-items:center;flex-wrap:wrap" title="Only the ticked databases get their history stored (browser AND background collector). A database that is not ticked is never saved, even if someone switches to it or starts the collector there.">
+      <b>Databases to store</b>
+      <span id="hm-dbs-list" style="display:flex;gap:12px;flex-wrap:wrap;color:var(--c-muted)">loading…</span>
+      <button class="qb-btn" id="hm-dbs-save" onclick="hmDbSave()">💾 Save</button>
+      <span id="hm-dbs-msg" style="color:var(--c-muted)"></span>
+    </div>
+    <div id="hm-alert" style="flex-basis:100%"></div>
+    <div id="hm-store" style="flex-basis:100%"></div>
+    <div id="hm-verify" style="flex-basis:100%;display:none"></div>
+    <details id="hm-howto" style="flex-basis:100%;border:1px solid var(--c-border);border-radius:6px;padding:6px 10px;background:var(--c-card)">
+      <summary style="cursor:pointer;color:var(--c-orange2);font-weight:600">📘 How to query the history table with SQL</summary>
+      <div style="color:var(--c-muted);font-size:11px;margin:6px 0">All panels are stored in ONE table. <b>PANEL_KEY</b> = the panel (e.g. sessions, tablespaces), <b>PAYLOAD</b> = that panel's data as JSON. Open any snapshot and press <b>🧾 SQL</b> to get a ready query for that panel.</div>
+      <pre id="hm-howto-sql" style="margin:0;white-space:pre-wrap;font:11px var(--font-mono);color:var(--c-text);user-select:all"></pre>
+    </details>
+  </div>
+  <div class="card" style="padding:0;overflow:auto">
+    <table id="hm-table" style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead><tr style="text-align:left;color:var(--c-muted)"><th style="padding:8px 12px">Record</th><th>Auto-collect</th><th>Panel / data</th><th>Endpoint</th><th>Snapshots</th><th id="hm-th-size" style="cursor:pointer;white-space:nowrap" onclick="hmSortSize()" title="How much space this panel's history uses in the table. Click to sort by size / by name order.">Size · share ↓</th><th>From → To</th><th>Last auto-collect</th><th>Actions</th></tr></thead>
+      <tbody id="hm-body"><tr><td colspan="9" style="padding:16px;color:var(--c-dim)">Loading…</td></tr></tbody>
+    </table>
+  </div>
+  <div style="font-size:10px;color:var(--c-dim);margin-top:8px">
+    <b>Record</b> = save a snapshot whenever that panel loads data (max 1 per 5 min). <b>Auto-collect</b> = the server also fetches that data itself on the schedule above, even if nobody has the dashboard open (adds that query load to the database).
+    Panels that use free-form SQL (SQL Analyzer, SQL Queries, Monitoring, Capacity, Health checks) and report generators (AWR/ASH/ADDM reports) are not covered.
+    Delete works per container (the one currently selected): the matching rows are deleted from the history table.</div>
+</div>
+<div id="hm-ir" style="display:none;position:fixed;inset:0;z-index:9650;background:rgba(0,0,0,.65);align-items:center;justify-content:center" onclick="if(event.target===this)hmIrClose()">
+  <div style="background:var(--c-surface);color:var(--c-text);border:1px solid var(--c-border2);border-radius:var(--rad);width:min(1200px,96vw);height:min(86vh,900px);display:flex;flex-direction:column;font-size:12px">
+    <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--c-border)">
+      <b style="font-size:14px" id="hm-ir-title">Incident report</b><span id="hm-ir-sub" style="color:var(--c-muted)"></span>
+      <button class="qb-btn" style="margin-left:auto" onclick="hmIrCopy()">📋 Copy summary</button>
+      <button class="qb-btn" onclick="hmIrClose()">✕ Close</button>
+    </div>
+    <div id="hm-ir-body" style="overflow:auto;padding:12px 16px;flex:1"></div>
+  </div>
+</div>
+<div id="hm-del" style="display:none;position:fixed;inset:0;z-index:9600;background:rgba(0,0,0,.6);align-items:center;justify-content:center" onclick="if(event.target===this)hmDelClose()">
+  <div style="background:var(--c-surface);color:var(--c-text);border:1px solid var(--c-border2);border-radius:var(--rad);padding:18px 20px;width:min(460px,92vw);font-size:12px;line-height:2">
+    <div style="font-size:14px;font-weight:700;margin-bottom:6px" id="hm-del-title">Delete history</div>
+    <label><input type="radio" name="hm-scope" value="range" checked onchange="hmScope()"> Delete a date range</label>
+    <div id="hm-del-range" style="margin:0 0 4px 22px">
+      Start date <input type="date" id="hm-from"> &nbsp; End date <input type="date" id="hm-to"><br>
+      <small style="color:var(--c-dim)">Both dates are included. Select the same date twice to delete a single day.</small>
+    </div>
+    <label><input type="radio" name="hm-scope" value="older" onchange="hmScope()"> Delete older than <input type="number" id="hm-days" value="7" min="0" style="width:60px"> days</label><br>
+    <label><input type="radio" name="hm-scope" value="all" onchange="hmScope()"> Delete everything</label>
+    <div id="hm-del-sum" style="margin:10px 0;color:var(--c-yellow)"></div>
+    <div id="hm-keep" style="display:none;margin:4px 0 10px;border-top:1px solid var(--c-border);padding-top:8px;line-height:1.7">
+      <b>Automatic clean-up for this panel only</b><br>
+      Keep only the last <input type="number" id="hm-keep-days" min="1" style="width:64px"> days <span style="color:var(--c-dim)" id="hm-keep-norm"></span><br>
+      <small style="color:var(--c-dim)">Older snapshots of THIS panel are deleted right away and then automatically every 6 hours. Other panels keep the normal retention.</small><br>
+      <button class="qb-btn" onclick="hmKeepSave(false)">💾 Save &amp; clean up now</button> <button class="qb-btn" onclick="hmKeepSave(true)">Back to normal</button> <span id="hm-keep-msg" style="color:var(--c-muted)"></span>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="qb-btn" onclick="hmDelClose()">Cancel</button>
+      <button class="qb-btn" style="color:var(--c-red)" onclick="hmDelGo()">🗑 Delete</button>
+    </div>
+  </div>
+</div>
 <div class="panel" id="panel-alertconfig">
   <div class="section-hdr">
     <div><div class="section-title">🔔 Alert Thresholds</div><div class="section-sub">Configure custom alert thresholds — saved to localStorage</div></div>
@@ -13439,6 +13540,15 @@ function _withDbId(path) {
           }
         }
       }
+      // CDB / PDB: pin the request to the container shown on THIS screen (server keeps it for the whole request).
+      // Without it the server used one global container shared by every tab/user -> root data under a PDB label and vice versa.
+      if (/\/api\/oracle\//.test(urlStr) && !/\/api\/oracle\/(databases|ping|defaults|set-container)(\/|\?|$)/.test(urlStr) && !/[?&]container=/.test(urlStr)) {
+        const ct = (typeof _activeContainer !== 'undefined' && _activeContainer) ? _activeContainer : '';
+        if (ct) {
+          urlStr += (urlStr.includes('?') ? '&' : '?') + 'container=' + encodeURIComponent(ct);
+          if (isReq) { input = new Request(urlStr, input); } else { input = urlStr; }
+        }
+      }
     } catch (e) { /* interceptor must never break a real request */ }
     return _origFetch(input, init);
   };
@@ -16752,7 +16862,7 @@ function renderAlerts(alerts) {
       <div style="flex:1">
         <div class="alert-title">${a.level}: ${a.title}</div>
         <div class="alert-desc">${a.desc}</div>
-        <div class="alert-time">${a.time}</div>
+        <div class="alert-time">${window._isoLocal(a.time,true)}</div>
       </div>
       ${a.level!=='INFO'?`<button class="qb-btn orange" style="font-size:9px;padding:4px 8px;align-self:center" onclick="askAIAbout('${a.title.replace(/'/g,'')}')">Ask AI</button>`:''}
     </div>`).join('');
@@ -17322,7 +17432,7 @@ async function loadPDBList() {
   sel.disabled = true;
 
   try {
-    const r = await fetchWithTimeout(state.proxyUrl + _withDbId('/api/oracle/pdbs-live'), {}, 20000);
+    const r = await fetchWithTimeout(state.proxyUrl + _withDbId('/api/oracle/pdbs-live?container=__cdb__'), {}, 20000);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
 
@@ -17385,6 +17495,7 @@ function _populatePDBSelect(pdbs) {
   pdbs.forEach(p => {
     const opt = document.createElement('option');
     opt.value = p.service || p.name.toLowerCase();
+    opt.dataset.pdb = p.name;   // real PDB name - the server verifies the connection really lands in THIS pdb
     const modeIcon = p.open_mode === 'READ WRITE' ? '📦' : p.open_mode === 'MOUNTED' ? '🔒' : '📦';
     opt.textContent = modeIcon + ' ' + p.name + (p.open_mode ? ' · ' + p.open_mode : '');
     if (p.open_mode && p.open_mode !== 'READ WRITE') opt.style.color = 'var(--c-dim)';
@@ -17392,92 +17503,351 @@ function _populatePDBSelect(pdbs) {
   });
 }
 
+// Clears every value that belongs to the container we are LEAVING (copy of switchDatabase STEP 2), so a CDB value can never
+// stay on screen under a PDB label or the other way round.
+function _resetPanelsForContainerSwitch() {
+  try { if (typeof hmReset === 'function') hmReset('Switching container…'); } catch (_) {}   // History Manager is per container too
+  // ══════════════════════════════════════════════════════════════════════════
+  // STEP 2 — CLEAR ALL STALE DATA & RESET EVERY UI ELEMENT
+  // Do this synchronously so there is ZERO flicker of old-DB values.
+  // Every panel that shows database data must be cleared here.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  // ── Helper: clear a table body with a "switching" placeholder ──
+  const _clearTable = (id, cols) => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = '<tr><td colspan="' + cols + '" style="text-align:center;color:var(--c-dim);padding:20px">Switching container…</td></tr>';
+  };
+  // ── Helper: clear a div / panel body ──
+  const _clearDiv = (id, msg) => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = '<div style="color:var(--c-dim);text-align:center;padding:40px">' + (msg || 'Switching container…') + '</div>';
+  };
+
+  // ── Dashboard KPI cards → blank "—" ──
+  const _kpiReset = [
+    ['mv-cpu','—'], ['ms-cpu','Loading…'], ['mv-buf','—'], ['ms-buf','Loading…'],
+    ['mv-sess','—'],['ms-sess','Loading…'],['mv-ts','—'], ['ms-ts','Loading…'],
+    ['m-active-sess','—'], ['m-blocked-sess','—']
+  ];
+  _kpiReset.forEach(([id, v]) => { const el = document.getElementById(id); if (el) el.textContent = v; });
+  ['m-cpu','m-buf','m-sess','m-ts'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.className = 'metric info';
+  });
+
+  // ── DB Info banner → blank ──
+  ['dbi-name','dbi-startup','dbi-version','dbi-os','dbi-cpu','dbi-rac','dbi-cdb','dbi-dg'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) { const sp = el.querySelector('.dbi-val'); if (sp) sp.textContent = '…'; }
+  });
+  const dbiMeta = document.getElementById('dash-dbinfo-meta');
+  if (dbiMeta) dbiMeta.textContent = 'Switching…';
+
+  // ── Session table → blank ──
+  _clearTable('live-sessions-tbody', 8);
+
+  // ── Top SQL table → blank ──
+  _clearTable('top-sql-tbody', 8);
+
+  // ── Wait bars & tablespace bars → blank ──
+  const waitBars = document.getElementById('wait-bars');
+  if (waitBars) waitBars.innerHTML = '';
+  const tsBars = document.getElementById('tablespace-bars');
+  if (tsBars) tsBars.innerHTML = '';
+
+  // ── IO chart history → reset so delta calc starts fresh for new DB ──
+  _ioHistory.reads.length  = 0;
+  _ioHistory.writes.length = 0;
+  _ioLast     = null;
+  _ioInflight = false;
+
+  // ── Dashboard last-refresh timestamp → blank ──
+  _dashLastRefreshMs = 0;
+  const dashRefEl = document.getElementById('dash-last-refresh');
+  if (dashRefEl) dashRefEl.textContent = '';
+
+  // ── Clear in-memory metrics state ──
+  state.liveMetrics    = null;
+  state.liveMetricsRaw = null;
+
+  // ── Tablespace panel → blank ──
+  _clearTable('tablespace-tbody', 6);
+  const tsKpis = ['ts-kpi-largest-name','ts-kpi-largest-pct','ts-kpi-critical-count','ts-kpi-autoext-count'];
+  tsKpis.forEach(id => { const el = document.getElementById(id); if (el) el.textContent = '—'; });
+
+  // ── Storage panel → blank ──
+  _clearTable('storage-ts-tbody', 5);
+  _clearTable('storage-df-tbody', 5);
+  _clearTable('storage-undo-tbody', 4);
+  ['storage-total-gb','storage-used-gb','storage-free-gb','storage-pct'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.textContent = '—';
+  });
+
+  // ── Sessions panel → blank ──
+  _clearTable('sessions-all-tbody', 9);
+  _clearTable('sessions-active-tbody', 9);
+  _clearTable('sessions-blocked-tbody', 7);
+  _clearTable('sessions-locks-tbody', 6);
+  ['sessions-total','sessions-active-count','sessions-blocked-count','sessions-max'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.textContent = '—';
+  });
+
+  // ── Performance panel → blank ──
+  ['perf-dbtime','perf-cputime','perf-logical','perf-physical','perf-hard-parse','perf-execute'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.textContent = '—';
+  });
+  _clearDiv('perf-wait-breakdown');
+  _clearDiv('perf-top-waits-list');
+  _clearDiv('perf-sga-list');
+
+  // ── Monitoring panel → blank ──
+  _clearTable('mon-sessions-tbody', 8);
+  _clearTable('mon-locks-tbody', 5);
+  _clearTable('mon-waits-tbody', 4);
+  ['mon-active','mon-blocked','mon-deadlocks','mon-top-wait'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.textContent = '—';
+  });
+
+  // ── Alerts panel → blank ──
+  _clearDiv('alerts-list');
+  _clearDiv('alerts-deadlocks-list');
+  _clearDiv('alerts-longrunning-list');
+
+  // ── Scheduler panel → blank ──
+  // FIX: the element ids below used to be wrong (sched-running-tbody /
+  // sched-failed-tbody / sched-upcoming-tbody / *-count) and didn't match any
+  // element in the Scheduler Jobs panel (which actually uses sched-jobs-tbody,
+  // sched-failures-tbody, and sched-total/-running/-failed/-disabled). Because
+  // of that mismatch, NOTHING in the Scheduler panel was ever cleared on a
+  // database switch — the previous database's jobs, failures, and KPI numbers
+  // stayed on screen (looking like "B db data showing in A db") until the
+  // next successful refresh completed for the new database.
+  _clearTable('sched-jobs-tbody', 7);
+  _clearTable('sched-failures-tbody', 5);
+  ['sched-total','sched-running','sched-failed','sched-disabled'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.textContent = '—';
+  });
+  // Reset the owner filter dropdown too — otherwise it keeps showing the OLD
+  // database's list of schema owners (this is what caused the scheduler
+  // "owner" dropdown to look wrong/stuck after switching databases).
+  const schedOwnerSel = document.getElementById('sched-owner-filter');
+  if (schedOwnerSel) schedOwnerSel.innerHTML = '<option value="ALL">All Owners</option>';
+
+  // ── Schema panel → blank ──
+  _clearDiv('schema-obj-list');
+  _clearTable('schema-tables-tbody', 6);
+  _clearTable('schema-indexes-tbody', 5);
+  _clearTable('schema-constraints-tbody', 5);
+
+  // ── Users / Privileges panel → blank ──
+  _clearTable('users-tbody', 7);
+  _clearTable('privesc-tbody', 5);
+  ['users-total','users-active','users-locked','users-expired'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.textContent = '—';
+  });
+
+  // ── RMAN panel → blank ──
+  _clearDiv('rman-jobs-list');
+  _clearTable('rman-tbody', 6);
+
+  // ── Data Guard panel → blank ──
+  // NOTE: this used to call _clearDiv('dg-status-list') / _clearTable('dg-tbody', 5),
+  // but neither id exists anywhere in the Data Guard panel markup (stale ids left
+  // over from an earlier layout) — so the "clear" was a silent no-op and the
+  // previous database's DG role/mode/lag/tables stayed on screen after switching
+  // until the user manually hit Refresh. Clearing the actual ids instead.
+  ['dg-role','dg-mode','dg-logmode','dg-switchover','dg-broker','dg-guard','dg-applylag','dg-tranlag'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.textContent = '—';
+  });
+  const dgModeSub = document.getElementById('dg-mode-sub');
+  if (dgModeSub) { dgModeSub.textContent = 'Configured mode'; dgModeSub.style.color = ''; }
+  const dgMembersBox = document.getElementById('dg-config-members-box');
+  if (dgMembersBox) dgMembersBox.innerHTML = 'Switching container…';
+  const dgNotConf = document.getElementById('dg-not-configured');
+  if (dgNotConf) dgNotConf.style.display = 'none';
+  const dgBadge = document.getElementById('dg-live-badge');
+  if (dgBadge) dgBadge.style.display = 'none';
+  const dgRefEl = document.getElementById('dg-last-refresh');
+  if (dgRefEl) { dgRefEl.textContent = '—'; dgRefEl.dataset.base = ''; }
+  _clearTable('dg-dest-tbody', 7);
+  _clearTable('dg-curlog-tbody', 4);
+  _clearTable('dg-destcfg-tbody', 9);
+  _clearDiv('dg-dest2-box');
+
+  // ── Standby Health Check (SSH) results → blank ──
+  // Leave the connection form fields (host/user/pass/sid/connstr) as the user
+  // typed them — only clear the results of the last run, since those belong to
+  // whichever standby host was checked and shouldn't linger looking "current".
+  ['dg-sb-role','dg-sb-openmode','dg-sb-applylag','dg-sb-tranlag'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.textContent = '—';
+  });
+  const dgSbStatus = document.getElementById('dg-sb-status');
+  if (dgSbStatus) dgSbStatus.textContent = '';
+  const dgSbLastRef = document.getElementById('dg-sb-last-refresh');
+  if (dgSbLastRef) dgSbLastRef.textContent = '—';
+  const dgSbResults = document.getElementById('dg-sb-results');
+  if (dgSbResults) dgSbResults.style.display = 'none';
+  ['ALLPROC','ARCHGAP','DATAFILE','FAL','HEALTH','LAG','LASTLOG','MRP','RECOVERY','SRL'].forEach(t => {
+    const el = document.getElementById('dg-sb-tbl-' + t);
+    if (!el) return;
+    // Clear the thead row's cells and the tbody's rows, but keep the
+    // <thead><tr></tr></thead><tbody></tbody> shell intact — _dgRenderCsvTable()
+    // does table.querySelector('thead tr') and writes to it directly, so wiping
+    // the whole table's innerHTML here breaks that on the very next render.
+    const thead = el.querySelector('thead tr');
+    const tbody = el.querySelector('tbody');
+    if (thead) thead.innerHTML = '';
+    if (tbody) tbody.innerHTML = '';
+  });
+  const noteEl = document.getElementById('dg-sb-lag-partial-note');
+  if (noteEl) noteEl.remove();
+
+  // ── RAC panel → blank ──
+  _clearDiv('rac-instances-list');
+  _clearTable('rac-tbody', 5);
+
+  // ── Archivelog panel → blank ──
+  _clearTable('arch-logs-tbody', 6);
+  _clearTable('arch-fra-files-tbody', 4);
+  ['arch-fra-pct','arch-fra-used','arch-gen-rate','arch-oldest'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.textContent = '—';
+  });
+  const archBar = document.getElementById('arch-fra-bar'); if (archBar) archBar.style.width = '0%';
+
+  // ── Advisory panel → blank ──
+  _clearDiv('adv-list');
+  _clearTable('adv-seg-tbody', 5);
+
+  // ── Capacity Planning panel → blank ──
+  // Without this, if the panel was already rendered for the OLD database, its narrative summary,
+  // SSH-connect form (prefilled with the OLD host), and charts stayed on screen showing the
+  // previous database's IP/data until the user manually hit Refresh. showPanel('capacity') does
+  // re-fetch automatically when the panel is next opened, but we still wipe it here so there is
+  // never a stale frame in between — consistent with every other panel above.
+  _clearDiv('cap-narrative-summary', 'Switching container…');
+  const capMeta = document.getElementById('capacity-last-refresh');
+  if (capMeta) { capMeta.textContent = '—'; delete capMeta.dataset.base; delete capMeta.dataset.tsMs; }
+  const capLiveBadge = document.getElementById('capacity-live-badge');
+  if (capLiveBadge) capLiveBadge.style.display = 'none';
+  ['cap-exec-bar-objects','cap-exec-bar-risk','cap-exec-bar-cpu','cap-growth-svg-wrap',
+   'cap-dbgrowth-custom-chart','cap-forecast-chart','cap-longforecast-chart',
+   'cap-partition-count-chart','cap-partition-new-wrap','cap-asm-pie','cap-asm-bars',
+   'cap-cpu-gauge','cap-mem-pie','cap-io-pie','cap-datafile-ceiling','cap-resource-chart'
+  ].forEach(id => { const el = document.getElementById(id); if (el) el.innerHTML = ''; });
+  const capIoNote = document.getElementById('cap-io-note'); if (capIoNote) capIoNote.textContent = '';
+
+  // ── Audit panel → blank ──
+  _clearTable('audit-tbody', 6);
+
+  // ── Redo log panel → blank ──
+  _clearTable('redo-tbody', 7);
+
+  // ── Logs panel → full wipe ──
+  _logsRawLines    = { alert: [], listener: [] };
+  _traceFiles      = [];
+  _activeTraceFile = null;
+  _traceContent    = {};
+  _logsCurrentTab  = 'alert';
+  ['alert-log-body','listener-log-body'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = '<div style="color:var(--c-dim);text-align:center;padding:40px">Switching container…</div>';
+  });
+  const traceList = document.getElementById('trace-file-list');
+  if (traceList) traceList.innerHTML = '<div style="color:var(--c-dim);text-align:center;padding:30px 10px">Switching container…</div>';
+  const traceBodyEl = document.getElementById('trace-file-body');
+  if (traceBodyEl) traceBodyEl.innerHTML = '';
+  const logsRefreshEl = document.getElementById('logs-last-refresh');
+  if (logsRefreshEl) { logsRefreshEl.textContent = 'Not loaded'; delete logsRefreshEl.dataset.base; delete logsRefreshEl.dataset.tsMs; }
+  const logsBadge = document.getElementById('logs-live-badge');
+  if (logsBadge) logsBadge.style.display = 'none';
+  switchLogTab('alert');
+  initLogTimeDefaults();
+
+  // (the PDB drop-down is deliberately NOT cleared here: the list of PDBs does not change when we move between containers,
+  //  and emptying it left the box showing "CDB Root" while we were inside a PDB - so choosing CDB Root fired no change event)
+
+  // ── Per-panel refresh-time spans → blank so countdowns reset ──
+  window._PANEL_REFRESH_SPANS.forEach(({ id }) => {
+    const el = document.getElementById(id);
+    if (el) { el.textContent = 'Not loaded'; delete el.dataset.base; delete el.dataset.tsMs; }
+  });
+  // Also clear the central panel-refresh-times registry
+  if (window._panelRefreshTimes) {
+    Object.keys(window._panelRefreshTimes).forEach(k => { delete window._panelRefreshTimes[k]; });
+  }
+
+}
+
+let _containerSwitching = false;
 async function switchContainer(value) {
   const badge  = document.getElementById('container-type-badge');
   const label  = document.getElementById('container-type-label');
   const selEl  = document.getElementById('cdb-pdb-switcher');
+  const prev   = _activeContainer || '__cdb__';
+  const prevName = state.currentContainer || (prev === '__cdb__' ? 'CDB$ROOT' : String(prev).toUpperCase());
+  const displayName = value === '__cdb__' ? 'CDB$ROOT' : value.toUpperCase();
+  const expectName = (value !== '__cdb__' && selEl && selEl.options[selEl.selectedIndex]) ? (selEl.options[selEl.selectedIndex].dataset.pdb || '') : '';
 
-  // Determine display name (the select option text contains the PDB name)
-  const selectedText = selEl ? (selEl.options[selEl.selectedIndex]?.text || value) : value;
-  const displayName  = value === '__cdb__' ? 'CDB$ROOT' : value.toUpperCase();
-
-  // Update badge optimistically
-  if (value === '__cdb__') {
-    badge.textContent = 'C';
-    badge.style.background = 'rgba(26,184,160,.2)';
-    badge.style.color = 'var(--c-tealL)';
-    label.textContent = 'CDB$ROOT';
-    label.style.color = 'var(--c-tealL)';
-  } else {
-    badge.textContent = 'P';
-    badge.style.background = 'rgba(59,125,216,.2)';
-    badge.style.color = 'var(--c-blueL)';
-    label.textContent = displayName;
-    label.style.color = 'var(--c-blueL)';
-  }
+  const paint = (isRoot, text, bad) => {
+    if (!badge || !label) return;
+    badge.textContent = isRoot ? 'C' : 'P';
+    badge.style.background = bad ? 'rgba(232,69,69,.2)' : isRoot ? 'rgba(26,184,160,.2)' : 'rgba(59,125,216,.2)';
+    badge.style.color = bad ? 'var(--c-red)' : isRoot ? 'var(--c-tealL)' : 'var(--c-blueL)';
+    label.textContent = text;
+    label.style.color = bad ? 'var(--c-red)' : isRoot ? 'var(--c-tealL)' : 'var(--c-blueL)';
+  };
 
   if (!state.connected || state.demoMode) {
     _activeContainer = value;
+    paint(value === '__cdb__', displayName);
     addToast(value === '__cdb__' ? 'Switched to CDB$ROOT (demo)' : 'Switched to PDB: ' + displayName + ' (demo)', 'blue');
     return;
   }
+  if (_containerSwitching) {                       // two quick clicks must not race each other
+    if (selEl) selEl.value = prev;
+    addToast('⚠ Container switch already in progress…', 'yellow');
+    return;
+  }
+  _containerSwitching = true;
+  if (selEl) selEl.disabled = true;
+  if (badge) { badge.textContent = '…'; badge.style.background = 'rgba(245,200,66,.2)'; badge.style.color = 'var(--c-yellow)'; }
+  if (label) label.textContent = 'Switching…';
 
-  // Show switching indicator on badge
-  badge.textContent = '…';
-  badge.style.background = 'rgba(245,200,66,.2)';
-  badge.style.color = 'var(--c-yellow)';
-  label.textContent = 'Switching…';
+  const revert = (msg) => {
+    if (selEl) selEl.value = prev;
+    paint(prev === '__cdb__', prevName);           // screen still shows (and requests still use) the previous container
+    addToast(msg, 'red');
+  };
 
   try {
     const resp = await fetchWithTimeout(state.proxyUrl + _withDbId('/api/oracle/set-container'), {
       method : 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body   : JSON.stringify({ container: value, pdbName: value === '__cdb__' ? null : value })
+      body   : JSON.stringify({ container: value, pdbName: value === '__cdb__' ? null : value, expectName })
     }, 25000);
-    const data = await resp.json();
+    const data = await resp.json().catch(() => ({ error: 'Bad response from server' }));
 
-    if (!resp.ok || data.error) {
-      // Revert badge to previous state
-      if (_activeContainer === '__cdb__') {
-        badge.textContent = 'C'; badge.style.background = 'rgba(26,184,160,.2)'; badge.style.color = 'var(--c-tealL)';
-        label.textContent = 'CDB$ROOT'; label.style.color = 'var(--c-tealL)';
-      } else {
-        badge.textContent = 'P'; badge.style.background = 'rgba(232,69,69,.2)'; badge.style.color = 'var(--c-red)';
-        label.textContent = 'Error'; label.style.color = 'var(--c-red)';
-      }
-      // Revert dropdown selection
-      if (selEl) selEl.value = _activeContainer || '__cdb__';
-      addToast('Container switch failed: ' + (data.error || 'Unknown error'), 'red');
-      return;
-    }
+    if (!resp.ok || data.error) { revert('Container switch failed: ' + (data.error || 'Unknown error')); return; }
 
-    // Success
+    // SUCCESS — from this line on every request carries the NEW container.
     _activeContainer = value;
-    state.currentContainer = value === '__cdb__' ? 'CDB$ROOT' : (data.service || displayName).toUpperCase();
-    if (value === '__cdb__') {
-      badge.textContent = 'C';
-      badge.style.background = 'rgba(26,184,160,.2)';
-      badge.style.color = 'var(--c-tealL)';
-      label.textContent = 'CDB$ROOT';
-      label.style.color = 'var(--c-tealL)';
-      addToast('✓ Connected to CDB$ROOT', 'green');
-    } else {
-      badge.textContent = 'P';
-      badge.style.background = 'rgba(59,125,216,.2)';
-      badge.style.color = 'var(--c-blueL)';
-      label.textContent = (data.service || displayName).toUpperCase();
-      label.style.color = 'var(--c-blueL)';
-      addToast('✓ Connected to PDB: ' + (data.service || displayName).toUpperCase(), 'blue');
-    }
-    // Refresh all live data for the new container
-    refreshDashboard();
+    window._dbSwitchEpoch = (window._dbSwitchEpoch || 0) + 1;   // anything still in flight for the OLD container is discarded when it arrives
+    _dbInfoCached = false;                                      // DB-info banner (name / CDB / instance) must be re-read for the new container
+    if (selEl) selEl.value = value;                             // a rejected double-click may have flipped the dropdown back
+    try { _resetPanelsForContainerSwitch(); } catch (e) { console.warn('[container switch] panel reset incomplete:', e && e.message); }   // must never leave the switch half-done
+    const real = String(data.conName || displayName).toUpperCase();   // the container the server PROVED it connected to
+    state.currentContainer = real;
+    paint(value === '__cdb__', real);
+    addToast(value === '__cdb__' ? '✓ Connected to CDB$ROOT' : '✓ Connected to PDB: ' + real, value === '__cdb__' ? 'green' : 'blue');
 
-  } catch(e) {
-    // Network / timeout error
-    badge.textContent = '!'; badge.style.background = 'rgba(232,69,69,.2)'; badge.style.color = 'var(--c-red)';
-    label.textContent = 'Error'; label.style.color = 'var(--c-red)';
-    if (selEl) selEl.value = _activeContainer || '__cdb__';
-    addToast('Container switch error: ' + e.message, 'red');
+    refreshDashboard();                                         // dashboard KPIs, sessions, top SQL, alerts, tablespaces ...
+    try { const a = document.querySelector('.panel.active'); if (a) showPanel(a.id.replace(/^panel-/, '')); } catch (e) {}   // and the panel the user is looking at
+  } catch (e) {
+    revert('Container switch error: ' + e.message);
+  } finally {
+    _containerSwitching = false;
+    if (selEl) selEl.disabled = false;
   }
 }
 
@@ -22546,6 +22916,7 @@ async function switchDatabase(i) {
   state.dbUser    = db.savedUser || '';
   _dbInfoCached = false;
   _activeContainer = '__cdb__';
+  try { if (typeof hmReset === 'function') hmReset('Switching database…'); } catch (_) {}   // History Manager must not keep the old database's rows
   // ══ CROSS-DATABASE FIX ══════════════════════════════════════════════════
   // Persist immediately so a page refresh right after switching restores
   // THIS database (matched by proxyUrl in the DOMContentLoaded handler),
@@ -28620,7 +28991,7 @@ function _renderTraceList(files) {
     const fromAlertBadge = f.fromAlert
       ? `<span style="background:rgba(255,107,43,.2);color:var(--c-orange2);border:1px solid rgba(255,107,43,.3);border-radius:3px;font-size:8px;padding:1px 4px;font-weight:600;flex-shrink:0">Alert Log</span>`
       : '';
-    const metaParts = [f.source||'', f.size||'', f.modified||''].filter(Boolean).join(' · ');
+    const metaParts = [f.source||'', f.size||'', window._isoLocal(f.modified)||''].filter(Boolean).join(' · ');
     const isActive  = _activeTraceFile === i;
     return `<div class="trace-item${isActive?' active':''}" id="trace-item-${i}" style="position:relative;padding-right:28px" title="${escHtml(f.path||'')}">
       <div style="display:flex;align-items:flex-start;gap:5px;cursor:pointer" onclick="loadTraceFile(${i})">
@@ -28655,7 +29026,7 @@ function filterTraceList() {
     const fromAlertBadge = f.fromAlert
       ? `<span style="background:rgba(255,107,43,.2);color:var(--c-orange2);border:1px solid rgba(255,107,43,.3);border-radius:3px;font-size:8px;padding:1px 4px;font-weight:600;flex-shrink:0">Alert Log</span>`
       : '';
-    const metaParts = [f.source||'', f.size||'', f.modified||''].filter(Boolean).join(' · ');
+    const metaParts = [f.source||'', f.size||'', window._isoLocal(f.modified)||''].filter(Boolean).join(' · ');
     const isActive  = _activeTraceFile === i;
     return `<div class="trace-item${isActive?' active':''}" id="trace-item-${i}" style="position:relative;padding-right:28px" title="${escHtml(f.path||'')}">
       <div style="display:flex;align-items:flex-start;gap:5px;cursor:pointer" onclick="loadTraceFile(${i})">
@@ -28790,7 +29161,7 @@ async function loadTraceFile(index) {
   if (metaEl)  metaEl.innerHTML = `
     <span>Source: <strong>${escHtml(file.source||'—')}</strong></span>
     <span>Size: <strong>${escHtml(file.size||'—')}</strong></span>
-    <span>Modified: <strong>${escHtml(file.modified||'—')}</strong></span>
+    <span>Modified: <strong>${escHtml(window._isoLocal(file.modified)||'—')}</strong></span>
     <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:420px">Path: <span style="color:var(--c-orange2);font-family:var(--font-mono)">${escHtml(file.path||'')}</span></span>`;
   if (sbEl)    sbEl.style.display = 'none';
   if (bodyEl)  bodyEl.innerHTML = '<div style="color:var(--c-dim);padding:40px;text-align:center;white-space:normal"><span style="animation:spin 1s linear infinite;display:inline-block">⟳</span> Loading trace file…</div>';
@@ -28830,7 +29201,7 @@ async function loadTraceFile(index) {
       if (metaEl) metaEl.innerHTML = `
         <span>Source: <strong>${escHtml(file.source||'—')}</strong></span>
         <span>Size: <strong>${escHtml(file.size)}</strong></span>
-        <span>Modified: <strong>${escHtml(file.modified||'—')}</strong></span>
+        <span>Modified: <strong>${escHtml(window._isoLocal(file.modified)||'—')}</strong></span>
         <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:420px">Path: <span style="color:var(--c-orange2);font-family:var(--font-mono)">${escHtml(file.path||'')}</span></span>`;
     }
 
@@ -29801,6 +30172,837 @@ function drilldownSchema(name) {
   }, 50);
 }
 
+</script>
+<!-- ═══ PANEL HISTORY VIEWER ═══ -->
+<style>
+#hist-modal{display:none;position:fixed;inset:0;z-index:9500;background:rgba(0,0,0,.65);align-items:center;justify-content:center}
+#hist-modal.open{display:flex}
+#hist-box{background:var(--c-surface);color:var(--c-text);border:1px solid var(--c-border2);border-radius:var(--rad);width:98vw;height:95vh;display:flex;flex-direction:column;font-family:var(--font-main)}
+#hist-box header{display:flex;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--c-border);flex-wrap:wrap}
+#hist-box header b{font-size:14px;margin-right:auto}
+#hist-box select,#hist-box input,#hist-box button{background:var(--c-card2);color:var(--c-text);border:1px solid var(--c-border2);border-radius:var(--rad-sm);padding:4px 8px;font:11px var(--font-mono)}
+#hist-box button{cursor:pointer}#hist-box button:hover,#hist-box button.on{border-color:var(--c-orange);color:var(--c-orange2)}
+#hist-cov{padding:6px 14px 4px;border-bottom:1px solid var(--c-border);font:11px var(--font-mono);color:var(--c-muted)}
+#hist-cov canvas{width:100%;height:34px;display:block;cursor:pointer;margin-top:3px}
+#hist-body{flex:1;display:flex;min-height:0}
+#hist-list{width:200px;overflow:auto;border-right:1px solid var(--c-border);font:11px var(--font-mono)}
+#hist-list div{padding:4px 10px;cursor:pointer;border-bottom:1px solid var(--c-border);content-visibility:auto}
+#hist-list div:hover{background:var(--c-card2)}#hist-list div.sel{background:rgba(255,107,43,.18);color:var(--c-orange2)}
+#hist-list .day{background:var(--c-card2);color:var(--c-muted);font-weight:700;cursor:default;position:sticky;top:0}
+#hist-main{flex:1;display:flex;flex-direction:column;min-width:0}
+#hist-tabs{display:flex;gap:6px;padding:8px 14px;border-bottom:1px solid var(--c-border);align-items:center;flex-wrap:wrap}
+#hist-view{flex:1;overflow:auto;padding:10px 16px;font-size:11px}
+#hist-view table{border-collapse:collapse;margin:4px 0 14px;font:11px var(--font-mono)}
+#hist-view th,#hist-view td{border:1px solid var(--c-border);padding:3px 8px;text-align:left;white-space:nowrap;max-width:460px;overflow:hidden;text-overflow:ellipsis}
+#hist-view th{background:var(--c-card2);color:var(--c-muted);cursor:pointer;position:sticky;top:0}
+#hist-view td.n{text-align:right}
+#hist-view h4{margin:12px 0 2px;color:var(--c-orange2);font-size:12px;display:flex;gap:10px;align-items:center}
+#hist-view .add td{background:rgba(74,222,128,.12)}#hist-view .del td{background:rgba(251,113,133,.12)}
+.hist-pl{display:flex;flex-wrap:wrap;gap:4px 12px;max-height:130px;overflow:auto;border:1px solid var(--c-border);padding:6px;margin-bottom:8px;border-radius:6px}
+.hist-pl label{white-space:nowrap;font:10px var(--font-mono)}
+.hist-ch{position:relative;margin-bottom:6px}.hist-ch canvas{width:100%;height:150px;display:block;background:var(--c-card);border:1px solid var(--c-border);border-radius:6px}
+.hist-ch span{position:absolute;left:8px;top:4px;right:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font:11px var(--font-mono);color:var(--c-text);pointer-events:none}
+#hist-help{padding:6px 14px;font-size:11px;line-height:1.5;color:var(--c-muted);background:var(--c-card);border-bottom:1px solid var(--c-border)}
+.hist-note{background:var(--c-card);border:1px solid var(--c-border);border-radius:6px;padding:8px 10px;margin-bottom:8px;line-height:1.6;color:var(--c-muted)}
+.hist-grp{flex-basis:100%;font:700 10px var(--font-main);color:var(--c-orange2);text-transform:uppercase;letter-spacing:.5px;margin-top:4px}
+.hist-sum{display:flex;gap:10px;flex-wrap:wrap;margin:6px 0 10px}.hist-sum b{padding:3px 10px;border-radius:12px;font:600 11px var(--font-mono);background:var(--c-card2);border:1px solid var(--c-border)}
+.d-up{color:var(--c-green)}.d-down{color:var(--c-red)}.tag-add{color:var(--c-green);font-weight:700}.tag-del{color:var(--c-red);font-weight:700}
+</style>
+<div id="hist-modal" onclick="if(event.target===this)histClose()"><div id="hist-box">
+  <header><b id="hist-title">History</b>
+    <span id="hist-presets"></span>
+    <input type="datetime-local" id="hist-from" onchange="histLoad()"> →
+    <input type="datetime-local" id="hist-to" onchange="histLoad()">
+    <button onclick="histStep(-1)" title="older snapshot">◀</button><button onclick="histStep(1)" title="newer snapshot">▶</button>
+    <button onclick="histTravel()" title="open the real dashboard panels as of this snapshot time" style="border-color:var(--c-orange)">⏪ Open in dashboard</button><button onclick="histDownload()">⬇ JSON</button><button onclick="histSql()" title="SQL that reads this panel's history from the database table">🧾 SQL</button><button onclick="histClose()">✕</button></header>
+  <div id="hist-cov"><span id="hist-covtxt"></span><canvas id="hist-covcv"></canvas></div>
+  <div id="hist-body"><div id="hist-list"></div>
+    <div id="hist-main">
+      <div id="hist-tabs"><button data-t="snap" class="on" onclick="histTab('snap')" title="What the panel looked like at the selected time">📋 Snapshot</button><button data-t="diff" onclick="histTab('diff')" title="What changed between two snapshots">🔍 Changes</button><select id="hist-cmp" onchange="histRender()" title="what to compare this snapshot with"><option value="0">vs previous snapshot</option><option value="3600000">vs 1 hour earlier</option><option value="86400000">vs 24 hours earlier</option><option value="604800000">vs 7 days earlier</option></select>
+        <input id="hist-filter" placeholder="filter rows…" oninput="histRender()" style="margin-left:auto"><span id="hist-when" style="color:var(--c-muted);font:11px var(--font-mono)"></span></div>
+      <div id="hist-help"></div>
+      <div id="hist-view">Loading…</div>
+    </div></div>
+</div></div>
+<script>
+(function(){
+  const base=()=> (typeof state!=='undefined'&&state.proxyUrl)||localStorage.getItem('proxyUrl')||'http://localhost:8080';
+  const db=()=> (typeof _currentDbId==='function'&&_currentDbId())||'';
+  const cont=()=> (typeof _activeContainer!=='undefined'&&_activeContainer)||'';
+  const api=(p,q)=>fetch(base()+'/api/history/'+p+'?'+new URLSearchParams(Object.assign({dbId:db(),container:cont()},q))).then(r=>r.json());
+  const $=id=>document.getElementById(id);
+  const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const tl=d=>{const z=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+z(d.getMonth()+1)+'-'+z(d.getDate())+'T'+z(d.getHours())+':'+z(d.getMinutes());};
+  const fmt=t=>new Date(t).toLocaleString();const isoLoc=v=>window._isoLocal(v);
+  const css=v=>getComputedStyle(document.body).getPropertyValue(v).trim()||'#888';
+  let EP='',LABEL='',snaps=[],idx=-1,cur=null,tab='snap',trendSel=null,trendData=null,reqId=0;
+  const PRE=[['1h',1/24],['6h',.25],['24h',1],['3 days',3],['7 days',7],['30 days',30]];
+  $('hist-presets').innerHTML=PRE.map(p=>`<button onclick="histPreset(${p[1]})">${p[0]}</button>`).join(' ');
+  const rng=()=>({from:new Date($('hist-from').value).getTime(),to:new Date($('hist-to').value).getTime()+59999});
+  window.histClose=()=>$('hist-modal').classList.remove('open');
+  window.histReset=()=>{reqId++;snaps=[];idx=-1;cur=null;trendData=null;EP='';$('hist-modal').classList.remove('open');$('hist-list').innerHTML='';$('hist-view').textContent='';};
+  window.histPreset=d=>{const n=new Date();$('hist-to').value=tl(n);$('hist-from').value=tl(new Date(n-d*864e5));histLoad();};
+  window.histOpen=function(ep,label){
+    EP=ep;LABEL=label||ep;trendSel=null;$('hist-title').textContent='🕘 History — '+LABEL;
+    $('hist-modal').classList.add('open');histPreset(3);
+  };
+  window.histLoad=async function(){
+    const my=++reqId; $('hist-view').textContent='Loading…';
+    const r=await api('data',Object.assign({endpoint:EP},rng())).catch(()=>({}));
+    if(my!==reqId)return;
+    snaps=(r.snapshots||[]).sort((a,b)=>a.ts-b.ts); trendData=null; window.__histBad=r.unreadable||0;
+    drawList(); drawCoverage();
+    if(!snaps.length){cur=null;idx=-1;$('hist-view').innerHTML='No snapshots in this range. History is saved from the moment recording/auto-collect was switched on — it cannot be created for earlier times.';$('hist-when').textContent='';return;}
+    histPick(snaps.length-1);
+  };
+  function drawList(){
+    let h='',day='';
+    for(let i=snaps.length-1;i>=0;i--){
+      const d=new Date(snaps[i].ts),dk=d.toDateString();
+      if(dk!==day){day=dk;const c=snaps.filter(s=>new Date(s.ts).toDateString()===dk).length;h+=`<div class="day">${esc(dk)} · ${c}</div>`;}
+      h+=`<div data-i="${i}" onclick="histPick(${i})">${d.toLocaleTimeString()}</div>`;
+    }
+    $('hist-list').innerHTML=h;
+  }
+  function drawCoverage(){
+    const cv=$('hist-covcv'),{from,to}=rng(),w=cv.width=cv.clientWidth*2,h=cv.height=68,c=cv.getContext('2d');
+    c.clearRect(0,0,w,h); c.fillStyle=css('--c-card2');c.fillRect(0,0,w,h);
+    const gaps=[];
+    if(snaps.length){
+      const ds=[];for(let i=1;i<snaps.length;i++)ds.push(snaps[i].ts-snaps[i-1].ts);
+      const med=ds.length?ds.slice().sort((a,b)=>a-b)[ds.length>>1]:300000, lim=Math.max(med*2.5,10*60000);
+      const X=t=>(t-from)/(to-from)*w;
+      c.fillStyle=css('--c-red');c.globalAlpha=.35;
+      for(let i=1;i<snaps.length;i++)if(snaps[i].ts-snaps[i-1].ts>lim){gaps.push([snaps[i-1].ts,snaps[i].ts]);c.fillRect(X(snaps[i-1].ts),0,X(snaps[i].ts)-X(snaps[i-1].ts),h);}
+      c.globalAlpha=1;c.fillStyle=css('--c-orange');
+      snaps.forEach(s=>c.fillRect(Math.round(X(s.ts)),10,2,h-20));
+    }
+    $('hist-covtxt').textContent=snaps.length+' snapshots'+(snaps.length?' · first '+fmt(snaps[0].ts)+' · last '+fmt(snaps[snaps.length-1].ts):'')+(gaps.length?' · '+gaps.length+' gap(s) with no data (red)':'')+(window.__histBad?' · ⚠ '+window.__histBad+' unreadable entr'+(window.__histBad>1?'ies':'y')+' skipped':'');
+    cv.onclick=e=>{if(!snaps.length)return;const t=from+(e.offsetX/cv.clientWidth)*(to-from);let b=0;snaps.forEach((s,i)=>{if(Math.abs(s.ts-t)<Math.abs(snaps[b].ts-t))b=i;});histPick(b);};
+  }
+  // ── "SQL" button: builds a ready-to-run query (JSON_TABLE) for THIS panel from the structure of the open snapshot ──
+  const sqlQ=s=>String(s).replace(/'/g,"''");
+  const jpath=(base,k)=>base+(/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)?'.'+k:'."'+String(k).replace(/"/g,'\\"')+'"');
+  const isScalar=v=>v===null||['string','number','boolean'].includes(typeof v);
+  const qcol=s=>'"'+String(s).replace(/"/g,'""').slice(0,120)+'"';
+  function arrays(o,path,depth,out){
+    if(Array.isArray(o)){if(o.length&&o.some(x=>x&&typeof x==='object'&&!Array.isArray(x)))out.push({path:path+'[*]',rows:o.filter(x=>x&&typeof x==='object'&&!Array.isArray(x))});return;}
+    if(o&&typeof o==='object'&&depth<2)for(const k of Object.keys(o))arrays(o[k],jpath(path,k),depth+1,out);
+  }
+  function scalars(o,path,depth,out){
+    if(o&&typeof o==='object'&&!Array.isArray(o)&&depth<2)for(const k of Object.keys(o)){const v=o[k];if(isScalar(v))out.push({path:jpath(path,k),name:(depth?path.replace(/^\$\.?/,'')+'.':'')+k,num:typeof v==='number'});else scalars(v,jpath(path,k),depth+1,out);}
+  }
+  function buildSql(table,ep,label,data,iv){
+    const where="WHERE  h.panel_key = '"+sqlQ(ep)+"'\nAND    h.snap_time >= SYSTIMESTAMP - INTERVAL '"+iv+"' DAY";
+    const parts=['-- History of panel "'+label+'" ('+ep+') from '+table,'-- change the INTERVAL to look further back; add AND h.con_name = ... if you collect several containers into one place',''];
+    const arr=[];arrays(data,'$',0,arr);
+    arr.slice(0,6).forEach((a,n)=>{
+      const keys=[...new Set(a.rows.slice(0,25).flatMap(r=>Object.keys(r).filter(k=>isScalar(r[k]))))].slice(0,40);
+      if(!keys.length)return;
+      const cols=keys.map(k=>{const vals=a.rows.slice(0,25).map(r=>r[k]).filter(v=>v!==null&&v!==undefined&&v!=='');const num=vals.length&&vals.every(v=>typeof v==='number'&&isFinite(v));return '         '+qcol(k)+' '+(num?'NUMBER':'VARCHAR2(4000)')+" PATH '"+sqlQ(jpath('$',k))+"'";}).join(',\n');
+      parts.push('-- '+(arr.length>1?'('+(n+1)+') ':'')+'rows of '+a.path.replace(/\[\*\]$/,''));
+      parts.push('SELECT h.snap_id, h.snap_time, j.*\nFROM   '+table+' h,\n       JSON_TABLE(h.payload, \''+sqlQ(a.path)+'\' COLUMNS (\n'+cols+'\n       )) j\n'+where+'\nORDER  BY h.snap_ts DESC;\n');
+    });
+    const sc=[];scalars(data,'$',0,sc);
+    if(sc.length){
+      const cols=sc.slice(0,30).map(s=>"       JSON_VALUE(h.payload, '"+sqlQ(s.path)+"'"+(s.num?' RETURNING NUMBER':'')+') AS '+qcol(s.name)).join(',\n');
+      parts.push('-- single values of this panel over time');
+      parts.push('SELECT h.snap_id, h.snap_time,\n'+cols+'\nFROM   '+table+' h\n'+where+'\nORDER  BY h.snap_ts DESC;\n');
+    }
+    if(!arr.length&&!sc.length)parts.push('SELECT h.snap_id, h.snap_time, h.payload\nFROM   '+table+' h\n'+where+'\nORDER  BY h.snap_ts DESC;\n');
+    return parts.join('\n');
+  }
+  window.histSql=async function(){
+    if(!cur||!cur.data){alert('Open a snapshot first.');return;}
+    let table=window._histTable||'ORADECK_HISTORY';
+    try{const r=await api('table-info',{});if(r&&r.name)table=r.name;}catch(e){}
+    const label=LABEL||EP;
+    let pgInfo=null;try{const r0=await api('table-info',{endpoint:EP});if(r0&&r0.backend==='postgres')pgInfo=r0;}catch(e){}
+    const sql=pgInfo?(()=>{const sch=pgInfo.owner,tb=sch+'.'+pgInfo.table,sc="'"+String(pgInfo.scope||'').replace(/'/g,"''")+"'",ep="'"+String(EP).replace(/'/g,"''")+"'",vs=pgInfo.views||[];
+      const t='-- PostgreSQL (psql / pgAdmin / DBeaver) - '+label+'\n';
+      if(!vs.length)return t+'-- The readable views are not created yet: History Manager -> Table & SQL -> Create (it also creates the views).\n-- Until then you can read the stored JSON:\nSELECT snap_time, payload FROM '+tb+'\nWHERE  scope = '+sc+' AND panel_key = '+ep+'\nORDER  BY snap_ts DESC LIMIT 1;\n';
+      return t+'-- every view has real columns (captured_at, container, ... + the panel fields; list views also have row_no): a plain SELECT is enough\n'
+        +vs.map(v=>'\n-- '+v+'\nSELECT * FROM '+sch+'.'+v+'\nWHERE  scope = '+sc+'\nORDER  BY snap_time DESC LIMIT 50;').join('\n')+'\n'
+        +'\n-- a time range (IST)\nSELECT * FROM '+sch+'.'+vs[0]+'\nWHERE  scope = '+sc+'\n  AND  snap_time >= TIMESTAMPTZ \'2026-10-20 00:00:00+05:30\' AND snap_time < TIMESTAMPTZ \'2026-10-21 00:00:00+05:30\'\nORDER  BY snap_time;\n'
+        +'\n-- the original JSON of the newest snapshot\nSELECT snap_time, payload FROM '+tb+'\nWHERE  scope = '+sc+' AND panel_key = '+ep+'\nORDER  BY snap_ts DESC LIMIT 1;\n';})():buildSql(table,EP,label,cur.data,1);
+    let ov=document.getElementById('hist-sql-ov');
+    if(!ov){ov=document.createElement('div');ov.id='hist-sql-ov';ov.style.cssText='position:fixed;inset:0;z-index:100000;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center';document.body.appendChild(ov);}
+    ov.style.display='flex';
+    ov.innerHTML='<div style="background:var(--c-bg2,#161b22);border:1px solid var(--c-border);border-radius:8px;padding:16px 18px;width:min(900px,94vw);max-height:90vh;display:flex;flex-direction:column;gap:8px;color:var(--c-text)"><div style="font-weight:700">🧾 SQL for this panel\'s history</div><div style="font-size:11px;color:var(--c-muted)">Run it in SQL*Plus / SQL Developer connected to the same container. Columns are generated from the data of the snapshot you are looking at.</div><textarea id="hist-sql-ta" readonly spellcheck="false" style="flex:1;min-height:320px;font:11px var(--font-mono);background:var(--c-card);color:var(--c-text);border:1px solid var(--c-border);border-radius:6px;padding:8px"></textarea><div style="display:flex;gap:8px;justify-content:flex-end"><button class="qb-btn" id="hist-sql-copy">📋 Copy</button><button class="qb-btn" onclick="document.getElementById(\'hist-sql-ov\').style.display=\'none\'">Close</button></div></div>';
+    const ta=document.getElementById('hist-sql-ta');ta.value=sql;
+    document.getElementById('hist-sql-copy').onclick=()=>{ta.select();try{navigator.clipboard.writeText(sql);}catch(e){document.execCommand('copy');}};
+  };
+  window.histStep=d=>{const i=idx+d;if(i>=0&&i<snaps.length)histPick(i);};
+  window.histPick=async function(i){
+    idx=i;document.querySelectorAll('#hist-list div[data-i]').forEach(d=>d.classList.toggle('sel',+d.dataset.i===i));
+    const sel=document.querySelector('#hist-list div.sel');if(sel)sel.scrollIntoView({block:'nearest'});
+    $('hist-when').textContent=fmt(snaps[i].ts)+'  ('+(i+1)+'/'+snaps.length+')';
+    const my=++reqId; $('hist-view').textContent='Loading…';
+    const r=await api('data',{endpoint:EP,ts:snaps[i].ts,from:snaps[i].ts,to:snaps[i].ts}).catch(()=>null);
+    if(my!==reqId)return; cur=r;
+    if(r&&r.con&&r.con.name)$('hist-when').textContent=fmt(snaps[i].ts)+'  ('+(i+1)+'/'+snaps.length+')  · container '+r.con.name;
+    histRender();
+  };
+  window.histTab=t=>{if(t==='trend')t='snap';tab=t;document.querySelectorAll('#hist-tabs button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));histRender();};
+  window.histRender=function(){
+    const v=$('hist-view'); $('hist-filter').style.display=tab==='snap'?'':'none';
+    {const HELP={snap:'📋 SNAPSHOT — exactly what this panel showed at the time selected in the left list. Click a time on the left (or the orange bars above) to look at another moment.',
+      trend:'📈 TRENDS — line charts of numbers over the selected date range (left = oldest snapshot, right = newest). Tick the numbers you want to follow.',
+      diff:'🔍 CHANGES — compares the selected snapshot with an earlier one (choose which in the drop-down): which values changed, and which table rows appeared (green) or disappeared (red).'};
+     const hp=$('hist-help');if(hp)hp.textContent=HELP[tab]||'';const cm=$('hist-cmp');if(cm)cm.style.display=tab==='diff'?'':'none';}
+    if(tab==='trend')return renderTrend(v);
+    if(!cur||cur.error){v.textContent=cur&&cur.error||'No data';return;}
+    if(tab==='snap'){v.innerHTML='';v.appendChild(renderNode(cur.data,'',$('hist-filter').value.toLowerCase()));}
+    else renderDiff(v);
+  };
+  // ── tables ──
+  const isNum=v=>v!==''&&v!=null&&isFinite(parseFloat(String(v).replace(/,/g,'')))&&/^-?[\d,.]+(e[+-]?\d+)?$/i.test(String(v).trim());
+  function csvOf(rows){const cols=[...new Set(rows.flatMap(r=>Object.keys(r)))];const q=x=>'"'+String(x==null?'':typeof x==='object'?JSON.stringify(x):x).replace(/"/g,'""')+'"';return cols.map(q).join(',')+'\n'+rows.map(r=>cols.map(c=>q(r[c])).join(',')).join('\n');}
+  function tableNode(rows,name,filter){
+    const wrap=document.createElement('div'),cols=[...new Set(rows.slice(0,200).flatMap(r=>Object.keys(r)))];
+    let data=rows,sortC=null,asc=true;
+    const h=document.createElement('h4');h.innerHTML=esc(name||'rows')+' <small style="color:var(--c-muted)">('+rows.length+' rows)</small>';
+    const b=document.createElement('button');b.textContent='⬇ CSV';b.onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csvOf(rows)],{type:'text/csv'}));a.download=(EP+'_'+name+'_'+(cur?cur.ts:'')).replace(/\W+/g,'_')+'.csv';a.click();};h.appendChild(b);
+    const t=document.createElement('table'),note=document.createElement('small');
+    const draw=()=>{
+      let d=filter?data.filter(r=>JSON.stringify(r).toLowerCase().includes(filter)):data.slice();
+      if(sortC){d.sort((x,y)=>{const a=x[sortC],b2=y[sortC];const na=parseFloat(String(a).replace(/,/g,'')),nb=parseFloat(String(b2).replace(/,/g,''));const r=(isNum(a)&&isNum(b2))?na-nb:String(a??'').localeCompare(String(b2??''));return asc?r:-r;});}
+      const shown=d.slice(0,5000);
+      t.innerHTML='<tr>'+cols.map(c=>'<th data-c="'+esc(c)+'">'+esc(c)+(sortC===c?(asc?' ▲':' ▼'):'')+'</th>').join('')+'</tr>'+shown.map(r=>'<tr>'+cols.map(c=>{const x=r[c],s=x!==null&&typeof x==='object'?JSON.stringify(x):isoLoc(x);return '<td class="'+(isNum(x)?'n':'')+'" title="'+esc(s)+'">'+esc(s)+'</td>';}).join('')+'</tr>').join('');
+      note.textContent=(filter?d.length+' match · ':'')+(d.length>5000?'showing first 5000 — use ⬇ CSV for all':'');
+      t.querySelectorAll('th').forEach(th=>th.onclick=()=>{const c=th.dataset.c;if(sortC===c)asc=!asc;else{sortC=c;asc=true;}draw();});
+    };
+    draw();wrap.append(h,t,note);return wrap;
+  }
+  function renderNode(d,name,filter){
+    const f=document.createDocumentFragment();
+    if(Array.isArray(d)){
+      const ttl=String(name||'result').replace(/\./g,' › ');
+      if(!d.length){const h=document.createElement('h4');h.innerHTML=esc(ttl)+' <small style="color:var(--c-muted)">(0 rows — the query returned nothing at this time)</small>';f.append(h);}
+      else if(typeof d[0]==='object'&&d[0]!==null&&d.every(x=>x&&typeof x==='object'&&!Array.isArray(x)))f.appendChild(tableNode(d,name,filter));
+      else{const rows=d.map(x=>({value:(x!==null&&typeof x==='object')?JSON.stringify(x):x}));f.appendChild(tableNode(rows,name||'list',filter));}
+    }else if(d&&typeof d==='object'){
+      const sc=[],kids=[];for(const k in d){const v=d[k];(v&&typeof v==='object')?kids.push([k,v]):sc.push([k,v]);}
+      if(sc.length){const h=document.createElement('h4');h.textContent=name?String(name).replace(/\./g,' › ')+' — values':'Summary values';const t=document.createElement('table');
+        t.innerHTML=sc.filter(([k,v])=>!filter||(k+' '+v).toLowerCase().includes(filter)).map(([k,v])=>'<tr><th style="cursor:default">'+esc(k)+'</th><td class="'+(isNum(v)?'n':'')+'">'+esc(v)+'</td></tr>').join('');f.append(h,t);}
+      kids.forEach(([k,v])=>f.appendChild(renderNode(v,name?name+'.'+k:k,filter)));
+    }else f.append(document.createTextNode(String(d)));
+    const w=document.createElement('div');w.appendChild(f);return w;
+  }
+  // ── diff vs previous snapshot ──
+  function flat(o,p,out,rowsOut){
+    if(Array.isArray(o)){if(o.length&&typeof o[0]==='object'&&o[0]!==null){rowsOut[p||'rows']=o;}else out[p]=JSON.stringify(o);}
+    else if(o&&typeof o==='object'){for(const k in o)flat(o[k],p?p+'.'+k:k,out,rowsOut);}
+    else out[p]=o;
+  }
+  // fields that are just "when was this collected" - they differ in every snapshot and would hide the real changes
+  // Fields the SERVER fills with 'right now' on every request (found by auditing server.js). They differ in every snapshot
+  // although nothing changed. Everything else is real data, so it is NEVER ignored (e.g. the nmon 'time' column of rac/cluster-check).
+  const NOISE_BY_EP={'alerts':['time'],'anomaly-signals':['checkedAt'],'io-stats':['ts'],'ddl':['generated'],'rac/cluster-check':['sampledAt']};
+  const noiseKeys=()=>new Set(NOISE_BY_EP[EP]||[]);
+  const isNoise=k=>noiseKeys().has(String(k).split('.').pop().replace(/\[\d+\]$/,''));
+  const stripN=o=>{if(!o||typeof o!=='object'||Array.isArray(o))return o;const nk=noiseKeys(),r={};for(const k in o)if(!nk.has(k))r[k]=o[k];return r;};
+  const delta=(x,y)=>{if(!isNum(x)||!isNum(y))return '';const d=parseFloat(String(y).replace(/,/g,''))-parseFloat(String(x).replace(/,/g,''));if(!d)return '';return '<span class="'+(d>0?'d-up':'d-down')+'">'+(d>0?'▲ +':'▼ ')+(+d.toFixed(2)).toLocaleString()+'</span>';};
+  async function renderDiff(v){
+    const back=+$('hist-cmp').value;let pi=idx-1;
+    if(back>0){const target=snaps[idx].ts-back;pi=-1;for(let i=idx-1;i>=0;i--){if(snaps[i].ts<=target){pi=i;break;}}
+      if(pi<0){v.textContent='No snapshot at or before '+fmt(target)+' in the loaded range — widen the date range above (e.g. 7 days or 30 days).';return;}}
+    if(pi<0){v.textContent='This is the oldest snapshot in the range — there is nothing earlier to compare with. Pick a newer snapshot in the left list.';return;}
+    v.textContent='Comparing…';
+    const prev=await api('data',{endpoint:EP,ts:snaps[pi].ts,from:snaps[pi].ts,to:snaps[pi].ts}).catch(()=>null);
+    if(!prev||prev.error){v.textContent='Previous snapshot unavailable';return;}
+    const a={},ar={},b={},br={};flat(prev.data,'',a,ar);flat(cur.data,'',b,br);
+    const ch=Object.keys(Object.assign({},a,b)).filter(k=>!isNoise(k)&&String(a[k])!==String(b[k]));
+    let body='',nAdd=0,nDel=0,tblNotes='';
+    for(const k of Object.keys(Object.assign({},ar,br))){
+      const A=(ar[k]||[]).map(r=>JSON.stringify(stripN(r))),B=(br[k]||[]).map(r=>JSON.stringify(stripN(r))),cnt={};
+      A.forEach(x=>cnt[x]=(cnt[x]||0)+1);const added=[];B.forEach(x=>{if(cnt[x])cnt[x]--;else added.push(x);});
+      const cnt2={};B.forEach(x=>cnt2[x]=(cnt2[x]||0)+1);const removed=[];A.forEach(x=>{if(cnt2[x])cnt2[x]--;else removed.push(x);});
+      nAdd+=added.length;nDel+=removed.length;
+      body+='<h4>Table "'+esc(k)+'" — <span class="tag-add">'+added.length+' new</span>, <span class="tag-del">'+removed.length+' gone</span>, '+(B.length-added.length)+' unchanged</h4>';
+      if(!added.length&&!removed.length){body+='<div style="color:var(--c-muted);margin-bottom:8px">No row changes.</div>';continue;}
+      const cols=[...new Set([...added,...removed].slice(0,100).flatMap(x=>Object.keys(JSON.parse(x))))];
+      const row=(x,c,tag)=>{const r=JSON.parse(x);return '<tr class="'+c+'"><td class="tag-'+c+'">'+tag+'</td>'+cols.map(cc=>'<td>'+esc(typeof r[cc]==='object'?JSON.stringify(r[cc]):isoLoc(r[cc]))+'</td>').join('')+'</tr>';};
+      body+='<table><tr><th></th>'+cols.map(c=>'<th>'+esc(c)+'</th>').join('')+'</tr>'+added.slice(0,300).map(x=>row(x,'add','+ new')).join('')+removed.slice(0,300).map(x=>row(x,'del','− gone')).join('')+'</table>';
+      if(added.length>300||removed.length>300)body+='<small style="color:var(--c-muted)">showing first 300 of each</small>';
+    }
+    let vals='<h4>Single values that changed ('+ch.length+')</h4>'+(ch.length
+      ?'<table><tr><th>value</th><th>older</th><th>newer</th><th>difference</th></tr>'+ch.map(k=>'<tr><td title="'+esc(k)+'">'+esc(nice(k))+'</td><td>'+esc(isoLoc(a[k]))+'</td><td>'+esc(isoLoc(b[k]))+'</td><td>'+delta(a[k],b[k])+'</td></tr>').join('')+'</table>'
+      :'<div style="color:var(--c-muted);margin-bottom:8px">No single value changed.</div>');
+    const same=!ch.length&&!nAdd&&!nDel;
+    let h='<div class="hist-note">Comparing <b>older</b> snapshot <b>'+fmt(prev.ts)+'</b> with <b>newer</b> snapshot <b>'+fmt(cur.ts)+'</b>.<br>'+(noiseKeys().size?'Ignored because the server fills them with the current time on every request: <i>'+[...noiseKeys()].join(', ')+'</i>. Everything else is compared.':'Every field is compared.')+'</div>'
+      +'<div class="hist-sum"><b style="color:'+(ch.length?'var(--c-yellow)':'var(--c-muted)')+'">'+ch.length+' value(s) changed</b><b class="tag-add">'+nAdd+' row(s) new</b><b class="tag-del">'+nDel+' row(s) gone</b></div>'
+      +(same?'<div style="color:var(--c-green);font-weight:600;margin:6px 0">✅ Nothing changed between these two snapshots — the panel looked identical.</div>':'');
+    v.innerHTML=h+vals+body;
+  }
+  // ── trends over the whole selected range ──
+  function cands(o,p,out){
+    if(out.length>400||o==null)return;
+    if(Array.isArray(o)){
+      if(o.length&&typeof o[0]==='object'&&o[0]!==null){
+        out.push(p+'[*]:count');
+        const first=o[0];for(const c in first)if(isNum(first[c])){['max','avg','sum'].forEach(a=>out.push(p+'[*].'+c+':'+a));}
+      }return;
+    }
+    if(typeof o==='object'){for(const k in o)cands(o[k],p?p+'.'+k:k,out);return;}
+    if(isNum(o))out.push(p);
+  }
+  // plain-English name for a chart value, e.g. "topSQL[*].SAMPLES:max" -> "topSQL › SAMPLES — highest row value"
+  function nice(p){
+    const m=String(p).match(/^(.*?)(?::(count|max|avg|sum))?$/),base=m[1],agg=m[2];
+    const t=base.replace(/\[\*\]\./g,' › ').replace(/\[\*\]$/,'').replace(/\./g,' › ');
+    return agg==='count'?t+' — number of rows':agg==='max'?t+' — highest row value':agg==='avg'?t+' — average of rows':agg==='sum'?t+' — total of all rows':t;
+  }
+  const fmtN=n=>Math.abs(n)>=1000?Math.round(n).toLocaleString():String(+n.toFixed(2));
+  const fmtT=t=>new Date(t).toLocaleString([],{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+  async function renderTrend(v){
+    if(!cur||!cur.data){v.textContent='Pick a snapshot first (it is used to discover the values).';return;}
+    if(snaps.length<2){v.innerHTML='A trend needs at least <b>2 snapshots</b> in the selected date range, but only '+snaps.length+' was found. Widen the range (24h / 7 days) or wait for the next collection pass.';return;}
+    const all=[];cands(cur.data,'',all);
+    if(!all.length){v.textContent='This panel has no numeric values to chart.';return;}
+    if(!trendSel||trendSel.ep!==EP){const sc=all.filter(x=>!x.includes('[*]')),ct=all.filter(x=>x.endsWith(':count')),mx=all.filter(x=>x.endsWith(':max'));trendSel={ep:EP,set:new Set([...sc.slice(0,4),...ct.slice(0,2),...mx.slice(0,4)].slice(0,6))};}
+    v.innerHTML='<div class="hist-note">Every chart follows <b>one number</b> over time: left edge = <b>'+fmtT(snaps[0].ts)+'</b> (oldest snapshot), right edge = <b>'+fmtT(snaps[snaps.length-1].ts)+'</b> (newest), '+snaps.length+' snapshots. '
+      +'Numbers that come from a table are summarised per snapshot as <i>number of rows</i>, <i>highest</i>, <i>average</i> or <i>total</i> of a column. Hover a chart to read a value; click it to open that snapshot.</div>'
+      +'<div><input id="hist-ps" placeholder="search values…" style="width:240px" oninput="histPS()"> <small style="color:var(--c-muted)">tick the numbers you want to chart (max 16)</small></div><div class="hist-pl" id="hist-pl"></div><div id="hist-charts">Loading…</div>';
+    const pl=$('hist-pl'),lab=p=>`<label data-p="${esc(p)}" title="${esc(p)}"><input type="checkbox" ${trendSel.set.has(p)?'checked':''}> ${esc(nice(p))}</label>`;
+    const singles=all.filter(x=>!x.includes('[*]')),fromRows=all.filter(x=>x.includes('[*]'));
+    pl.innerHTML=(singles.length?'<span class="hist-grp">Single values</span>'+singles.map(lab).join(''):'')+(fromRows.length?'<span class="hist-grp">Summaries of table rows</span>'+fromRows.map(lab).join(''):'');
+    pl.onchange=e=>{const l=e.target.closest('label');if(!l)return;const p=l.dataset.p;e.target.checked?trendSel.set.add(p):trendSel.set.delete(p);if(trendSel.set.size>16){trendSel.set.delete(p);e.target.checked=false;alert('Max 16 charts at once');}loadCharts();};
+    window.histPS=()=>{const q=$('hist-ps').value.toLowerCase();pl.querySelectorAll('label').forEach(l=>l.style.display=(l.dataset.p+' '+l.textContent).toLowerCase().includes(q)?'':'none');};
+    loadCharts();
+  }
+  async function loadCharts(){
+    const box=$('hist-charts');if(!box)return;const paths=[...trendSel.set];
+    if(!paths.length){box.textContent='Tick at least one value above.';return;}
+    const key=EP+'|'+paths.join(',')+'|'+JSON.stringify(rng());
+    if(!trendData||trendData.key!==key){box.textContent='Loading…';const r=await api('trends',Object.assign({endpoint:EP,paths:paths.join(',')},rng())).catch(()=>({}));if(!r.series){box.textContent=r.error||'failed';return;}trendData={key,series:r.series};}
+    box.innerHTML=paths.map((p,i)=>`<div class="hist-ch"><canvas data-i="${i}"></canvas><span></span></div>`).join('');
+    // the time axis fits the snapshots we actually have (it used to span the whole 30-day range, which squashed the line into a sliver)
+    const from=snaps[0].ts,to=snaps[snaps.length-1].ts>snaps[0].ts?snaps[snaps.length-1].ts:snaps[0].ts+60000;
+    const L=54,R=12,TP=24,BT=20,H=150;let hoverT=null;
+    const draw=()=>box.querySelectorAll('canvas').forEach(cv=>{
+      const p=paths[+cv.dataset.i],pts=trendData.series[p]||[],W=cv.clientWidth||600,c=cv.getContext('2d'),lab=cv.nextSibling;
+      cv.width=W*2;cv.height=H*2;c.setTransform(2,0,0,2,0,0);c.clearRect(0,0,W,H);
+      if(!pts.length){lab.textContent=nice(p)+' — no numeric data in this range';return;}
+      const pw=W-L-R,ph=H-TP-BT,ys=pts.map(a=>a[1]),mn=Math.min(...ys),mxv=Math.max(...ys);
+      let lo=mn,hi=mxv;const pad=(hi-lo)?(hi-lo)*.12:(Math.abs(hi)*.1||1);lo-=pad;hi+=pad;
+      const X=t=>L+(t-from)/(to-from)*pw,Y=y=>TP+ph-(y-lo)/(hi-lo)*ph;
+      c.font='10px monospace';c.lineWidth=1;c.strokeStyle=css('--c-border');c.fillStyle=css('--c-muted');
+      [mxv,...(mn!==mxv?[mn]:[])].forEach(val=>{const yy=Math.round(Y(val))+.5;c.beginPath();c.moveTo(L,yy);c.lineTo(W-R,yy);c.stroke();c.textAlign='right';c.textBaseline='middle';c.fillText(fmtN(val),L-5,yy);});
+      c.textBaseline='alphabetic';c.textAlign='left';c.fillText(fmtT(from),L,H-6);c.textAlign='right';c.fillText(fmtT(to),W-R,H-6);
+      const ds=[];for(let i=1;i<pts.length;i++)ds.push(pts[i][0]-pts[i-1][0]);const lim=Math.max((ds.length?ds.slice().sort((a,b)=>a-b)[ds.length>>1]:300000)*3,15*60000);
+      c.strokeStyle=css('--c-orange');c.lineWidth=2;c.beginPath();
+      pts.forEach((a,i)=>{const x=X(a[0]),y=Y(a[1]);(i&&a[0]-pts[i-1][0]<=lim)?c.lineTo(x,y):c.moveTo(x,y);});c.stroke();
+      c.fillStyle=css('--c-orange');pts.forEach(a=>{c.beginPath();c.arc(X(a[0]),Y(a[1]),2.5,0,6.283);c.fill();});
+      let txt=nice(p)+'     lowest '+fmtN(mn)+' · highest '+fmtN(mxv)+' · latest '+fmtN(pts[pts.length-1][1]);
+      if(hoverT!=null){let b=pts[0];pts.forEach(a=>{if(Math.abs(a[0]-hoverT)<Math.abs(b[0]-hoverT))b=a;});c.strokeStyle=css('--c-text');c.lineWidth=1;c.beginPath();c.moveTo(X(b[0]),TP);c.lineTo(X(b[0]),H-BT);c.stroke();txt=nice(p)+'     │  '+fmtT(b[0])+'  =  '+fmtN(b[1]);}
+      lab.textContent=txt;
+    });
+    draw();
+    const tAt=e=>{const cv=e.target.closest('canvas');if(!cv)return null;return from+Math.min(1,Math.max(0,(e.offsetX-L)/(cv.clientWidth-L-R)))*(to-from);};
+    box.onmousemove=e=>{const t=tAt(e);if(t==null)return;hoverT=t;draw();};
+    box.onmouseleave=()=>{hoverT=null;draw();};
+    box.onclick=e=>{const t=tAt(e);if(t==null||!snaps.length)return;let b=0;snaps.forEach((s,i)=>{if(Math.abs(s.ts-t)<Math.abs(snaps[b].ts-t))b=i;});tab='snap';document.querySelectorAll('#hist-tabs button').forEach(x=>x.classList.toggle('on',x.dataset.t==='snap'));histPick(b);};
+  }
+  window.histTravel=function(){if(idx<0||!snaps.length)return;const t=snaps[idx].ts;histClose();ttStart(t,EP);};
+  window.histDownload=function(){
+    if(!cur)return;const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([JSON.stringify(cur,null,2)],{type:'application/json'}));
+    a.download=EP.replace(/\W+/g,'_')+'_'+cur.ts+'.json';a.click();
+  };
+  document.addEventListener('keydown',e=>{if(!$('hist-modal').classList.contains('open'))return;if(e.key==='Escape')histClose();else if(e.key==='ArrowLeft'&&e.target.tagName!=='INPUT')histStep(-1);else if(e.key==='ArrowRight'&&e.target.tagName!=='INPUT')histStep(1);});
+})();
+</script>
+
+<script>
+(function(){
+  const base=()=> (typeof state!=='undefined'&&state.proxyUrl)||localStorage.getItem('proxyUrl')||'http://localhost:8080';
+  const db=()=> (typeof _currentDbId==='function'&&_currentDbId())||'';
+  const cont=()=> (typeof _activeContainer!=='undefined'&&_activeContainer)||'';
+  const q=()=>'dbId='+encodeURIComponent(db())+'&container='+encodeURIComponent(cont());
+  const get=p=>fetch(base()+'/api/history/'+p+(p.includes('?')?'&':'?')+q()).then(r=>r.json());
+  const post=(p,b)=>fetch(base()+'/api/history/'+p+'?'+q(),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json());
+  const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const $=id=>document.getElementById(id);
+  const sz=b=>b>1048576?(b/1048576).toFixed(1)+' MB':b>1024?(b/1024).toFixed(0)+' KB':b+' B';
+  const ymd=d=>{const z=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+z(d.getMonth()+1)+'-'+z(d.getDate());};
+  let rows=[], delTarget=null, poll=null, collState=null, tickT=null;
+  // ── FIX: History Manager must never show another database's / container's data ──
+  // scopeNow() identifies "which database + container is on screen". Every load remembers the scope it was started for and
+  // throws its answer away if the user switched meanwhile; hmReset() blanks the panel the moment a switch starts.
+  const scopeNow=()=>db()+'|'+cont()+'|'+base();
+  let shownScope=null, loadSeq=0;
+  window.hmReset=function(why){
+    loadSeq++; shownScope=null; rows=[]; collState=null; clearTimeout(poll); poll=null;
+    const m=why||'Switching database…';
+    const b=$('hm-body'); if(b)b.innerHTML='<tr><td colspan="9" style="padding:16px;color:var(--c-dim);text-align:center">'+esc(m)+'</td></tr>';
+    const set=(id,t)=>{const e=$(id);if(e)e.textContent=t;};
+    set('hm-sub','Loading history of the selected database…'); set('hm-col-msg','');
+    const st=$('hm-store'); if(st)st.innerHTML='';
+    const vb=$('hm-verify'); if(vb){vb.style.display='none';vb.innerHTML='';}
+    set('hm-howto-sql','');
+    const so=$('hm-setup-ov'); if(so)so.style.display='none';
+    try{hmDelClose();}catch(_){}
+    try{if(typeof histReset==='function')histReset();}catch(_){}
+  };
+  const tmS=t=>t?new Date(t).toLocaleTimeString():'—';
+  const left=ms=>{ms=Math.max(0,Math.round(ms/1000));return Math.floor(ms/60)+'m '+String(ms%60).padStart(2,'0')+'s';};
+  // repaints the "Background collection" line every second (live countdown) without hitting the server
+  function hmPaintMsg(){
+    const el=$('hm-col-msg'); if(!el||!collState)return;
+    const p=$('panel-history'); if(p&&!p.classList.contains('active'))return;
+    const {c,okN,badN,skew}=collState, now=Date.now()+skew;
+    if(!c.enabled){el.innerHTML='<b style="color:var(--c-red)">○ OFF</b> — nothing is collected in the background; only panels you open are saved. Tick ON above.';return;}
+    const nxt=(c.lastPass||now)+(c.intervalMin||5)*60000;
+    el.innerHTML='<b style="color:var(--c-green)">● ON</b> — '+(c.running?'⏳ collecting right now… ':'')
+      +'last pass '+(c.lastPass?tmS(c.lastPass)+' ('+left(now-c.lastPass)+' ago)':'not yet')
+      +' ('+okN+' panels ok'+(badN?', <span style="color:var(--c-red)">'+badN+' failing</span>':'')+')'
+      +(c.running?'':' · next ≈ '+tmS(nxt)+(nxt>now?' (in '+left(nxt-now)+')':' (due now)'));
+  }
+  window.hmLoad=async function(){
+    const tb=$('hm-body'), myScope=scopeNow(), mySeq=++loadSeq;
+    if(shownScope!==null&&shownScope!==myScope)hmReset();     // the database/container changed since the last paint: never keep the old rows on screen
+    try{
+      const r=await get('endpoints'); if(!r.endpoints)throw new Error(r.error||'bad response');
+      if(mySeq!==loadSeq||myScope!==scopeNow())return;        // answer belongs to a database/container that is no longer selected - discard it
+      shownScope=myScope;
+      rows=r.endpoints;
+      window._hmBackend=(r.store&&r.store.backend)||r.backend||'oracle'; hmPaintBackend(r.store||{backend:window._hmBackend}); hmDbLoad();
+      $('hm-sub').textContent='Container: '+(r.con&&r.con.name?r.con.name+' (CON_ID '+r.con.id+', confirmed by the database)':(r.container||'—').toUpperCase())+' · history is kept separately for CDB$ROOT and every PDB · keeps '+r.retentionDays+' days · one snapshot per '+r.intervalMin+' min';
+      $('hm-col-on').checked=!!r.collectEnabled; $('hm-col-int').value=String(r.collectIntervalMin); $('hm-col-all').checked=!!r.allContainers;
+      collState={c:r.collector||{},okN:rows.filter(e=>e.status&&e.status.ok).length,badN:rows.filter(e=>e.status&&!e.status.ok).length,skew:(r.now||Date.now())-Date.now()};
+      hmPaintMsg();
+      const st=r.storage||{},mb=x=>x<1048576?(x/1024).toFixed(0)+' KB':(x/1048576).toFixed(1)+' MB',bad=rows.filter(e=>e.status&&!e.status.ok).length;
+      {const tb2=r.table,tn=(tb2&&tb2.name)||'ORADECK_HISTORY';window._histTable=tn;const mg=r.backend==='postgres';
+        let h;
+        if(r.dbError)h='<span style="color:var(--c-red)">⚠ cannot read '+(mg?'PostgreSQL':'the database')+': '+esc(r.dbError)+'</span>';
+        else if(tb2&&!tb2.exists&&mg)h='<span style="color:var(--c-red)">✗ PostgreSQL table <b>'+esc(tn)+'</b> does not exist — nothing can be saved here yet.</span> <button class="qb-btn" onclick="hmSetup()">🛠 Create table…</button>';
+        else if(tb2&&!tb2.exists)h='<span style="color:var(--c-red)">✗ History table <b>'+esc(tn)+'</b> does not exist in container <b>'+esc(tb2.container)+'</b> — nothing can be saved here yet.</span> <button class="qb-btn" onclick="hmSetup()">🛠 Create table…</button>';
+        else h=(mg?'History table (PostgreSQL): ':'History table: ')+'<b>'+esc(tn)+'</b> (container '+esc((tb2&&tb2.container)||'')+') · <b>'+((tb2&&tb2.rows)||0).toLocaleString()+'</b> snapshots · '+mb(st.bytes||0)+' of '+mb(st.maxBytes||0)+' limit'+(st.paused?' <b style="color:var(--c-red)">— LIMIT REACHED: recording is paused. Delete old history or raise '+(mg?'HISTORY_PG_MAX_MB':'HISTORY_MAX_MB')+'.</b>':'')+' <button class="qb-btn" onclick="hmSetup()">⚙ Table &amp; SQL</button>';
+        $('hm-store').innerHTML=h+(bad?' · <span style="color:var(--c-red)">'+bad+' panel(s) failing to collect (see "Last auto-collect")</span>':'');
+        try{window._hmRet=+r.retentionDays||30;hmPaintAlert(r,rows);}catch(_){}
+        const hw=$('hm-howto-sql');if(hw)hw.textContent=
+`-- which panels are stored, how many snapshots
+SELECT panel_key, COUNT(*) AS snapshots, MIN(snap_time) AS first_snap, MAX(snap_time) AS last_snap
+FROM   ${tn} GROUP BY panel_key ORDER BY panel_key;
+
+-- snapshots of one panel in the last 24 hours (newest first)
+SELECT snap_id, snap_time, con_name, query_params
+FROM   ${tn}
+WHERE  panel_key = 'alerts' AND snap_time >= SYSTIMESTAMP - INTERVAL '1' DAY
+ORDER  BY snap_ts DESC;
+
+-- the panel's rows as a normal result set (JSON_TABLE) - press "SQL" on any snapshot for a ready-made one
+SELECT h.snap_time, j.*
+FROM   ${tn} h,
+       JSON_TABLE(h.payload, '$.rows[*]' COLUMNS ("level" VARCHAR2(4000) PATH '$.level', "title" VARCHAR2(4000) PATH '$.title')) j
+WHERE  h.panel_key = 'alerts' AND h.snap_time >= SYSTIMESTAMP - INTERVAL '7' DAY;
+
+-- one number over time
+SELECT snap_time, JSON_VALUE(payload, '$.avgActive' RETURNING NUMBER) AS avg_active
+FROM   ${tn} WHERE panel_key = 'performance' ORDER BY snap_ts;`;
+        if(mg&&hw)hw.textContent=
+`-- PostgreSQL (psql / pgAdmin / DBeaver). Every panel has a ready VIEW with real columns, so a plain SELECT is enough.
+-- (the views are created by Table & SQL -> Create; press it again when a new panel appears)
+SELECT viewname FROM pg_views WHERE schemaname = '${(r.table&&r.table.owner)||'public'}' AND viewname LIKE 'v\\_%' ORDER BY 1;     -- v_history, v_metrics, v_deep_sessions_sessions, ...
+
+-- all panels, newest first, with a plain-text summary
+SELECT captured_at, panel, row_count, size_kb, summary FROM v_history WHERE scope = '<dbId@container>' ORDER BY snap_time DESC LIMIT 20;
+
+-- one panel (example: the dashboard KPIs) - the last 20 snapshots
+SELECT * FROM v_metrics WHERE scope = '<dbId@container>' ORDER BY snap_time DESC LIMIT 20;
+
+-- one day (IST)
+SELECT * FROM v_metrics WHERE scope = '<dbId@container>'
+  AND snap_time >= TIMESTAMPTZ '2026-10-20 00:00:00+05:30' AND snap_time < TIMESTAMPTZ '2026-10-21 00:00:00+05:30' ORDER BY snap_time;
+
+-- the original JSON of a snapshot (all data as it was)
+SELECT snap_time, payload FROM ${tn} WHERE scope = '<dbId@container>' AND panel_key = 'metrics' ORDER BY snap_ts DESC LIMIT 1;`;}
+      const tot=rows.reduce((n,x)=>n+(x.bytes||0),0), ord=rows.map((_,k)=>k); if(window._hmBySize!==false)ord.sort((a,b)=>(rows[b].bytes||0)-(rows[a].bytes||0)||a-b);
+      const th=$('hm-th-size'); if(th)th.textContent=window._hmBySize!==false?'Size · share ↓':'Size · share';
+      tb.innerHTML=ord.map(i=>{const e=rows[i];
+        const pr=e.problem&&(!e.status||e.problem.ts>=e.status.ts)?e.problem:null;
+        const st=pr?'<span style="color:var(--c-yellow)" title="'+esc(pr.msg)+'">⚠ not saved: '+esc(pr.msg).slice(0,60)+'</span>':e.status?(e.status.ok?'<span style="color:var(--c-green)">✓ '+new Date(e.status.ts).toLocaleTimeString()+'</span>':'<span style="color:var(--c-red)" title="'+esc(e.status.msg)+'">✗ '+esc(e.status.msg).slice(0,40)+'</span>'):(e.collectable?'—':'<span style="color:var(--c-dim)" title="open this panel once in the dashboard to create history">saved when you open the panel</span>');
+        return `<tr style="border-top:1px solid var(--c-border)">
+        <td style="padding:6px 12px"><input type="checkbox" ${e.enabled?'checked':''} onchange="hmToggle(${i},this.checked)"></td>
+        <td>${e.collectable?`<input type="checkbox" ${e.collect?'checked':''} ${e.enabled?'':'disabled'} onchange="hmCollect(${i},this.checked)">`:'<span title="This panel needs input from you (owner / name / date range / filters), so the server cannot fetch it by itself. It is saved only when you open the panel in the dashboard." style="color:var(--c-dim)">on-demand</span>'}</td>
+        <td>${esc(e.label)}${e.keepDays?` <span style="color:var(--c-yellow);font-size:10px" title="Automatic clean-up: only the last ${e.keepDays} days of this panel are kept">· keeps ${e.keepDays} d</span>`:''}</td><td style="font-family:var(--font-mono);color:var(--c-muted)">${esc(e.endpoint)}</td>
+        <td>${e.snapshots}</td><td style="white-space:nowrap" title="${e.snapshots?'average '+sz(Math.round(e.bytes/e.snapshots))+' per snapshot':''}">${sz(e.bytes)} <span style="display:inline-block;vertical-align:middle;width:46px;height:6px;background:var(--c-border);border-radius:3px;overflow:hidden;margin:0 4px"><span style="display:block;height:100%;width:${tot?Math.max(e.bytes?2:0,Math.round(100*e.bytes/tot)):0}%;background:${tot&&e.bytes/tot>=.2?'var(--c-red)':tot&&e.bytes/tot>=.1?'var(--c-yellow)':'var(--c-green)'}"></span></span><span style="color:var(--c-muted)">${tot?(100*e.bytes/tot).toFixed(e.bytes/tot<.1?1:0):0}%</span></td><td>${e.firstDay?esc(e.firstDay)+' → '+esc(e.lastDay):'—'}</td><td>${st}</td>
+        <td style="white-space:nowrap"><button class="qb-btn" ${e.snapshots?'':'disabled'} onclick="hmView(${i})">View</button>
+        <button class="qb-btn" ${e.snapshots?'':'disabled'} onclick="hmDelOpen(${i})" style="color:var(--c-red)">Delete…</button></td></tr>`;}).join('');
+      // keep the panel live: refresh every 4s while a pass is running, otherwise every 15s - but only while this panel is on screen
+      clearTimeout(poll); poll=setTimeout(()=>{const p=$('panel-history');if(p&&p.classList.contains('active'))hmLoad();},r.collecting?4000:15000);
+      if(!tickT)tickT=setInterval(hmPaintMsg,1000);
+    }catch(e){if(mySeq!==loadSeq||myScope!==scopeNow())return;rows=[];tb.innerHTML='<tr><td colspan="9" style="padding:16px;color:var(--c-yellow)">History service not reachable ('+esc(e.message)+'). Check the proxy URL in Settings and that server.js includes history_store.js.</td></tr>';}
+  };
+  window.hmRefreshBtn=async function(b){
+    const m=$('hm-refresh-msg'); if(b)b.disabled=true; if(m)m.textContent='refreshing…';
+    try{await hmLoad(); if(m)m.textContent='✓ updated '+new Date().toLocaleTimeString();}
+    catch(e){if(m)m.innerHTML='<span style="color:var(--c-red)">✗ '+esc(e&&e.message||e)+'</span>';}
+    finally{if(b)b.disabled=false;}
+  };
+  // ── warning banner: failing panels, table nearly full / full, collector not running ──
+  function hmPaintAlert(r,rowsNow){
+    const el=$('hm-alert'); if(!el)return;
+    const st=r.storage||{}, msgs=[]; const now=(r.now||Date.now());
+    const bad=rowsNow.filter(e=>e.status&&!e.status.ok&&!(e.problem&&e.problem.ts>=e.status.ts));
+    if(st.paused)msgs.push(['r','🛑 History table is FULL ('+sz(st.bytes||0)+' of '+sz(st.maxBytes||0)+'): recording is PAUSED, nothing new is saved. Delete old history (Delete history…) or raise the limit.']);
+    else if(st.maxBytes>0&&(st.bytes||0)/st.maxBytes>=0.8)msgs.push(['y','⚠ History table is '+Math.round(100*st.bytes/st.maxBytes)+'% full ('+sz(st.bytes)+' of '+sz(st.maxBytes)+'). Recording will pause at 100%.']);
+    if(bad.length)msgs.push(['r','✗ '+bad.length+' panel(s) failing to collect: '+bad.slice(0,6).map(e=>esc(e.label)).join(', ')+(bad.length>6?' …':'')+' — see "Last auto-collect" in the table.']);
+    const c=r.collector||{}, ivMs=(+r.collectIntervalMin||5)*60000;
+    if(!r.collectEnabled)msgs.push(['y','⚠ Auto-collect is OFF: history is saved only while someone has the panels open in the dashboard.']);
+    else if(!c.running){
+      if(c.lastPass&&now-c.lastPass>Math.max(3*ivMs,900000))msgs.push(['r','✗ The background collector has not run for '+Math.round((now-c.lastPass)/60000)+' min (every '+r.collectIntervalMin+' min expected). History has a gap — check the server.']);
+      else if(!c.lastPass)msgs.push(['y','⚠ The background collector has not run yet since the server started.']);
+    }
+    const col={r:'var(--c-red)',y:'var(--c-yellow)'};
+    el.innerHTML=msgs.length?msgs.map(m=>'<div style="border:1px solid '+col[m[0]]+';color:'+col[m[0]]+';border-radius:6px;padding:6px 10px;margin:4px 0;font-weight:600">'+m[1]+'</div>').join(''):'<div style="color:var(--c-green);margin:4px 0">✓ No problems: all panels collecting, table '+(st.maxBytes>0?Math.round(100*(st.bytes||0)/st.maxBytes)+'% of its limit':'within its limit')+'.</div>';
+  }
+  window.hmPaintAlert=hmPaintAlert;
+
+  // ── shared: a panel response -> readable HTML (tables for lists, key/value for single values) ──
+  const isObj=v=>v&&typeof v==='object'&&!Array.isArray(v);
+  const cellTxt=v=>v===null||v===undefined?'':(typeof v==='object'?JSON.stringify(v):String(v));
+  function dataHtml(d,name,depth){
+    depth=depth||0; if(depth>4)return '<pre>'+esc(JSON.stringify(d).slice(0,2000))+'</pre>';
+    const ttl=name?'<div style="color:var(--c-orange2);font-weight:600;margin:8px 0 2px">'+esc(name)+'</div>':'';
+    if(Array.isArray(d)){
+      if(!d.length)return ttl+'<div style="color:var(--c-dim)">0 rows (the query returned nothing at that time)</div>';
+      if(d.every(isObj)){
+        const cols=[...new Set(d.slice(0,300).flatMap(x=>Object.keys(x)))], MAXR=300;
+        return ttl+'<div style="color:var(--c-muted)">'+d.length+' row(s)'+(d.length>MAXR?' — first '+MAXR+' shown, use ⬇ Export for all':'')+'</div><div style="overflow:auto;max-height:340px"><table style="border-collapse:collapse;font-size:11px"><tr>'+cols.map(c=>'<th style="text-align:left;padding:2px 8px;border-bottom:1px solid var(--c-border);position:sticky;top:0;background:var(--c-surface)">'+esc(c)+'</th>').join('')+'</tr>'+d.slice(0,MAXR).map(x=>'<tr>'+cols.map(c=>'<td style="padding:2px 8px;border-bottom:1px solid var(--c-border);white-space:nowrap">'+esc(cellTxt(x[c]))+'</td>').join('')+'</tr>').join('')+'</table></div>';
+      }
+      return ttl+'<div>'+d.slice(0,200).map(x=>esc(cellTxt(x))).join(', ')+(d.length>200?' … ('+d.length+' items)':'')+'</div>';
+    }
+    if(isObj(d)){
+      const sc=Object.keys(d).filter(k=>d[k]===null||typeof d[k]!=='object'), kids=Object.keys(d).filter(k=>d[k]!==null&&typeof d[k]==='object');
+      return ttl+(sc.length?'<table style="border-collapse:collapse;font-size:11px">'+sc.map(k=>'<tr><th style="text-align:left;padding:2px 8px;color:var(--c-muted);font-weight:600">'+esc(k)+'</th><td style="padding:2px 8px">'+esc(cellTxt(d[k]))+'</td></tr>').join('')+'</table>':'')+kids.map(k=>dataHtml(d[k],(name?name+' › ':'')+k,depth+1)).join('');
+    }
+    return ttl+'<div>'+esc(cellTxt(d))+'</div>';
+  }
+  const countRows=d=>Array.isArray(d)?d.length:(isObj(d)?Object.keys(d).reduce((n,k)=>n+(Array.isArray(d[k])?d[k].length:0),0):0);
+  const ago=ms=>{const m=Math.round(Math.abs(ms)/60000);return m<1?'<1 min':m<90?m+' min':(m/60).toFixed(1)+' h';};
+  const pool=async(items,n,fn)=>{let i=0;const w=async()=>{while(i<items.length){const k=i++;await fn(items[k],k);}};await Promise.all(Array.from({length:Math.min(n,items.length)},w));};
+  let irText='', irSeq=0;
+  window.hmIrClose=()=>{irSeq++;$('hm-ir').style.display='none';};
+  window.hmIrCopy=()=>{try{navigator.clipboard.writeText(irText);}catch(_){} };
+  window.hmIncident=async function(){
+    const v=$('hm-ir-t').value; if(!v){alert('Choose the date and time first.');return;}
+    const ts=new Date(v).getTime(); if(!isFinite(ts)){alert('Bad date/time.');return;}
+    const my=++irSeq, scope=scopeNow(), list=rows.filter(e=>e.snapshots>0);
+    const ov=$('hm-ir'), bd=$('hm-ir-body'); ov.style.display='flex';
+    $('hm-ir-title').textContent='Incident report — '+new Date(ts).toLocaleString();
+    $('hm-ir-sub').textContent='for the database/container now selected · each panel shows its newest snapshot at or before this time (looking back up to 1 day)';
+    if(!list.length){bd.innerHTML='<div style="color:var(--c-yellow)">No panel has any snapshot yet.</div>';irText='';return;}
+    const res=new Array(list.length); let done=0;
+    bd.innerHTML='<div id="hm-ir-prog" style="color:var(--c-muted)">loading 0 / '+list.length+' panels…</div>';
+    await pool(list,6,async(e,k)=>{
+      try{const r=await get('at?'+new URLSearchParams({endpoint:e.endpoint,ts:ts,lookbackDays:1}));res[k]=r;}catch(err){res[k]={error:String(err&&err.message||err)};}
+      done++; if(my===irSeq){const p=$('hm-ir-prog');if(p)p.textContent='loading '+done+' / '+list.length+' panels…';}
+    });
+    if(my!==irSeq||scope!==scopeNow())return;      // closed, or another database/container was selected meanwhile: drop it
+    const sum=[], parts=[];
+    list.forEach((e,k)=>{
+      const r=res[k]||{};
+      if(r.found){
+        const age=ts-r.ts, n=countRows(r.data);
+        sum.push({label:e.label,ep:e.endpoint,time:new Date(r.ts).toLocaleString(),age:age,rows:n,ok:true});
+        parts.push('<details style="border:1px solid var(--c-border);border-radius:6px;margin:6px 0;padding:6px 10px"><summary style="cursor:pointer"><b>'+esc(e.label)+'</b> <span style="color:var(--c-muted)">· snapshot '+esc(new Date(r.ts).toLocaleTimeString())+' ('+ago(age)+' before) · '+n+' row(s)'+(r.approx?' · different query options than the panel default':'')+'</span></summary>'+dataHtml(r.data,'',0)+'</details>');
+      }else{
+        sum.push({label:e.label,ep:e.endpoint,time:'—',age:null,rows:0,ok:false,err:r.error});
+        parts.push('<div style="border:1px solid var(--c-border);border-radius:6px;margin:6px 0;padding:6px 10px;color:var(--c-dim)"><b>'+esc(e.label)+'</b> — '+(r.error?'could not be read: '+esc(r.error):'no snapshot in the 24 h before this time')+'</div>');
+      }
+    });
+    const found=sum.filter(x=>x.ok).length;
+    bd.innerHTML='<div style="margin-bottom:8px"><b>'+found+'</b> of '+list.length+' panels have a snapshot. Click a panel to open its data. <button class="qb-btn" onclick="document.querySelectorAll(\'#hm-ir-body details\').forEach(d=>d.open=true)">Expand all</button> <button class="qb-btn" onclick="document.querySelectorAll(\'#hm-ir-body details\').forEach(d=>d.open=false)">Collapse all</button></div>'
+      +'<table style="border-collapse:collapse;font-size:11px;margin-bottom:10px"><tr style="color:var(--c-muted);text-align:left"><th style="padding:2px 12px">Panel</th><th style="padding:2px 12px">Snapshot taken</th><th style="padding:2px 12px">Before chosen time</th><th style="padding:2px 12px">Rows</th></tr>'+sum.map(x=>'<tr><td style="padding:2px 12px">'+esc(x.label)+'</td><td style="padding:2px 12px">'+esc(x.time)+'</td><td style="padding:2px 12px">'+(x.age==null?'—':esc(ago(x.age)))+'</td><td style="padding:2px 12px">'+(x.ok?x.rows:'—')+'</td></tr>').join('')+'</table>'+parts.join('');
+    irText='Incident report for '+new Date(ts).toLocaleString()+'\n'+sum.map(x=>x.label+' | '+x.time+' | '+(x.age==null?'-':ago(x.age)+' before')+' | rows '+(x.ok?x.rows:'-')).join('\n');
+  };
+
+  window.hmToggle=async(i,on)=>{const r=await post('config',{endpoint:rows[i].endpoint,enabled:on});if(!r.ok)alert(r.error||'failed');hmLoad();};
+  window.hmCollect=async(i,on)=>{const r=await post('config',{endpoint:rows[i].endpoint,collect:on});if(!r.ok)alert(r.error||'failed');hmLoad();};
+  window.hmAll=async on=>{if(!confirm(on?'Record history for ALL panels?':'Stop recording history for ALL panels? (existing history is kept)'))return;await post('config',{all:true,enabled:on});hmLoad();};
+  window.hmMaster=async()=>{const r=await post('config',{master:true,collectEnabled:$('hm-col-on').checked,collectIntervalMin:+$('hm-col-int').value,collectAllContainers:$('hm-col-all').checked});if(!r.ok)alert(r.error||'failed');hmLoad();};
+  window.hmCollectNow=async()=>{const r=await post('collect-now',{});$('hm-col-msg').textContent=r.alreadyRunning?'already running…':'⏳ collecting now…';setTimeout(hmLoad,3000);};
+  window.hmView=i=>histOpen(rows[i].endpoint,rows[i].label);
+  // ── Create the history table: shows the exact SQL first, runs it only after confirmation, never drops anything ──
+  // header line of the Create-table dialog (also used when the owner schema is edited)
+  // ── where is history stored: Oracle table or PostgreSQL ──
+  window.hmPaintBackend=function(s){
+    s=s||{};const mg=s.backend==='postgres',mo=s.postgres||{},on='border:2px solid var(--c-orange);font-weight:700';
+    const bo=$('hm-be-oracle'),bm=$('hm-be-pg'),msg=$('hm-be-msg');
+    const off='opacity:.5';
+    if(bo){bo.style.cssText=mg?off:on;bo.textContent=(mg?'':'✓ ')+'🗄 Oracle table';}
+    if(bm){bm.style.cssText=mg?on:off;bm.textContent=(mg?'✓ ':'')+'🐘 PostgreSQL';}
+    if(!msg)return;
+    let t=mg?'new snapshots are written to <b>PostgreSQL</b> ('+esc(mo.db||'')+' · '+esc(mo.collection||'')+') — the Oracle table is not used':'new snapshots are written to the <b>Oracle table</b>';
+    if(s.requested==='postgres'&&!mg)t+=' <span style="color:var(--c-red)">· PostgreSQL is selected but history_store_postgres.js is not loaded (see the server log)</span>';
+    else if(!mg&&mo.available===false)t+=' <span style="color:var(--c-dim)">· PostgreSQL option unavailable: history_store_postgres.js not found next to history_store.js</span>';
+    msg.innerHTML=t;
+  };
+  // ── which registered databases get their history stored ──
+  window.hmDbLoad=async function(){
+    const box=$('hm-dbs-list'),msg=$('hm-dbs-msg');if(!box)return;
+    try{
+      const r=await fetch(base()+'/api/history/databases').then(x=>x.json());
+      if(!r||!r.databases)throw new Error((r&&r.error)||'bad response');
+      // the server's registry holds EVERY database anybody ever registered on it (hundreds, duplicates): show only the ones connected in THIS dashboard (Database Connections)
+      const norm=u=>String(u||'').replace(/\/+$/,'').toLowerCase(),mine=new Map();
+      try{(typeof _databases!=='undefined'?_databases:[]).forEach(x=>{if(x&&x.serverId&&(!x.url||norm(x.url)===norm(base())))mine.set(String(x.serverId),x.name||x.dbname||String(x.serverId));});}catch(_){}
+      const total=r.databases.length;
+      r.databases=r.databases.filter(d=>mine.has(String(d.id))).map(d=>Object.assign({},d,{name:mine.get(String(d.id))||d.name}));
+      window._hmDbs=r;
+      box.innerHTML=r.databases.map(d=>'<label style="color:var(--c-text);white-space:nowrap" title="'+esc(d.host||'')+'"><input type="checkbox" class="hm-dbs-cb" value="'+esc(d.id)+'" '+(d.allowed?'checked':'')+'> '+esc(d.name)+(d.active?' <span style="color:var(--c-green)">(selected now)</span>':'')+'</label>').join('')||'<span>no database registered</span>';
+      const stored=r.databases.filter(d=>d.allowed).map(d=>d.name),saved=window._hmDbSavedAt;window._hmDbSavedAt=null;
+      msg.style.color=stored.length?'var(--c-green)':'var(--c-red)';
+      msg.textContent=(stored.length?(saved?'✓ Saved at '+saved+'. ':'')+'History is being stored for '+stored.length+' database'+(stored.length>1?'s':'')+': '+stored.join(', ')+'.  All other databases are NOT stored.':'⚠ NOTHING is ticked, so NO history is stored for any database - tick the ones you want and press Save');
+    }catch(e){box.textContent='';msg.style.color='var(--c-red)';msg.textContent='✗ '+e.message;}
+  };
+  window.hmDbSave=async function(){
+    const cbs=[...document.querySelectorAll('.hm-dbs-cb')],ids=cbs.filter(c=>c.checked).map(c=>c.value),names=cbs.filter(c=>c.checked).map(c=>c.parentNode.textContent.replace('(selected now)','').trim()),msg=$('hm-dbs-msg');
+    if(!cbs.length)return;
+    const ans=prompt('Store history ONLY for these databases?\n\n'+(names.length?names.map(n=>'  • '+n).join('\n'):'  (none - nothing will be stored)')+'\n\n• Databases that are not ticked are never saved: not from the browser, not by the background collector.\n• Existing history is NOT deleted.\n\n────────────────────\nType  YES  to save, or  NO  to cancel:','');
+    let a=ans;while(a!==null&&!/^(yes|no)$/i.test(String(a).trim())){a=prompt('⚠ "'+String(a).trim().slice(0,30)+'" is not valid. Type only YES or NO.\n\nStore history ONLY for the ticked databases?','');}
+    if(a===null||String(a).trim().toLowerCase()!=='yes'){msg.style.color='var(--c-yellow)';msg.textContent='Not changed (cancelled).';hmDbLoad();return;}
+    msg.style.color='var(--c-muted)';msg.textContent='⏳ saving…';
+    try{const r=await fetch(base()+'/api/history/databases',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({allow:ids})}).then(x=>x.json());if(!r.ok)throw new Error(r.error||'failed');}
+    catch(e){msg.style.color='var(--c-red)';msg.textContent='✗ '+e.message;return;}
+    window._hmDbSavedAt=new Date().toLocaleTimeString();
+    await hmDbLoad();
+  };
+  window.hmBackend=async function(b){
+    if(window._hmBackend===b)return;
+    const q=b==='postgres'
+      ?'Store history in POSTGRESQL from now on?\n\n• New snapshots (browser + background collector) are written to PostgreSQL.\n• History Manager, "Open dashboard at this time" and the snapshot viewer then read from PostgreSQL.\n• Nothing is moved or deleted: the Oracle table keeps its data and is used again when you switch back.\n\nNeeds POSTGRES_URL in the server .env, the npm package "pg", and the table created once (Table & SQL -> Create).'
+      :'Store history in the ORACLE TABLE again?\n\n• New snapshots are written to the Oracle table.\n• History Manager and time travel read from the Oracle table again.\n• Nothing is moved or deleted: snapshots saved in PostgreSQL stay there.';
+    // critical change: the answer must be typed - only YES or NO (any case) is accepted, anything else asks again
+    let ans,bad='';
+    for(;;){
+      ans=prompt((bad?'⚠ "'+bad+'" is not valid. Type only YES or NO.\n\n':'')+q+'\n\n────────────────────\nType  YES  to confirm, or  NO  to cancel:','');
+      if(ans===null){ans='no';break;}
+      const a=String(ans).trim().toLowerCase();
+      if(a==='yes'||a==='no'){ans=a;break;}
+      bad=String(ans).trim().slice(0,30);
+    }
+    if(ans!=='yes'){const m=$('hm-be-msg');if(m){m.style.color='var(--c-yellow)';m.textContent='Not changed (cancelled).';}return;}
+    const msg=$('hm-be-msg');if(msg)msg.textContent='⏳ switching…';
+    try{const r=await post('backend',{backend:b});if(!r.ok)throw new Error(r.error||'failed');window._hmBackend=r.backend;hmPaintBackend(r);}
+    catch(e){if(msg)msg.innerHTML='<span style="color:var(--c-red)">✗ '+esc(e.message)+'</span>';return;}
+    hmLoad();
+  };
+  window.hmSuHead=function(r){if(r.backend==='postgres')return 'PostgreSQL <b style="color:var(--c-text)">'+esc(r.uri||'')+'</b> · database <b style="color:var(--c-text)">'+esc(r.database||'')+'</b> as <b style="color:var(--c-text)">'+esc(r.loginUser||'')+'</b> · table <b style="color:var(--c-text)">'+esc(r.name)+'</b> — '+(r.exists?'<b style="color:var(--c-green)">already exists ('+Number(r.rows).toLocaleString()+' snapshots of this container)</b>':'<b style="color:var(--c-yellow)">does not exist yet</b>');return 'Container: <b style="color:var(--c-text)">'+esc(r.container)+'</b> (CON_ID '+esc(r.conId)+') · connected as <b style="color:var(--c-text)">'+esc(r.loginUser)+'</b> · table <b style="color:var(--c-text)">'+esc(r.previewOwner+'.'+r.table)+'</b> — '
+      +(r.exists?'<b style="color:var(--c-green)">already exists ('+Number(r.rows).toLocaleString()+' snapshots)</b>':'<b style="color:var(--c-yellow)">does not exist yet</b>');};
+  // the owner schema was edited: rebuild the statements for THAT schema (every CREATE TABLE / INDEX / VIEW uses it), without re-drawing the dialog
+  window.hmSuRefresh=async function(){
+    const inp=$('hm-su-owner');if(!inp)return;const o=inp.value.trim().toUpperCase();let r;
+    try{r=await get('table-info?owner='+encodeURIComponent(o));}catch(e){return;}
+    if(!r||(r.error&&!r.sql))return;
+    if(!$('hm-su-owner')||$('hm-su-owner').value.trim().toUpperCase()!==o)return;     // typed again meanwhile
+    window._hmSuShown=o;$('hm-su-sql').textContent=r.sql.join('\n\n');$('hm-su-head').innerHTML=hmSuHead(r);
+  };
+  window.hmSetup=async function(owner){
+    let ov=$('hm-setup-ov');
+    if(!ov){ov=document.createElement('div');ov.id='hm-setup-ov';ov.style.cssText='position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center';document.body.appendChild(ov);}
+    ov.style.display='flex';ov.innerHTML='<div style="background:var(--c-bg2,#161b22);padding:20px;border-radius:8px;color:var(--c-text)">Loading…</div>';
+    let r;try{r=await get('table-info'+(owner!==undefined?'?owner='+encodeURIComponent(owner):''));if(r.error&&!r.sql)throw new Error(r.error);}
+    catch(e){ov.innerHTML='<div style="background:var(--c-bg2,#161b22);padding:20px;border-radius:8px;color:var(--c-red)">'+esc(e.message)+' <button class="qb-btn" onclick="hmSetupClose()">Close</button></div>';return;}
+    window._hmSuShown=String(owner!==undefined?owner:(r.configuredOwner||'')).toUpperCase();
+    const warnSys=r.loginIsSys&&!(owner!==undefined?owner:r.configuredOwner);
+    ov.innerHTML='<div style="background:var(--c-bg2,#161b22);border:1px solid var(--c-border);border-radius:8px;padding:16px 18px;width:min(820px,94vw);max-height:90vh;overflow:auto;color:var(--c-text)">'
+      +'<div style="font-weight:700;font-size:14px;margin-bottom:8px">🛠 History '+(r.backend==='postgres'?'table in PostgreSQL':'table in the database')+'</div>'
+      +'<div id="hm-su-head" style="font-size:12px;color:var(--c-muted);line-height:1.7">'+hmSuHead(r)+'</div>'
+      +'<div style="margin:10px 0;font-size:12px">Owner schema: <input id="hm-su-owner" value="'+esc(owner!==undefined?owner:(r.configuredOwner||''))+'" placeholder="empty = '+esc(r.loginSchema)+'" style="width:200px" oninput="clearTimeout(window._hmSuT);window._hmSuT=setTimeout(hmSuRefresh,600)" onkeydown="if(event.key===\'Enter\'){clearTimeout(window._hmSuT);hmSuRefresh();}"> <button class="qb-btn" onclick="hmSetup(document.getElementById(\'hm-su-owner\').value.trim().toUpperCase())">Preview</button> <span style="color:var(--c-muted)">the schema must already exist in this container</span></div>'
+      +(warnSys?'<div style="background:rgba(245,200,66,.12);border:1px solid var(--c-yellow);border-radius:6px;padding:6px 10px;margin-bottom:8px;font-size:12px">⚠ You are connected as <b>'+esc(r.loginSchema)+'</b>, so the table would be created in the <b>'+esc(r.loginSchema)+'</b> schema. A dedicated schema is recommended: create it first (DBA), then type it in <b>Owner schema</b>.</div>':'')
+      +'<div style="font-size:12px;margin-bottom:4px">These statements will run (nothing is dropped or changed if the objects already exist):</div>'
+      +'<pre id="hm-su-sql" style="background:var(--c-card);border:1px solid var(--c-border);border-radius:6px;padding:8px 10px;font:11px var(--font-mono);white-space:pre-wrap;max-height:300px;overflow:auto;user-select:all">'+esc(r.sql.join('\n\n'))+'</pre>'
+      +'<div id="hm-su-res" style="font:11px var(--font-mono);margin:8px 0"></div>'
+      +'<div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">'
+      +'<button class="qb-btn" onclick="navigator.clipboard&&navigator.clipboard.writeText(document.getElementById(\'hm-su-sql\').textContent)">📋 Copy SQL</button>'
+      +'<button class="qb-btn" onclick="hmSetupRun(false)" '+(r.exists?'':'style="border-color:var(--c-orange)"')+'>'+(r.backend==='postgres'?'Create table, indexes &amp; views':'Create in THIS container')+'</button>'
+      +(r.backend==='postgres'?'':'<button class="qb-btn" onclick="hmSetupRun(true)" title="CDB$ROOT and every open PDB">Create in ALL containers</button>')
+      +'<button class="qb-btn" onclick="hmSetupClose()">Close</button></div></div>';
+    if(r.backend==='postgres'){const ow=$('hm-su-owner');if(ow&&ow.parentNode)ow.parentNode.style.display='none';}      // PostgreSQL: the schema comes from POSTGRES_SCHEMA in the server .env
+  };
+  window.hmSetupClose=()=>{const ov=$('hm-setup-ov');if(ov)ov.style.display='none';hmLoad();};
+  window.hmSetupRun=async function(all){
+    const o=($('hm-su-owner').value||'').trim().toUpperCase(),res=$('hm-su-res');
+    if(o!==window._hmSuShown){await hmSuRefresh();res.style.color='var(--c-yellow)';res.textContent='The statements above were rebuilt for schema "'+(o||'login schema')+'" - review them and press Create again.';return;}
+    if(!confirm('Run the CREATE statements shown above in '+(all?'CDB$ROOT and EVERY open PDB':'this container')+'?\nExisting tables/indexes are never dropped or changed.'))return;
+    res.style.color='var(--c-muted)';res.textContent='⏳ running…';
+    try{
+      const r=await post('setup',{owner:o,allContainers:!!all});
+      const one=x=>(x.container?'['+esc(x.container)+'] ':'')+(x.steps?x.steps.map(s=>(s.status==='error'?'<span style="color:var(--c-red)">✗ '+esc(s.sql)+' — '+esc(s.error)+'</span>':'<span style="color:var(--c-green)">✓ '+esc(s.status)+'</span> '+esc(s.sql))).join('<br>'):'<span style="color:var(--c-red)">✗ '+esc(x.error||'failed')+'</span>');
+      res.style.color='var(--c-text)';
+      res.innerHTML=r.error?'<span style="color:var(--c-red)">✗ '+esc(r.error)+'</span>':(r.results?r.results.map(one).join('<hr style="border-color:var(--c-border)">'):one(r))+'<div style="margin-top:6px;color:var(--c-muted)">Done. Press <b>Collect now</b>, then <b>✔ Verify history</b> to confirm snapshots are being written.</div>';
+      try{res.scrollIntoView({block:'center'});}catch(_){}
+    }catch(e){res.style.color='var(--c-red)';res.textContent='✗ '+e.message;}
+  };
+  window.hmVerify=async function(){
+    const box=$('hm-verify'),vScope=scopeNow();box.style.display='block';box.innerHTML='<span style="color:var(--c-muted)">⏳ verifying…</span>';
+    try{
+      const r=await get('verify');if(!r.checks)throw new Error(r.error||'bad response');
+      if(vScope!==scopeNow())return;
+      const col={ok:'var(--c-green)',warn:'var(--c-yellow)',bad:'var(--c-red)'},ico={ok:'✓',warn:'⚠',bad:'✗'},ord={bad:0,warn:1,ok:2};
+      const sorted=r.checks.slice().sort((a,b)=>ord[a.level]-ord[b.level]);
+      const verdict=r.summary.bad?'<b style="color:var(--c-red)">✗ '+r.summary.bad+' problem(s) found</b>':r.summary.warn?'<b style="color:var(--c-yellow)">⚠ no errors, '+r.summary.warn+' warning(s)</b>':'<b style="color:var(--c-green)">✓ everything checked is OK</b>';
+      box.innerHTML='<div style="border:1px solid var(--c-border);border-radius:6px;padding:8px 10px;background:var(--c-card)"><div style="margin-bottom:6px">'+verdict+' <span style="color:var(--c-muted)">· container '+esc(r.con&&r.con.name?r.con.name:(r.container||'—'))+' · '+r.summary.ok+' ok, '+r.summary.warn+' warning, '+r.summary.bad+' bad · checked '+new Date(r.at).toLocaleTimeString()+'</span> <button class="qb-btn" onclick="document.getElementById(\'hm-verify\').style.display=\'none\'" style="float:right">✕</button></div>'
+        +sorted.map(c=>'<div style="font:11px var(--font-mono);padding:1px 0;color:'+col[c.level]+'">'+ico[c.level]+' <b>'+esc(c.endpoint)+'</b> — <span style="color:var(--c-text)">'+esc(c.msg)+'</span></div>').join('')+'</div>';
+    }catch(e){box.innerHTML='<span style="color:var(--c-red)">Verify failed: '+esc(e.message)+'</span>';}
+  };
+  // ── delete dialog (date pickers) ──
+  window.hmSortSize=function(){window._hmBySize=window._hmBySize===false;hmLoad();};
+  window.hmDelOpen=function(i){
+    delTarget=i==null?null:rows[i];
+    $('hm-del-title').textContent=delTarget?'Delete history — '+delTarget.label:'Delete history — ALL panels';
+    const t=ymd(new Date()); $('hm-from').value=t; $('hm-to').value=t; $('hm-from').max=$('hm-to').max=t;
+    document.querySelector('input[name=hm-scope][value=range]').checked=true; hmScope();
+    $('hm-keep').style.display=delTarget?'block':'none'; $('hm-keep-msg').textContent='';
+    if(delTarget){$('hm-keep-days').value=delTarget.keepDays||'';$('hm-keep-days').max=window._hmRet||30;$('hm-keep-norm').textContent='(normal: '+(window._hmRet||30)+' days'+(delTarget.keepDays?'; now '+delTarget.keepDays:'')+')';}
+    $('hm-del').style.display='flex';
+  };
+  window.hmKeepSave=async function(reset){
+    if(!delTarget)return; const m=$('hm-keep-msg'), ret=window._hmRet||30;
+    const d=reset?0:parseInt($('hm-keep-days').value,10);
+    if(!reset&&!(d>=1&&d<=ret)){m.innerHTML='<span style="color:var(--c-red)">enter a whole number from 1 to '+ret+'</span>';return;}
+    if(!reset&&!confirm('Delete every snapshot of "'+delTarget.label+'" older than '+d+' day(s) now, and keep deleting older ones automatically?\nThis cannot be undone.'))return;
+    m.textContent='working…';
+    try{
+      const r=await post('config',{keepDays:true,endpoint:delTarget.endpoint,days:d});
+      if(r&&r.error){m.innerHTML='<span style="color:var(--c-red)">'+esc(r.error)+'</span>';return;}
+      let del=0; if(!reset){const p=await post('prune',{}); del=(p&&p.deleted)||0;}
+      m.innerHTML='<span style="color:var(--c-green)">✓ '+(reset?'back to the normal '+ret+' days':'saved: keeps '+d+' days'+(del?' · '+del+' old snapshot(s) deleted':''))+'</span>';
+      hmLoad();
+    }catch(e){m.innerHTML='<span style="color:var(--c-red)">failed: '+esc(e&&e.message||e)+'</span>';}
+  };
+  window.hmDelClose=()=>{$('hm-del').style.display='none';};
+  window.hmScope=function(){
+    const sc=document.querySelector('input[name=hm-scope]:checked').value;
+    $('hm-del-range').style.opacity=sc==='range'?1:.4;
+    $('hm-from').disabled=$('hm-to').disabled=sc!=='range'; $('hm-days').disabled=sc!=='older';
+    $('hm-del-sum').textContent='';
+  };
+  window.hmDelGo=async function(){
+    const sc=document.querySelector('input[name=hm-scope]:checked').value, who=delTarget?delTarget.label:'ALL panels';
+    const body=delTarget?{endpoint:delTarget.endpoint}:{everything:true}; let what;
+    if(sc==='range'){
+      const f=$('hm-from').value,t=$('hm-to').value;
+      if(!f||!t){$('hm-del-sum').textContent='Select both start and end date.';return;}
+      if(f>t){$('hm-del-sum').textContent='Start date is after end date.';return;}
+      body.fromTs=new Date(f+'T00:00:00').getTime();body.toTs=new Date(t+'T23:59:59.999').getTime();what=(f===t?'on '+f:'from '+f+' to '+t)+' (your local time)';
+    }else if(sc==='older'){
+      const n=parseInt($('hm-days').value,10); if(!(n>=0)){$('hm-del-sum').textContent='Enter number of days.';return;}
+      body.olderThanDays=n;what='older than '+n+' days';
+    }else{body.all=true;what='(everything)';}
+    if(!confirm('Permanently delete history of '+who+' '+what+'?\nThis cannot be undone.'))return;
+    if(!delTarget&&sc==='all'&&prompt('Type DELETE to confirm deleting ALL history of ALL panels')!=='DELETE')return;
+    const r=await post('delete',body);
+    if(!r.ok){$('hm-del-sum').textContent=r.error||'delete failed';return;}
+    hmDelClose(); alert('Deleted '+r.removedSnapshots+' snapshot(s). '+r.keptSnapshots+' kept.'); hmLoad();
+  };
+  const _sp=window.showPanel;
+  window.showPanel=function(id){const x=_sp.apply(this,arguments); if(id==='history'){hmLoad();const t=$('hm-tt');if(t&&!t.value)t.value=ymd(new Date(Date.now()-864e5))+'T'+new Date().toTimeString().slice(0,5);} return x;};
+})();
+</script>
+<!-- ═══ TIME TRAVEL: show the real dashboard panels with saved history ═══ -->
+<style>
+#tt-bar{display:none;position:fixed;left:0;right:0;bottom:0;z-index:9400;background:#b45309;color:#fff;padding:7px 14px;font:600 12px var(--font-main);align-items:center;gap:8px;flex-wrap:wrap;box-shadow:0 -4px 14px rgba(0,0,0,.4)}
+body.tt-on #tt-bar{display:flex}body.tt-on{padding-bottom:44px}
+#tt-bar button,#tt-bar input{background:rgba(0,0,0,.28);color:#fff;border:1px solid rgba(255,255,255,.4);border-radius:5px;padding:3px 8px;font:11px var(--font-mono);cursor:pointer}
+#tt-bar button:hover{background:rgba(0,0,0,.5)}
+#tt-info{font:11px var(--font-mono);opacity:.95}
+</style>
+<div id="tt-bar">
+  <span>⏪ HISTORY MODE — every panel shows saved data, live data is paused</span>
+  <button onclick="ttShift(-3600000)">−1h</button><button onclick="ttShift(-300000)">−5m</button>
+  <input type="datetime-local" id="tt-time" onchange="ttSet()">
+  <button onclick="ttShift(300000)">+5m</button><button onclick="ttShift(3600000)">+1h</button>
+  <button onclick="ttReload()">↻ reload panel</button>
+  <span id="tt-info"></span>
+  <button style="margin-left:auto;background:#fff;color:#7c2d12" onclick="ttStop()">✕ Back to live</button>
+</div>
+<script>
+(function(){
+  const of=window.fetch.bind(window), RealNotification=window.Notification;
+  let T=null, known=new Set(), cache=new Map(), served={min:null,max:null,miss:new Set(),approx:0,diff:new Set()};
+  let curScope=null, scopeP=null;      // history belongs to ONE database + container: when either changes, history mode re-binds to the new one (nothing of the old one is reused)
+  const base=()=> (typeof state!=='undefined'&&state.proxyUrl)||localStorage.getItem('proxyUrl')||'http://localhost:8080';
+  const db=()=> (typeof _currentDbId==='function'&&_currentDbId())||'';
+  const cont=()=> (typeof _activeContainer!=='undefined'&&_activeContainer)||'';
+  const $=id=>document.getElementById(id);
+  const scope=()=>db()+'|'+cont();
+  const dbName=()=>{try{const d=_databases[_activeDBIndex];return (d&&(d.name||d.label||d.alias||d.serviceName))||db()||'?';}catch(e){return db()||'?';}};
+  async function loadKnown(){const r=await of(base()+'/api/history/endpoints?dbId='+encodeURIComponent(db())+'&container='+encodeURIComponent(cont())).then(r=>{if(!r.ok)throw new Error('HTTP '+r.status);return r.json();});return new Set((r.endpoints||[]).map(e=>e.endpoint));}
+  const IGN=new Set(['dbId','container','_panel','_collector','_','t','ts','nocache','cb','bust']);
+  const PASS=/^(databases|ping|defaults|set-container)(\/|$)/;
+  const tl=d=>{const z=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+z(d.getMonth()+1)+'-'+z(d.getDate())+'T'+z(d.getHours())+':'+z(d.getMinutes());};
+  const json=(o,st)=>new Response(JSON.stringify(o),{status:st||200,headers:{'Content-Type':'application/json'}});
+  function info(){
+    let t='showing data as of '+new Date(T).toLocaleString()+' · database: '+dbName()+(cont()&&cont()!=='__cdb__'?' / '+cont():'');
+    if(served.min!=null)t+=' · snapshots used: '+new Date(served.min).toLocaleString()+(served.max!==served.min?' … '+new Date(served.max).toLocaleString():'');
+    const bar=$('tt-bar');
+    if(served.miss.size){t='⚠ NO HISTORY SAVED at this time for: '+[...served.miss].join(', ')+' — a panel showing old values below is NOT this time. '+t;bar.style.background='#991b1b';}
+    else bar.style.background='';
+    if(served.diff.size){t='⚠ FILTERS DIFFER: '+[...served.diff].join('; ')+' — saved with other filter values than this panel currently asks for. '+t;if(!served.miss.size)bar.style.background='#92400e';}
+    $('tt-info').textContent=t;
+  }
+  window.fetch=function ttFetch(input,init){
+    if(T==null)return of(input,init);
+    try{
+      const url=typeof input==='string'?input:(input&&input.url)||'';
+      const method=((init&&init.method)||(input&&input.method)||'GET').toUpperCase();
+      if(/\/api\/report\/send-email/.test(url))return Promise.resolve(json({error:'Disabled while viewing history'},400));
+      const m=url.match(/\/api\/oracle\/([^?#]*)/);
+      if(m){
+        const ep=m[1].replace(/\/+$/,'');
+        if(method!=='GET'){ if(PASS.test(ep))return of(input,init); return Promise.resolve(json({error:'Live queries are disabled while viewing history. Click "Back to live" to run queries.'},400)); }
+        if(!PASS.test(ep)){
+          const sc=scope();
+          if(sc!==curScope){ttStop();return of(input,init);}            // database / container was switched while in history mode: leave history mode, this request goes live to the new database
+          if(scopeP)return scopeP.then(()=>ttFetch(input,init));
+          if(known===null)return Promise.resolve(json({error:'History service not reachable for this database - nothing from another database is shown. Click "Back to live" or reload.'},503));
+        }
+        if(PASS.test(ep)||!known.has(ep))return of(input,init);
+        const u=new URL(url,location.href),qs=[];
+        [...u.searchParams.keys()].filter((k,i,a)=>a.indexOf(k)===i).filter(k=>!IGN.has(k)).sort().forEach(k=>qs.push(k+'='+u.searchParams.get(k)));
+        const q=qs.join('&'),key=scope()+'|'+ep+'|'+q+'|'+T;
+        let p=cache.get(key);
+        if(!p){
+          p=of(base()+'/api/history/at?'+new URLSearchParams({dbId:db(),container:cont(),endpoint:ep,ts:T,q})).then(r=>r.json()).catch(()=>({found:false}));
+          cache.set(key,p);
+        }
+        return p.then(r=>{
+          if(!r||!r.found){served.miss.add(ep);info();return json({error:'No history saved for "'+ep+'" at or before '+new Date(T).toLocaleString()},404);}
+          served.min=served.min==null?r.ts:Math.min(served.min,r.ts);served.max=served.max==null?r.ts:Math.max(served.max,r.ts);
+          if(r.approx){served.approx++;served.diff.add(ep+' (saved: '+(r.q||'no filters')+' / asked: '+(q||'no filters')+')');}info();
+          return json(r.data);
+        });
+      }
+    }catch(e){}
+    return of(input,init);
+  };
+  const PANEL={sessions:'sessions',alerts:'alerts',tablespaces:'storage',performance:'performance',metrics:'dashboard','top-sql':'dashboard','io-stats':'dashboard',instances:'dashboard',
+    rman:'rman',ash:'ash',redo:'redolog',scheduler:'scheduler',dataguard:'dataguard',rac:'rac',users:'users',audit:'audit',privesc:'privesc','failed-logins':'failedlogins',
+    archivelog:'archivelog',datapump:'datapump',schema:'schema','anomaly-signals':'anomaly','awr/snapshots':'awr','logs/alert':'logs','logs/listener':'logs','logs/trace-files':'logs',ddl:'ddlgen'};
+  const active=()=>{const a=document.querySelector('.panel.active');return a?a.id.replace(/^panel-/,''):'dashboard';};
+  window.ttReload=function(){served={min:null,max:null,miss:new Set(),approx:0,diff:new Set()};cache.clear();info();try{showPanel(active());}catch(e){}};
+  window.ttStart=async function(ts,endpoint){
+    try{known=await loadKnown();}
+    catch(e){alert('History service not reachable');return;}
+    curScope=scope();scopeP=null;
+    T=ts;document.body.classList.add('tt-on');$('tt-time').value=tl(new Date(T));
+    // no popups / sounds from alert checks, and no emails, on historical data
+    window.Notification=function(){};window.Notification.permission='denied';window.Notification.requestPermission=()=>Promise.resolve('denied');
+    let target=endpoint&&PANEL[endpoint]||active();if(target==='history')target='dashboard';
+    try{showPanel(target);}catch(e){}
+    ttReload();
+  };
+  // switching the database (or container) ends history mode: back to LIVE data of the newly selected database
+  setInterval(function(){try{if(T!=null&&curScope!=null&&scope()!==curScope)ttStop();}catch(e){}},300);
+  window.ttSet=function(){const v=new Date($('tt-time').value).getTime();if(isFinite(v)){T=v+59999;ttReload();}};
+  window.ttShift=function(ms){T=T+ms;if(T>Date.now())T=Date.now();$('tt-time').value=tl(new Date(T));ttReload();};
+  window.ttStop=function(){T=null;curScope=null;scopeP=null;cache.clear();document.body.classList.remove('tt-on');window.Notification=RealNotification;try{showPanel(active());}catch(e){}};
+  window.ttGoFromManager=function(){const v=new Date($('hm-tt').value).getTime();if(!isFinite(v)){alert('Pick a date and time');return;}ttStart(v+59999);};
+})();
 </script>
 </body>
 </html>
