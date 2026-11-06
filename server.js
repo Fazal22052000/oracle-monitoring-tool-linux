@@ -127,15 +127,37 @@ app.use(express.json({ limit: '512kb' }));
 
 
 // ── Serve the dashboard frontend ──────────────────────────────────────────
-app.use(express.static(__dirname));
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'oracle_ai_dashboard.html'));
+// saved history (users, audit, SQL …) must never be downloadable as a static file
+app.use(['/history', '/history_store.js'], (req, res) => res.status(404).end());
+// SECURITY: do NOT use express.static(__dirname) - it makes the whole folder public (server.js with DB
+// credentials, package.json, ...). Only the dashboard HTML itself is served, nothing else from this folder.
+const DASHBOARD_NAMES = ['oracle_ai_dashboard.html', 'oracle_ai_dashboard__26_.html'];   // 2nd = name used by the browser download
+function findDashboardFile() {
+  for (const n of DASHBOARD_NAMES) { const p = path.join(__dirname, n); if (fs.existsSync(p)) return p; }
+  return null;
+}
+(function checkDashboardFile() {
+  const f = findDashboardFile();
+  if (!f) return console.error('[dashboard] NOT FOUND: put oracle_ai_dashboard.html next to server.js');
+  try {
+    const head = fs.readFileSync(f, 'utf8').slice(0, 400).trimStart().toLowerCase();
+    if (!head.startsWith('<!doctype html') && !head.startsWith('<html'))
+      console.error('[dashboard] WARNING: ' + path.basename(f) + ' does not look like HTML (it starts with "' + head.slice(0, 40).replace(/\s+/g, ' ') + '"). Wrong file copied/renamed?');
+  } catch (e) { console.error('[dashboard] cannot read ' + f + ': ' + e.message); }
+})();
+app.get(['/', '/index.html', '/oracle_ai_dashboard.html'], (req, res) => {
+  const f = findDashboardFile();
+  if (!f) return res.status(404).type('text/plain').send('oracle_ai_dashboard.html not found next to server.js');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.sendFile(f);
 });
 
 // ── Simple in-memory rate limiter (per IP, max 120 req/min) ──────────────
 const _rateCounts = new Map();
 app.use((req, res, next) => {
   const ip  = req.ip || req.connection?.remoteAddress || 'unknown';
+  // the history collector calls this server from the same machine — never count/limit it
+  if (req.query && req.query._collector === '1' && /^(::1|127\.0\.0\.1|::ffff:127\.0\.0\.1)$/.test(ip)) return next();
   const key = ip + ':' + Math.floor(Date.now() / 60000);
   const cnt = (_rateCounts.get(key) || 0) + 1;
   _rateCounts.set(key, cnt);
@@ -188,38 +210,118 @@ function DB() { return _dbRegistry.get(currentDbId()) || _defaultDB; }
 // If no dbId is supplied, or it doesn't exist, we fall back to whatever is
 // globally active at the moment the request arrives (previous behaviour),
 // but — crucially — that value is now frozen for the rest of the request.
+// ══ CDB / PDB SCOPING ═════════════════════════════════════════════════════
+// Switching between CDB$ROOT and a PDB used to keep the SAME dbId and only change the registry's connection
+// string. Everything keyed by dbId (pools, caches, RAC info, history) therefore mixed root and PDB data,
+// in-flight requests silently continued on the NEW container, and the container was one global shared by
+// every browser tab / user. Now the CONTAINER is part of each request (?container=__cdb__ | <pdb service>),
+// is frozen for the request's whole lifetime next to the dbId, and every cache / pool / history folder is
+// keyed by dbId + container.
+function _svcOf(cs) { const m = String(cs || '').match(/SERVICE_NAME\s*=\s*([^)\s]+)/i); return m ? m[1].trim() : ''; }
+// container: '' -> whatever is globally active for that db (legacy callers) | '__cdb__' -> CDB root exactly as registered | else a PDB service name
+function _connStrFor(cfg, container) {
+  if (!container) return cfg.connectionString;
+  const base = cfg._baseConnectionString || cfg.connectionString;
+  if (container === '__cdb__') return base;
+  if (!/^[\w$.]+$/.test(container)) return cfg.connectionString;
+  const host = ((base.match(/HOST=([^)\s]+)/i) || [])[1] || '127.0.0.1').trim();
+  const port = ((base.match(/PORT=([^)\s]+)/i) || [])[1] || '1521').trim();
+  return `(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=${host})(PORT=${port}))(CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=${container})))`;
+}
+function currentConnStr() {
+  const st = _dbContext.getStore();
+  if (st && st.connStr) return st.connStr;
+  return (_dbRegistry.get(currentDbId()) || _defaultDB).connectionString;
+}
+function _scopeOf(dbId, container) {
+  const cfg = _dbRegistry.get(dbId) || _defaultDB;
+  return dbId + '@' + (_svcOf(_connStrFor(cfg, container)).toLowerCase() || 'default');
+}
+function scopeKey() { return currentDbId() + '@' + (_svcOf(currentConnStr()).toLowerCase() || 'default'); }
+// what the background history collector should pin itself to: the database + container that is globally selected right now
+function _collectorCtx() {
+  const cfg = _dbRegistry.get(_activeDBId) || _defaultDB;
+  const base = cfg._baseConnectionString || cfg.connectionString;
+  return { dbId: _activeDBId, container: cfg.connectionString === base ? '__cdb__' : _svcOf(cfg.connectionString) };
+}
 app.use((req, res, next) => {
   const requested = req.query.dbId || req.headers['x-db-id'];
   const dbId = (requested && _dbRegistry.has(String(requested)))
     ? String(requested)
     : _activeDBId;
-  _dbContext.run({ dbId }, next);
+  const cfg = _dbRegistry.get(dbId) || _defaultDB;
+  const rc = req.query.container || req.headers['x-container'];
+  const connStr = _connStrFor(cfg, rc ? String(rc) : '');
+  _dbContext.run({ dbId, connStr }, next);
 });
+
+// ── Panel history (30 days) — see history_store.js ─────────────────────────
+// History must NEVER be able to stop the server from starting: any problem here is logged and the server carries on.
+// (set HISTORY_DISABLED=1 in .env to switch the whole history feature off)
+try {
+  if (process.env.HISTORY_DISABLED === '1') console.log('[history] disabled by HISTORY_DISABLED=1');
+  else require('./history_store')(app, currentDbId, { oracledb, getPool: () => getPool(currentDbId()), getPort: () => 8080, scopeKey, scopeOf: _scopeOf, collectorCtx: _collectorCtx, conInfo: currentConInfo });
+} catch (e) { console.error('[history] NOT STARTED (server continues without history):', e && e.stack || e); }
 
 // ── CONNECTION POOL ───────────────────────────────────────────────────────────
 // Each registered database gets its own pool. Pools are created on first use
 // and cached. Switching DBs just changes _activeDBId — no restart needed.
+const _poolMeta = new Map();      // key -> { pool, id, cs, used }
+const _poolPending = new Map();   // key -> Promise  (two concurrent first requests must not create two pools)
+const _poolKey = (id, cs) => id + '\u0001' + cs;
 async function getPool(dbId) {
   const id = dbId || _activeDBId;
-  if (_poolCache.has(id)) return _poolCache.get(id);
   const cfg = _dbRegistry.get(id);
   if (!cfg) throw new Error('Database not found: ' + id);
-  const creds = parseCreds(cfg.user, cfg.password);
-  const pool = await oracledb.createPool({
-    user             : creds.user,
-    password         : creds.password,
-    connectionString : cfg.connectionString,
-    ...(creds.privilege !== undefined ? { privilege: creds.privilege } : {}),
-    poolMin      : 2,
-    poolMax      : 10,
-    poolIncrement: 2,
-    poolTimeout  : 60,
-    queueTimeout : 60000   // increased from 10s → 60s; BFILE tail can hold a connection for ~45s
-  });
-  _poolCache.set(id, pool);
-  console.log('✓ Oracle pool created for DB:', cfg.name, '(min=2, max=10)');
-  return pool;
+  // inside a request: the connection string frozen for THIS request (database + container); otherwise the registry's
+  const cs = (id === currentDbId()) ? currentConnStr() : cfg.connectionString;
+  const key = _poolKey(id, cs);
+  const hit = _poolMeta.get(key);
+  if (hit) { hit.used = Date.now(); return hit.pool; }
+  if (_poolPending.has(key)) return _poolPending.get(key);
+  const p = (async () => {
+    const creds = parseCreds(cfg.user, cfg.password);
+    const pool = await oracledb.createPool({
+      user             : creds.user,
+      password         : creds.password,
+      connectionString : cs,
+      ...(creds.privilege !== undefined ? { privilege: creds.privilege } : {}),
+      poolMin      : 2,
+      poolMax      : 10,
+      poolIncrement: 2,
+      poolTimeout  : 60,
+      queueTimeout : 60000   // increased from 10s → 60s; BFILE tail can hold a connection for ~45s
+    });
+    // ask the database ONCE which container this pool really lands in (stored with every history snapshot + shown in the UI)
+    let con = null;
+    try {
+      const c0 = await pool.getConnection();
+      try {
+        const r0 = await c0.execute(`SELECT SYS_CONTEXT('USERENV','CON_NAME') AS N, SYS_CONTEXT('USERENV','CON_ID') AS I FROM DUAL`, [], { outFormat: oracledb.OUT_FORMAT_OBJECT });
+        con = { name: String(r0.rows?.[0]?.N || ''), id: Number(r0.rows?.[0]?.I) };
+      } finally { await c0.close(); }
+    } catch (_) { /* informational only */ }
+    _poolMeta.set(key, { pool, id, cs, used: Date.now(), con });
+    _poolCache.set(key, pool);
+    console.log('✓ Oracle pool created for DB:', cfg.name, '[service ' + (_svcOf(cs) || '?') + ']', '(min=2, max=10)');
+    return pool;
+  })().finally(() => _poolPending.delete(key));
+  _poolPending.set(key, p);
+  return p;
 }
+function currentConInfo() { const m = _poolMeta.get(_poolKey(currentDbId(), currentConnStr())); return (m && m.con) || null; }
+// pools of containers nobody has used for 10 minutes are closed (the one that is globally active is always kept)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, m] of [..._poolMeta]) {
+    const cfg = _dbRegistry.get(m.id);
+    if ((!cfg || cfg.connectionString !== m.cs) && now - m.used > 10 * 60000) {
+      _poolMeta.delete(key); _poolCache.delete(key);
+      m.pool.close(10).catch(() => {});
+      console.log('[pool] closed idle pool:', m.id, '[service ' + (_svcOf(m.cs) || '?') + ']');
+    }
+  }
+}, 5 * 60000).unref();
 
 // ── MULTI-DB API ENDPOINTS ────────────────────────────────────────────────────
 
@@ -295,9 +397,10 @@ app.delete('/api/oracle/databases/:id', async (req, res) => {
   if (id === 'default') return res.status(400).json({ error: 'Cannot remove the default database' });
   if (!_dbRegistry.has(id)) return res.status(404).json({ error: 'Database not found' });
   // Close pool if open
-  if (_poolCache.has(id)) {
-    try { await _poolCache.get(id).close(0); } catch (_) {}
-    _poolCache.delete(id);
+  for (const [key, m] of [..._poolMeta]) {
+    if (m.id !== id) continue;
+    _poolMeta.delete(key); _poolCache.delete(key);
+    try { await m.pool.close(0); } catch (_) {}
   }
   const name = _dbRegistry.get(id)?.name;
   _dbRegistry.delete(id);
@@ -382,7 +485,7 @@ const _cache = new Map();
 // Uses the request-scoped dbId (currentDbId()), not the raw global, so a
 // request that started against DB A keeps reading/writing DB A's cache
 // entries even if another request switches the global active DB mid-flight.
-function _cacheKey(key) { return currentDbId() + ':' + key; }
+function _cacheKey(key) { return scopeKey() + ':' + key; }
 
 function cacheGet(key) {
   const k = _cacheKey(key);
@@ -409,7 +512,7 @@ const _racInfoByDb = new Map();
 let racInfo = null; // kept only so `racInfo = null` reset call-sites still work harmlessly
 
 async function detectRAC() {
-  const dbId = currentDbId();
+  const dbId = scopeKey();
   if (_racInfoByDb.has(dbId)) return _racInfoByDb.get(dbId);
   try {
     const rows = await query(
@@ -437,7 +540,21 @@ async function detectRAC() {
 // FIX: Use pool connection + callTimeout so Oracle actually cancels the SQL
 // (the old Promise.race only rejected the JS promise but left Oracle running,
 // causing repeated timeouts and PromiseRejectionHandledWarnings).
+// A pool that is being closed (container switch / DB removed / re-activate) rejects in-flight requests with
+// NJS-064 / NJS-065. That is transient: wait a moment and run the query again on the NEW pool.
 async function query(sql, binds, opts) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await _queryOnce(sql, binds, opts); }
+    catch (e) {
+      if (attempt < 2 && /NJS-064|NJS-065|connection pool is closing|pool.*(terminated|closed)/i.test((e && e.message) || '')) {
+        await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+async function _queryOnce(sql, binds, opts) {
   let conn;
   try {
     // Use the request-scoped database id (see currentDbId()/_dbContext above)
@@ -1072,7 +1189,9 @@ app.get('/api/oracle/alerts', async (req, res) => {
     const crossInstLocks = val(crossLocksR, [{ CNT: 0 }]);
 
     const alerts = [];
-    const now = new Date().toLocaleTimeString();
+    // ISO (UTC) string: the BROWSER converts it to the viewer's own time zone. toLocaleTimeString() here used the
+    // Node server's time zone, so the Time column disagreed with the dashboard clock.
+    const now = new Date().toISOString();
     ts.forEach(t => {
       if(t.PCT_USED >= 90)
         alerts.push({ level:'CRITICAL', title:`Tablespace ${t.TABLESPACE_NAME} at ${t.PCT_USED}%`, desc: t.AUTO_EXT==='YES' ? 'Auto-extend ON' : 'Auto-extend DISABLED — immediate action required.', time: now });
@@ -1582,87 +1701,73 @@ app.get('/api/oracle/pdbs-live', async (req, res) => {
   }
 });
 
-app.post('/api/oracle/set-container', async (req, res) => {
-  try {
-    const { container, pdbName } = req.body;
-    // container = '__cdb__' for CDB$ROOT, or PDB service name for a PDB
-    if (container && container !== '__cdb__' && !/^[\w$.]+$/.test(container)) {
-      return res.status(400).json({ error: 'Invalid container name' });
-    }
-
-    const activeDb = DB();
-    // Always derive host/port from the ORIGINAL base connection string
-    // so switching PDB->CDB->PDB never loses the host information
-    const baseCs = activeDb._baseConnectionString || activeDb.connectionString;
-    const hostMatch = baseCs.match(/HOST=([^)\s]+)/i);
-    const portMatch = baseCs.match(/PORT=([^)\s]+)/i);
-    const host = hostMatch ? hostMatch[1].trim() : '127.0.0.1';
-    const port = portMatch ? portMatch[1].trim() : '1521';
-
-    let newService;
-    if (!container || container === '__cdb__') {
-      // Switching back to CDB root — use the original base service name
-      const svcMatch = baseCs.match(/SERVICE_NAME=([^)\s]+)/i);
-      newService = svcMatch ? svcMatch[1].trim().split('.')[0] : 'orcl';
-    } else {
-      // Switching to a PDB — use pdbName if provided (full PDB name), else container value
-      newService = (pdbName || container).trim();
-    }
-
-    const newConnStr = `(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=${host})(PORT=${port}))(CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=${newService})))`;
-    const _pdbCreds = parseCreds(activeDb.user, activeDb.password);
-    const testCfg = { ..._pdbCreds, connectionString: newConnStr };
-    let conn;
-    try {
-      conn = await Promise.race([
-        oracledb.getConnection(testCfg),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('Connection to ' + newService + ' timed out after 20s')), 20000))
-      ]);
-      const containerCheck = await conn.execute(
-        `SELECT SYS_CONTEXT('USERENV','CON_NAME') AS CON_NAME FROM DUAL`,
-        [], { outFormat: oracledb.OUT_FORMAT_OBJECT }
-      );
-      const conName = containerCheck.rows?.[0]?.CON_NAME || newService;
-      console.log('[set-container] Connected to container:', conName);
-    } catch(e) {
-      let hint = '';
-      if (/ORA-12514|service.*not registered/i.test(e.message))
-        hint = ' — PDB may be closed. Try: ALTER PLUGGABLE DATABASE ' + (pdbName || newService) + ' OPEN;';
-      if (/ORA-01017/i.test(e.message))
-        hint = ' — User may not exist in this PDB or requires a local account.';
-      if (/timed out/i.test(e.message))
-        hint = ' — Check that the PDB is OPEN and its listener service is registered.';
-      return res.status(500).json({ error: 'Cannot connect to ' + newService + ': ' + e.message + hint });
-    } finally {
-      if (conn) try { await conn.close(); } catch(_) {}
-    }
-
-    // Commit: update registry, preserve _baseConnectionString for future CDB<->PDB switches
-    // Use currentDbId() (request-scoped) rather than the raw global, so this
-    // stays consistent even if a dbId query param pinned this request to a
-    // non-globally-active database.
-    const targetDbId = currentDbId();
-    if (!activeDb._baseConnectionString) {
-      activeDb._baseConnectionString = activeDb.connectionString;
-    }
-    activeDb.connectionString = newConnStr;
-    _dbRegistry.set(targetDbId, activeDb);
-
-    // Close existing pool so next query uses fresh connection to new container
-    if (_poolCache.has(targetDbId)) {
-      try { await _poolCache.get(targetDbId).close(0); } catch(_) {}
-      _poolCache.delete(targetDbId);
-    }
-    _racInfoByDb.delete(targetDbId);
-    _resolvedLogPathsByDb.delete(targetDbId);
-    _cache.clear();
-
-    console.log('[set-container] Switched to:', container === '__cdb__' ? 'CDB$ROOT' : newService);
-    res.json({ ok: true, container: container || '__cdb__', service: newService, connString: newConnStr });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
+// Switch container (CDB$ROOT <-> PDB). The browser ALSO sends ?container= with every later request, so each tab
+// is pinned to the container ITS OWN screen shows; this endpoint tests the target, proves which container the
+// connection really lands in, and records it as the default for callers that send no container (history collector).
+let _containerChain = Promise.resolve();      // one switch at a time: two quick clicks can never finish out of order
+app.post('/api/oracle/set-container', (req, res) => {
+  const run = _containerChain.then(() => _setContainer(req, res))
+    .catch(e => { if (!res.headersSent) res.status(500).json({ error: e.message }); });
+  _containerChain = run.catch(() => {});
 });
+async function _setContainer(req, res) {
+  const { container, pdbName, expectName } = req.body || {};
+  const isRoot = !container || container === '__cdb__';
+  if (!isRoot && !/^[\w$.]+$/.test(container)) return res.status(400).json({ error: 'Invalid container name' });
+
+  const dbId = currentDbId();
+  const activeDb = _dbRegistry.get(dbId) || _defaultDB;
+  // the registered (root) connection string is remembered the first time a switch happens
+  if (!activeDb._baseConnectionString) activeDb._baseConnectionString = activeDb.connectionString;
+  const newService = isRoot ? (_svcOf(activeDb._baseConnectionString) || 'root') : String(pdbName || container).trim();
+  const newConnStr = isRoot ? activeDb._baseConnectionString : _connStrFor(activeDb, newService);
+
+  let conn, conName = '', conId = null;
+  try {
+    conn = await Promise.race([
+      oracledb.getConnection({ ...parseCreds(activeDb.user, activeDb.password), connectionString: newConnStr }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('Connection to ' + newService + ' timed out after 20s')), 20000))
+    ]);
+    const r = await conn.execute(
+      `SELECT SYS_CONTEXT('USERENV','CON_NAME') AS CON_NAME, SYS_CONTEXT('USERENV','CON_ID') AS CON_ID FROM DUAL`,
+      [], { outFormat: oracledb.OUT_FORMAT_OBJECT });
+    conName = String(r.rows?.[0]?.CON_NAME || newService);
+    conId   = Number(r.rows?.[0]?.CON_ID);
+    console.log('[set-container] Connected to container:', conName, '(CON_ID=' + conId + ')');
+  } catch (e) {
+    let hint = '';
+    if (/ORA-12514|service.*not registered/i.test(e.message))
+      hint = ' — PDB may be closed. Try: ALTER PLUGGABLE DATABASE ' + (pdbName || newService) + ' OPEN;';
+    if (/ORA-01017/i.test(e.message))
+      hint = ' — User may not exist in this PDB or requires a local account.';
+    if (/timed out/i.test(e.message))
+      hint = ' — Check that the PDB is OPEN and its listener service is registered.';
+    return res.status(500).json({ error: 'Cannot connect to ' + newService + ': ' + e.message + hint });
+  } finally {
+    if (conn) try { await conn.close(); } catch (_) {}
+  }
+
+  // PROOF of where the connection landed - never show PDB data under a CDB label (or the other way round)
+  if (isRoot && conId > 1)
+    return res.status(409).json({ error: 'The connection registered for this database lands in PDB "' + conName + '", not CDB$ROOT. Register the database with the CDB root service name.' });
+  if (!isRoot && conId <= 1)
+    return res.status(409).json({ error: 'Service "' + newService + '" connected to CDB$ROOT, not to a PDB. Check the PDB service name.' });
+  const want = String(expectName || '').trim();
+  if (!isRoot && want && conName.toUpperCase() !== want.toUpperCase())
+    return res.status(409).json({ error: 'Service "' + newService + '" connected to PDB "' + conName + '", but you selected "' + want + '". Check the PDB service name.' });
+
+  // default for callers that send no ?container= (history collector, old browser tabs)
+  activeDb.connectionString = newConnStr;
+  _dbRegistry.set(dbId, activeDb);
+  // fresh data for the container we just entered (other containers' caches and pools are left alone)
+  const sc = _scopeOf(dbId, isRoot ? '__cdb__' : newService);
+  _racInfoByDb.delete(sc);
+  _resolvedLogPathsByDb.delete(sc);
+  for (const k of [..._cache.keys()]) if (k.startsWith(sc + ':')) _cache.delete(k);
+
+  console.log('[set-container] Switched to:', isRoot ? 'CDB$ROOT' : conName);
+  res.json({ ok: true, container: isRoot ? '__cdb__' : container, service: newService, connString: newConnStr, conName, conId });
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LOGS API
@@ -1859,7 +1964,7 @@ let _resolvedLogPathsAt = 0;
 const LOG_PATH_CACHE_MS = 300000; // 5 minutes
 
 async function resolveLogPaths() {
-  const dbId = currentDbId();
+  const dbId = scopeKey();
   const cached = _resolvedLogPathsByDb.get(dbId);
   // Return cached result if still fresh — avoids 2 sequential DB queries on every refresh
   if (cached && (Date.now() - cached.at) < LOG_PATH_CACHE_MS) {
@@ -2141,9 +2246,8 @@ app.get('/api/oracle/logs/alert', async (req, res) => {
         // Standalone connection — bypasses pool entirely, no queueTimeout risk
         conn2 = await Promise.race([
           oracledb.getConnection({
-            user             : cfg.user,
-            password         : cfg.password,
-            connectionString : cfg.connectionString
+            ...parseCreds(cfg.user, cfg.password),
+            connectionString : currentConnStr()
           }),
           new Promise((_, rej) => setTimeout(() => rej(new Error('BFILE connection timed out after 20s')), 20000))
         ]);
@@ -2499,7 +2603,7 @@ app.get('/api/oracle/logs/trace-files', async (req, res) => {
               size: stat.size > 1048576
                 ? (stat.size/1048576).toFixed(1) + ' MB'
                 : (stat.size/1024).toFixed(1) + ' KB',
-              modified: mtime.toLocaleString()
+              modified: mtime.toISOString()
             });
           } catch(_) {}
         });
@@ -2665,7 +2769,7 @@ app.post('/api/oracle/logs/trace-content', async (req, res) => {
         const safeName  = fileName.replace(/'/g, "''");
 
         conn2 = await Promise.race([
-          oracledb.getConnection({ user: cfg.user, password: cfg.password, connectionString: cfg.connectionString }),
+          oracledb.getConnection({ ...parseCreds(cfg.user, cfg.password), connectionString: currentConnStr() }),
           new Promise((_, rej) => setTimeout(() => rej(new Error('BFILE connect timeout')), 20000))
         ]);
         conn2.callTimeout = 45000;
@@ -2789,7 +2893,7 @@ app.post('/api/oracle/logs/trace-content', async (req, res) => {
       content,
       path    : filePath,
       size    : statInfo?.size    || 0,
-      modified: statInfo ? statInfo.mtime.toLocaleString() : ''
+      modified: statInfo ? statInfo.mtime.toISOString() : ''
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -3779,7 +3883,7 @@ app.get('/api/oracle/topsql', async (req, res) => {
             ROUND(SUM(st.CPU_TIME_DELTA)    /NULLIF(SUM(st.EXECUTIONS_DELTA),0)/1000, 1) AS AVG_CPU_MS,
             ROUND(SUM(st.BUFFER_GETS_DELTA) /NULLIF(SUM(st.EXECUTIONS_DELTA),0),    0) AS AVG_BUFFER_GETS,
             ROUND(SUM(st.DISK_READS_DELTA)  /NULLIF(SUM(st.EXECUTIONS_DELTA),0),    0) AS AVG_PHYS_READS,
-            MAX(sn.MODULE)                                                          AS MODULE,
+            MAX(st.MODULE)                                                          AS MODULE,
             SUBSTR(MAX(tx.SQL_TEXT), 1, 80)                                         AS SQL_TEXT,
             SUM(st.${orderCol})                                                     AS SORT_METRIC
           FROM DBA_HIST_SQLSTAT st
@@ -3812,7 +3916,7 @@ app.get('/api/oracle/topsql', async (req, res) => {
               ROUND(SUM(st.CPU_TIME_DELTA)    /NULLIF(SUM(st.EXECUTIONS_DELTA),0)/1000,1) AS AVG_CPU_MS,
               ROUND(SUM(st.BUFFER_GETS_DELTA) /NULLIF(SUM(st.EXECUTIONS_DELTA),0),    0) AS AVG_BUFFER_GETS,
               ROUND(SUM(st.DISK_READS_DELTA)  /NULLIF(SUM(st.EXECUTIONS_DELTA),0),    0) AS AVG_PHYS_READS,
-              MAX(sn.MODULE)                                                            AS MODULE,
+              MAX(st.MODULE)                                                            AS MODULE,
               SUM(st.${orderCol})                                                       AS SORT_METRIC
             FROM DBA_HIST_SQLSTAT st
             INNER JOIN DBA_HIST_SNAPSHOT sn
