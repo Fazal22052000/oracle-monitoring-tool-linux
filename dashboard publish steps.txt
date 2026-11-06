@@ -142,8 +142,32 @@ pm2 save                                 # persist for reboot
 
 
 
-// ── Serve the dashboard frontend ──────────────────────────────────────────
+// ── Serve the dashboard frontend ──────────────────────────────────────────isse mera browser pe open hora hai dusre user ko
 app.use(express.static(__dirname));
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'oracle_ai_dashboard.html'));
 });
+
+
+
+
+CDB_DATA =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = 192.168.20.80)(PORT = 1521))
+    (CONNECT_DATA =
+      (SERVER = DEDICATED)
+      (SERVICE_NAME = cdb_data)
+    )
+  )
+  
+  
+ORCL =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = 192.168.2.137)(PORT = 1521))
+    (CONNECT_DATA =
+      (SERVER = DEDICATED)
+      (SERVICE_NAME = orcl)
+    )
+  )
+ 
+ 
