@@ -180,6 +180,14 @@ This is the most important part. Your DB user needs **read-only SELECT access** 
 -- Replace YOUR_USER with your actual schema name (e.g. fazal)
 
 -- ── Core DBA dictionary views ──────────────────────────────────────────────
+npm install xlsx
+
+GRANT CREATE SESSION   TO FAZAL;   -- pehle se hoga
+GRANT CREATE TABLE     TO FAZAL;   -- table + uske indexes + comment
+GRANT CREATE VIEW      TO FAZAL;   -- ORADECK_HISTORY_V aur har panel ke ORADECK_V_* views
+GRANT CREATE SEQUENCE  TO FAZAL;   -- identity column (SNAP_ID) ke liye, safe side ke liye
+ALTER USER FAZAL QUOTA UNLIMITED ON USERS;   -- jis tablespace me table jaaye
+
 GRANT SELECT ON DBA_USERS              TO YOUR_USER;
 GRANT SELECT ON DBA_OBJECTS            TO YOUR_USER;
 GRANT SELECT ON DBA_SEGMENTS           TO YOUR_USER;
@@ -466,3 +474,83 @@ GRANT READ ON DIRECTORY ORACLE_ALERT_DIR TO fazal;  -- BFILE access
 bash# Run as root — OS side
 chmod o+rx /u01/app/oracle/diag/rdbms/orcl/orcl/trace
 chmod o+r  /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+
+========================================================================
+
+history data postgre me istall karne ke liye
+
+CREATE USER fazal WITH PASSWORD 'fazal';
+CREATE DATABASE fazal OWNER fazal;
+GRANT ALL ON SCHEMA public TO fazal;
+
+Connection test karo
+psql "postgresql://fazal:fazal@localhost:5433/fazal" -c "select 1"
+
+
+App folder mein
+cd /dashboard       # jahan server.js hai
+npm install pg
+
+Teeno files (history_store.js, history_store_postgres.js, oracle_ai_dashboard.html) wahin rakho. history_store_mongo.js ho to delete kar do
+
+.env mein add karo
+POSTGRES_URL=postgresql://fazal:fazal@localhost:5433/fazal
+
+
+
+
+======================================
+**Naya database jodne ke steps (Oracle table aur PostgreSQL, dono ke liye)**
+
+**Step 1: Database dashboard mein jodiye**
+1. "Add Oracle Database" kholiye: connection name, environment, proxy URL, username/password, connection string bhariye.
+2. **Test & Save** dabayiye.
+3. Naye database ko select karke dekhiye ki dashboard ke panels chal rahe hain.
+
+**Step 2: Background collection ON kijiye**
+1. **History Manager** kholiye.
+2. **Background collection** ko ON kijiye aur interval chuniye (5, 15, 30 ya 60 min).
+3. Agar aapka database CDB hai aur sab PDB ki history chahiye, to **all containers** bhi tick kijiye. Non-CDB ke liye ye zaroori nahi.
+
+**Step 3: Database ko "store" ke liye tick kijiye**
+1. **Databases to store** mein naya database dikhega. Use tick kijiye.
+2. **Save** dabayiye.
+3. Hare message mein dekhiye ki naya database "stored" list mein hai.
+
+**Step 4: Table banaiye**
+- **Oracle table:** naya database select karke **Table & SQL → Create in THIS container** dabayiye (CDB mein sab PDB ke liye **Create in ALL containers**). User ko table banane ki permission chahiye.
+- **PostgreSQL:** kuch nahi karna, table pehle se bani hui hai.
+
+**Step 5: Pehla data lijiye**
+1. **Collect now** dabayiye, ya ek interval ruk kar pehla automatic pass hone dijiye.
+2. Table mein panels ke saamne "Last auto-collect" mein ✓ aane tak ruke.
+
+**Step 6: Verify kijiye**
+1. **Verify history** dabayiye.
+2. Warning banner (History Manager ke upar) mein koi laal ya peela message ho to wo padhiye.
+
+**Step 7: Views banaiye (data aane ke baad)**
+1. **Table & SQL → Create** dobara dabayiye.
+   - **Oracle:** naye database par (har database ke apne views hote hain).
+   - **PostgreSQL:** ek hi baar, sab databases ke liye.
+2. Result mein "panel(s) checked, N created" dikhna chahiye.
+
+**Step 8: Check kijiye**
+```sql
+-- PostgreSQL
+SELECT scope, db_name, db_role, container_type, count(*) FROM oradeck_history GROUP BY 1,2,3,4;
+-- Oracle (naye database mein)
+SELECT * FROM oradeck_panels;
+```
+
+**Agar kuch na chale:**
+| Dikhta hai | Matlab | Kya karein |
+|---|---|---|
+| Panels laal ✗ "table does not exist" (Oracle) | Us database mein Create nahi hua | Step 4 |
+| Kuch store nahi ho raha | Database tick nahi hai ya Save nahi hua | Step 3 |
+| Sirf wahi panels store jo aap kholte ho | Background collection OFF hai | Step 2 |
+| Panel views nahi dikhte | Data aane se pehle Create hua | Step 7 |
+| Banner laal "collector has not run" | Server ya collector band hai | Server ka check kijiye |
+
+**Database hatana ho to:** Databases to store mein untick karke Save dabayiye. Purana data table mein bana rahega, naya store nahi hoga.
+
